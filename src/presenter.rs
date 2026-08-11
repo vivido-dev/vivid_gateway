@@ -4856,7 +4856,7 @@ fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::BridgeSourceKey;
@@ -4869,13 +4869,15 @@ mod tests {
         SurfaceDefinition, SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
     };
 
-    /// A Unix-socket `PresenterListener` for gateway tests: binds a socket at the requested path
-    /// and hands accepted connections to the inner presenter as transports.
+    /// A local `PresenterListener` for gateway tests. Unix uses a filesystem socket while Windows
+    /// uses the same loopback TCP transport as the shipping nested presenter.
+    #[cfg(unix)]
     struct TestSocketListener {
         inner: std::os::unix::net::UnixListener,
         endpoint: std::path::PathBuf,
     }
 
+    #[cfg(unix)]
     impl TestSocketListener {
         fn bind(path: std::path::PathBuf) -> io::Result<Self> {
             let inner = std::os::unix::net::UnixListener::bind(&path)?;
@@ -4887,6 +4889,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl PresenterListener for TestSocketListener {
         fn endpoint(&self) -> String {
             format!("unix:{}", self.endpoint.display())
@@ -4903,6 +4906,56 @@ mod tests {
                 let _ = cancel_writer.shutdown(std::net::Shutdown::Both);
             });
             let timeout = Arc::new(|_: Option<Duration>| Ok(()));
+            Ok(Transport::new(
+                Box::new(reader),
+                Box::new(stream),
+                cancel,
+                timeout,
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    struct TestSocketListener {
+        inner: std::net::TcpListener,
+        endpoint: String,
+    }
+
+    #[cfg(windows)]
+    impl TestSocketListener {
+        fn bind(_path: std::path::PathBuf) -> io::Result<Self> {
+            let inner = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+            inner.set_nonblocking(true)?;
+            let endpoint = format!("tcp:{}", inner.local_addr()?);
+            Ok(Self { inner, endpoint })
+        }
+    }
+
+    #[cfg(windows)]
+    impl PresenterListener for TestSocketListener {
+        fn endpoint(&self) -> String {
+            self.endpoint.clone()
+        }
+
+        fn accept(&self) -> io::Result<Transport> {
+            let (stream, peer) = self.inner.accept()?;
+            if !peer.ip().is_loopback() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "test presenter peer is not loopback",
+                ));
+            }
+            stream.set_nonblocking(false)?;
+            stream.set_nodelay(true)?;
+            let reader = stream.try_clone()?;
+            let timeout_stream = stream.try_clone()?;
+            let cancel_reader = stream.try_clone()?;
+            let cancel_writer = stream.try_clone()?;
+            let cancel = crate::ConnectionCancel::new(move || {
+                let _ = cancel_reader.shutdown(std::net::Shutdown::Both);
+                let _ = cancel_writer.shutdown(std::net::Shutdown::Both);
+            });
+            let timeout = Arc::new(move |value| timeout_stream.set_read_timeout(value));
             Ok(Transport::new(
                 Box::new(reader),
                 Box::new(stream),
