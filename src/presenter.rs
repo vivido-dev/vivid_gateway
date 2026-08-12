@@ -368,7 +368,10 @@ pub struct SnapshotSource {
     pub live: bool,
     pub active: bool,
     pub audio_gain: Option<AudioGain>,
+    /// Retained immutable media body, currently used by encoded-image tracks.
     pub retained: Option<Arc<[u8]>>,
+    /// The fully composed latest raster, independent of the producer's delta chain.
+    pub retained_raster: Option<RetainedRaster>,
     pub first_visible_presented: bool,
     pub playing: bool,
     pub play_request: PlayRequest,
@@ -379,6 +382,15 @@ pub struct SnapshotSource {
     pub capture_policy: u64,
     pub semantic_descriptor: Option<SemanticDescriptor>,
     pub raster_delta_operation_limit: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetainedRaster {
+    pub epoch: u32,
+    pub frame_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<[u8]>,
 }
 
 #[derive(Debug)]
@@ -500,6 +512,7 @@ struct TrackEntry {
     audio_gain: AudioGain,
     channel_writer: Option<Arc<Writer>>,
     retained: Option<Arc<[u8]>>,
+    retained_raster: Option<RetainedRaster>,
     playing: bool,
     play_request: PlayRequest,
     eos_epoch: Option<u32>,
@@ -1117,6 +1130,7 @@ impl VirtualVivid {
                         }))
                 .then_some(track.audio_gain),
                 retained: track.retained.clone(),
+                retained_raster: track.retained_raster.clone(),
                 first_visible_presented: track.outer_presented,
                 playing: track.playing,
                 play_request: track.play_request,
@@ -1534,7 +1548,7 @@ impl VirtualVivid {
                     outer_channel_generation: outer.attachment_generations.get(&source).copied(),
                     outer_mapping_fresh: outer.bridge_instance_id.is_some(),
                     visible: state.projected_sources.contains(&source),
-                    retained_static: track.retained.is_some(),
+                    retained_static: has_retained_media(track),
                     keyframe_needed: track.recovery_pending,
                     milestones: track.state.milestones,
                     queued_packets: state
@@ -1633,7 +1647,7 @@ impl VirtualVivid {
         let mut state = lock(&self.state);
         loop {
             if state.tracks.iter().any(|(key, track)| {
-                track.retained.is_some()
+                has_retained_media(track)
                     && state
                         .sessions
                         .get(&key.surface.session)
@@ -2583,6 +2597,7 @@ fn dispatch_control(
                     audio_gain: AudioGain::UNITY,
                     channel_writer: None,
                     retained: None,
+                    retained_raster: None,
                     playing: false,
                     play_request: PlayRequest::baseline(),
                     eos_epoch: None,
@@ -3042,6 +3057,7 @@ fn dispatch_control(
                     track.recovery_minimum_epoch = epoch;
                     track.discard_blocked_for_recovery = false;
                     track.retained = None;
+                    track.retained_raster = None;
                 }
                 messages::DRAIN => {
                     if track.eos_epoch.is_none() {
@@ -3515,9 +3531,7 @@ fn track_loop(
                 track.recovery_requested = false;
                 track.discard_blocked_for_recovery = false;
             }
-            if retained {
-                track.retained = Some(Arc::from(record.body.clone()));
-            }
+            update_retained_media(key, track, &record)?;
         }
         if recovering_keyframe && recovery_gates_audio {
             let linked_audio = state
@@ -3622,6 +3636,194 @@ fn track_loop(
             wakeup();
         }
     }
+}
+
+fn has_retained_media(track: &TrackEntry) -> bool {
+    track.retained.is_some() || track.retained_raster.is_some()
+}
+
+/// Terminate an inner raster delta chain into one owner-scoped latest framebuffer.
+///
+/// A nested presenter cannot retain only the last full record: interactive producers such as
+/// vvpaint send an initial full canvas followed by small overwrite deltas. Replaying that old full
+/// record after an outer attachment is recreated restores a blank canvas. Compose every accepted
+/// delta here so a later outer hop starts from the actual latest pixels and gets a new hop-local
+/// full-frame identity.
+fn update_retained_media(key: TrackKey, track: &mut TrackEntry, record: &Record) -> io::Result<()> {
+    match (&track.configuration.kind, record.record_type) {
+        (KindConfiguration::EncodedImage(_), messages::IMAGE_DATA) => {
+            track.retained = Some(Arc::from(record.body.clone()));
+            track.retained_raster = None;
+        }
+        (KindConfiguration::Raster(config), messages::RASTER_FRAME) => {
+            let flags = record
+                .body
+                .get(4..8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_be_bytes)
+                .ok_or_else(|| invalid("raster record is truncated"))?;
+            track.retained = None;
+            if flags & media::RASTER_FRAME_DELTA == 0 {
+                let frame = media::parse_full_raster_frame(&record.body)?;
+                let pixels = media::decode_raster_pixels(frame)?;
+                track.retained_raster = Some(RetainedRaster {
+                    epoch: frame.epoch,
+                    frame_id: frame.frame_id,
+                    width: frame.width,
+                    height: frame.height,
+                    pixels: Arc::from(pixels),
+                });
+            } else {
+                let frame = media::parse_delta_raster_frame(
+                    &record.body,
+                    config.width,
+                    config.height,
+                    u32::from(config.maximum_delta_operations),
+                )?;
+                let Some(retained) = track.retained_raster.as_mut() else {
+                    track.recovery_pending = true;
+                    send_need_full_frame(key, track);
+                    return Err(invalid("raster delta has no retained full-frame base"));
+                };
+                if retained.epoch != frame.epoch || retained.frame_id != frame.base_frame_id {
+                    track.recovery_pending = true;
+                    send_need_full_frame(key, track);
+                    return Err(invalid(
+                        "raster delta does not name the retained base frame",
+                    ));
+                }
+                let pixels = Arc::make_mut(&mut retained.pixels);
+                for operation in frame.operations {
+                    apply_retained_raster_operation(
+                        pixels,
+                        retained.width,
+                        retained.height,
+                        operation,
+                    )?;
+                }
+                retained.epoch = frame.epoch;
+                retained.frame_id = frame.frame_id;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_retained_raster_operation(
+    pixels: &mut [u8],
+    canvas_width: u32,
+    canvas_height: u32,
+    operation: media::ParsedRasterDeltaOperation<'_>,
+) -> io::Result<()> {
+    let stride = usize::try_from(canvas_width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| invalid("raster stride overflows"))?;
+    let expected = media::rgba8_pixel_len(canvas_width, canvas_height)
+        .map_err(|_| invalid("raster dimensions overflow"))? as usize;
+    if pixels.len() != expected {
+        return Err(invalid("retained raster pixel length is inconsistent"));
+    }
+    match operation {
+        media::ParsedRasterDeltaOperation::Overwrite {
+            x,
+            y,
+            width,
+            height,
+            rgba,
+        } => {
+            let row_bytes = usize::try_from(width)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+                .ok_or_else(|| invalid("raster overwrite row overflows"))?;
+            let x_bytes = usize::try_from(x)
+                .ok()
+                .and_then(|x| x.checked_mul(4))
+                .ok_or_else(|| invalid("raster overwrite offset overflows"))?;
+            let height = usize::try_from(height)
+                .map_err(|_| invalid("raster overwrite height exceeds address space"))?;
+            for row in 0..height {
+                let destination = usize::try_from(y)
+                    .ok()
+                    .and_then(|y| y.checked_add(row))
+                    .and_then(|y| y.checked_mul(stride))
+                    .and_then(|offset| offset.checked_add(x_bytes))
+                    .ok_or_else(|| invalid("raster overwrite destination overflows"))?;
+                let source = row
+                    .checked_mul(row_bytes)
+                    .ok_or_else(|| invalid("raster overwrite source overflows"))?;
+                let destination_end = destination
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| invalid("raster overwrite destination extent overflows"))?;
+                let source_end = source
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| invalid("raster overwrite source extent overflows"))?;
+                if destination_end > pixels.len() || source_end > rgba.len() {
+                    return Err(invalid("raster overwrite extent exceeds its buffers"));
+                }
+                pixels[destination..destination_end].copy_from_slice(&rgba[source..source_end]);
+            }
+        }
+        media::ParsedRasterDeltaOperation::Copy {
+            destination_x,
+            destination_y,
+            width,
+            height,
+            source_x,
+            source_y,
+        } => {
+            let row_bytes = usize::try_from(width)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+                .ok_or_else(|| invalid("raster copy row overflows"))?;
+            let source_x = usize::try_from(source_x)
+                .ok()
+                .and_then(|x| x.checked_mul(4))
+                .ok_or_else(|| invalid("raster copy source offset overflows"))?;
+            let destination_x = usize::try_from(destination_x)
+                .ok()
+                .and_then(|x| x.checked_mul(4))
+                .ok_or_else(|| invalid("raster copy destination offset overflows"))?;
+            let height = usize::try_from(height)
+                .map_err(|_| invalid("raster copy height exceeds address space"))?;
+            let mut copy_row = |row: usize| -> io::Result<()> {
+                let source = usize::try_from(source_y)
+                    .ok()
+                    .and_then(|y| y.checked_add(row))
+                    .and_then(|y| y.checked_mul(stride))
+                    .and_then(|offset| offset.checked_add(source_x))
+                    .ok_or_else(|| invalid("raster copy source overflows"))?;
+                let destination = usize::try_from(destination_y)
+                    .ok()
+                    .and_then(|y| y.checked_add(row))
+                    .and_then(|y| y.checked_mul(stride))
+                    .and_then(|offset| offset.checked_add(destination_x))
+                    .ok_or_else(|| invalid("raster copy destination overflows"))?;
+                let source_end = source
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| invalid("raster copy source extent overflows"))?;
+                let destination_end = destination
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| invalid("raster copy destination extent overflows"))?;
+                if source_end > pixels.len() || destination_end > pixels.len() {
+                    return Err(invalid("raster copy extent exceeds the retained canvas"));
+                }
+                pixels.copy_within(source..source_end, destination);
+                Ok(())
+            };
+            if destination_y > source_y {
+                for row in (0..height).rev() {
+                    copy_row(row)?;
+                }
+            } else {
+                for row in 0..height {
+                    copy_row(row)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_media_record(
@@ -4412,6 +4614,7 @@ fn suspend_session(
             KindConfiguration::Video(_) | KindConfiguration::Audio(_)
         ) {
             track.retained = None;
+            track.retained_raster = None;
         }
         let _ = track.state.detach();
     }
@@ -4474,7 +4677,7 @@ fn detach_session(state: &mut State, session: u64) {
         .collect::<Vec<_>>();
     for key in tracks {
         let retain = state.tracks.get(&key).is_some_and(|track| {
-            track.retained.is_some()
+            has_retained_media(track)
                 && matches!(
                     track.configuration.kind,
                     KindConfiguration::EncodedImage(_) | KindConfiguration::Raster(_)
@@ -6647,8 +6850,78 @@ mod tests {
         assert_eq!(snapshot.sources.len(), 1);
         assert_eq!(snapshot.nodes.len(), 1);
         assert_eq!(snapshot.sources[0].key.producer, session);
-        assert!(snapshot.sources[0].retained.is_some());
+        assert!(snapshot.sources[0].retained_raster.is_some());
         assert_eq!(snapshot.nodes[0].config.node.anchor_id, Some(13));
+    }
+
+    #[test]
+    fn retained_raster_composes_vvpaint_style_deltas_into_latest_canvas() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(4);
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let mut configuration = raster(context, 9, 11);
+        let KindConfiguration::Raster(raster) = &mut configuration.kind else {
+            unreachable!()
+        };
+        raster.delta_enabled = true;
+        raster.maximum_delta_operations = 4;
+        let track = client
+            .create_track(configuration, &RequestMetadata::default())
+            .unwrap();
+        let channel = client.open_track_channel(&track).unwrap();
+
+        let blank = [0xff_u8; 16];
+        channel.send_raster(1, 1, &blank, false).unwrap();
+        let full = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!presenter.complete_bridge_delivery(full.delivery_id, true));
+
+        let stroke = [0x10, 0x20, 0x30, 0xff];
+        channel
+            .send_raster_delta(
+                1,
+                2,
+                1,
+                16_000,
+                16_000,
+                &[media::RasterDeltaOperation::Overwrite {
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    rgba: &stroke,
+                }],
+                false,
+            )
+            .unwrap();
+        let delta = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!presenter.complete_bridge_delivery(delta.delivery_id, true));
+
+        let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+        let retained = snapshot.sources[0]
+            .retained_raster
+            .as_ref()
+            .expect("delta-capable raster did not retain a composed canvas");
+        assert_eq!(retained.epoch, 1);
+        assert_eq!(retained.frame_id, 2);
+        let mut expected = blank;
+        expected[4..8].copy_from_slice(&stroke);
+        assert_eq!(&*retained.pixels, expected);
+        assert!(snapshot.sources[0].retained.is_none());
+
+        client.close().unwrap();
     }
 
     #[test]

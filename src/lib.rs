@@ -18,7 +18,7 @@ pub use outer::{
 pub use presenter::{
     AudioSourceConfig, BridgeProjection, ClipRect, GatewayLeaseReady, KeyframeRequestOutcome,
     MediaEvent, NodeConfig, OuterMediaProjection, PlayRequest, ProducerId, ProjectionSnapshot,
-    SceneNode, SceneNodeConfig, SemanticDescriptor, SnapshotSource, SnapshotSurface,
-    SourceDescriptor, SourceKey, VirtualVivid,
+    RetainedRaster, SceneNode, SceneNodeConfig, SemanticDescriptor, SnapshotSource,
+    SnapshotSurface, SourceDescriptor, SourceKey, VirtualVivid,
 };
 pub use types::*;
