@@ -1747,6 +1747,21 @@ fn handle_connection(
             )?;
             Ok(())
         }
+        ConnectionKind::FileTransfer => {
+            let writer = reader.writer();
+            let first = reader.read_record(ConnectionKind::FileTransfer)?;
+            writer.write_record(
+                messages::ERROR,
+                first.object_id,
+                &protocol_error(
+                    0,
+                    messages::ERROR_UNSUPPORTED_PROFILE,
+                    true,
+                    "file-drop-v1 is not implemented by this presenter",
+                )?,
+            )?;
+            Ok(())
+        }
     }
 }
 

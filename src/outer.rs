@@ -950,6 +950,8 @@ impl OuterBridge {
                 SessionEvent::AnchorReady { .. }
                 | SessionEvent::AnchorGone { .. }
                 | SessionEvent::ContextChanged { .. }
+                | SessionEvent::FileDropOffered(_)
+                | SessionEvent::FileDropCancelled(_)
                 | SessionEvent::Other { .. } => {}
             }
         }
