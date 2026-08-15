@@ -1820,6 +1820,13 @@ fn handle_control(
                 }
             }
         }
+        if record.record_type == messages::ADVANCE_CHANNEL {
+            // A timed channel can be parked behind projection or linked-video recovery while the
+            // producer advances it. Wake the retired worker after the mutation is visible so it
+            // observes the generation mismatch and exits; otherwise a producer that synchronously
+            // retires its old audio worker during a seek can wait forever.
+            changed.notify_all();
+        }
         if record.record_type == messages::GOODBYE {
             clean = true;
             break;
@@ -5849,6 +5856,146 @@ mod tests {
         };
         assert!(source_playing(seeking.info().session_id));
         assert!(source_playing(neighbor.info().session_id));
+        seeking.close().unwrap();
+        neighbor.close().unwrap();
+    }
+
+    #[test]
+    fn advancing_a_parked_timed_channel_wakes_only_its_retired_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(16);
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut seeking =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let mut neighbor =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let seeking_context = seeking.info().root_context_id;
+        let neighbor_context = neighbor.info().root_context_id;
+        seeking
+            .create_surface(surface(seeking_context, 9), &RequestMetadata::default())
+            .unwrap();
+        neighbor
+            .create_surface(surface(neighbor_context, 9), &RequestMetadata::default())
+            .unwrap();
+        let seeking_track = seeking
+            .create_track(audio(seeking_context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let neighbor_track = neighbor
+            .create_track(audio(neighbor_context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let seeking_channel = Arc::new(seeking.open_track_channel(&seeking_track).unwrap());
+        let neighbor_channel = Arc::new(neighbor.open_track_channel(&neighbor_track).unwrap());
+
+        let spawn_two_packets = |channel: Arc<vivid_sdk::TrackChannel>, pts_us: i64| {
+            let (done_sender, done_receiver) = mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                let send = |packet_id, packet_pts_us| {
+                    channel.send_audio(media::AudioPacket {
+                        epoch: 1,
+                        packet_id,
+                        pts_us: packet_pts_us,
+                        dts_us: packet_pts_us,
+                        duration_us: 20_000,
+                        trim_start_samples: 0,
+                        trim_end_samples: 0,
+                        data: &[0; 16],
+                    })
+                };
+                let result = send(1, pts_us).and_then(|_| send(2, pts_us + 20_000));
+                let _ = done_sender.send(result);
+            });
+            (worker, done_receiver)
+        };
+        let (seeking_worker, seeking_done) = spawn_two_packets(seeking_channel, 0);
+        let (neighbor_worker, neighbor_done) = spawn_two_packets(neighbor_channel, 1_000_000);
+
+        let track_key = |session, context| TrackKey {
+            surface: SurfaceKey {
+                session,
+                context,
+                surface: 9,
+            },
+            track: 11,
+        };
+        let seeking_key = track_key(seeking.info().session_id, seeking_context);
+        let neighbor_key = track_key(neighbor.info().session_id, neighbor_context);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = lock(&presenter.state);
+            if state
+                .tracks
+                .get(&seeking_key)
+                .is_some_and(|track| track.projection_blocked)
+                && state
+                    .tracks
+                    .get(&neighbor_key)
+                    .is_some_and(|track| track.projection_blocked)
+            {
+                break;
+            }
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "timed audio channels never parked"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        seeking
+            .advance_channel(&seeking_track, 1, &RequestMetadata::default())
+            .unwrap();
+        assert!(
+            seeking_done.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the retired audio sender stayed parked after ADVANCE_CHANNEL"
+        );
+        assert!(
+            neighbor_done
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "advancing one owner completed the unrelated owner's parked sender"
+        );
+        let replacement = seeking.open_track_channel(&seeking_track).unwrap();
+        assert_eq!(
+            seeking
+                .query_track(&seeking_track)
+                .unwrap()
+                .channel_generation,
+            ChannelGeneration::new(2)
+        );
+        assert_eq!(
+            lock(&presenter.state)
+                .tracks
+                .get(&neighbor_key)
+                .unwrap()
+                .state
+                .channel_generation,
+            ChannelGeneration::ONE
+        );
+
+        presenter.projection_snapshot(&HashSet::from([7]));
+        for _ in 0..2 {
+            let delivery = received.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(delivery.source.producer, neighbor.info().session_id);
+            assert!(!presenter.complete_bridge_delivery(delivery.delivery_id, true));
+        }
+        assert!(
+            neighbor_done
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(neighbor.query_track(&neighbor_track).unwrap().lifecycle, 1);
+
+        seeking_worker.join().unwrap();
+        neighbor_worker.join().unwrap();
+        replacement.close().unwrap();
         seeking.close().unwrap();
         neighbor.close().unwrap();
     }
