@@ -1338,7 +1338,15 @@ impl VirtualVivid {
                 }
                 track.recovery_pending = true;
                 resync = true;
-                if matches!(track.configuration.kind, KindConfiguration::Video(_)) {
+                if matches!(track.configuration.kind, KindConfiguration::Video(_))
+                    && delivery.random_access
+                {
+                    // Only a replacement keyframe that failed to reach the outer leaves the outer
+                    // decoder with nothing to resume on, which is the state linked audio must not
+                    // run ahead of. Re-arming on a failed inter frame instead parks audio behind a
+                    // keyframe the gateway has already accepted and handed to the bridge, and the
+                    // bridge publishes the replacement PLAY that would drain it only once linked
+                    // audio has submitted its own pre-roll.
                     track.gate_linked_audio_for_recovery = true;
                 }
             }
@@ -3416,6 +3424,14 @@ fn track_loop(
                 })
             })
             .flatten();
+        // The first record of a replacement generation on an audio track the outer already
+        // presented is a seek's new epoch, not a stale sample from the retired one.
+        let audio_seek_handoff = configuration.mode == TrackMode::Timed
+            && matches!(configuration.kind, KindConfiguration::Audio(_))
+            && generation != ChannelGeneration::ONE
+            && state.tracks.get(&key).is_some_and(|track| {
+                track.outer_presented && track.state.milestones & MILESTONE_OUTPUT_READY == 0
+            });
         let prime_live_audio_before_projection = configuration.mode == TrackMode::Live
             && matches!(configuration.kind, KindConfiguration::Audio(_))
             && state
@@ -3448,11 +3464,18 @@ fn track_loop(
         }
         loop {
             let projected = state.projected_sources.contains(&source);
-            let linked_video_recovering = linked_video.is_some_and(|video| {
-                state.tracks.get(&video).is_some_and(|track| {
-                    track.recovery_pending && track.gate_linked_audio_for_recovery
-                })
-            });
+            // The recovery gate holds linked audio that still belongs to the retired epoch. A seek
+            // hands over a whole replacement generation instead, and the outer relay publishes the
+            // replacement PLAY only once every linked member has submitted pre-roll — so parking
+            // that handoff record holds the PLAY the recovery itself is waiting for. Let it pass:
+            // the outer clock cannot start before the producer's own atomic activation, and
+            // `resume_after_pts_us` still discards anything below the recovered keyframe.
+            let linked_video_recovering = !audio_seek_handoff
+                && linked_video.is_some_and(|video| {
+                    state.tracks.get(&video).is_some_and(|track| {
+                        track.recovery_pending && track.gate_linked_audio_for_recovery
+                    })
+                });
             if !timed || (projected && !linked_video_recovering) {
                 break;
             }
@@ -3546,6 +3569,14 @@ fn track_loop(
                 track.last_record_sequence = record.sequence;
                 track.last_pts_us = pts;
             }
+            if audio_seek_handoff {
+                // A first generation earns its rolling window from its first completed delivery.
+                // A replacement generation cannot: the outer relay forwards one pre-PLAY pre-roll
+                // record per track, and the producer will not issue that PLAY until it has filled
+                // the audio prebuffer the window exists for. Re-grant the window this exact track
+                // already earned, so the seek's prebuffer does not deadlock against its own PLAY.
+                grant_rolling_flow(key, track);
+            }
             if random_access && events.is_none() {
                 // Focused eventless tests terminate delivery locally. A live bridge keeps
                 // recovery pending until complete_bridge_delivery confirms outer acceptance.
@@ -3570,6 +3601,15 @@ fn track_loop(
                     track.resume_after_pts_us = Some(pts);
                 }
             }
+            // Accepting the replacement keyframe is what arms the catch-up floor above, and that
+            // floor - not a parked worker - is what keeps stale samples out of the new physical
+            // audio clock. Release linked audio here rather than on the outer acknowledgement:
+            // the outer relay forwards one pre-PLAY record per track and publishes the replacement
+            // PLAY only once every linked member has submitted one, so audio held for that
+            // acknowledgement is holding the activation the acknowledgement is waiting for. A
+            // failed delivery re-arms the gate along with recovery.
+            let track = state.tracks.get_mut(&key).unwrap();
+            track.gate_linked_audio_for_recovery = false;
         }
         if discard_locally {
             // Recovery video and pre-recovery linked audio cannot enter the replacement outer
@@ -4784,6 +4824,35 @@ fn node_uses_live_anchor(
             .is_some_and(|anchor| anchors.contains_key(&anchor))
 }
 
+/// The bounded rolling window a projected track's producer may keep in flight.
+///
+/// The immutable inflight-byte limit the track declared is the ceiling; `ROLLING_FLOW_RECORDS`
+/// keeps a single source from occupying the bridge with more small records than an
+/// acknowledgement round trip needs.
+fn rolling_flow_window(track: &TrackEntry) -> (u64, u64) {
+    let maximum_record_body = u64::from(track.configuration.maximum_record_body);
+    let records = ROLLING_FLOW_RECORDS.min(
+        track
+            .configuration
+            .maximum_inflight_body_bytes
+            .checked_div(maximum_record_body)
+            .unwrap_or(0)
+            .max(INITIAL_FLOW_RECORDS),
+    );
+    let bytes = track
+        .configuration
+        .maximum_inflight_body_bytes
+        .min(maximum_record_body.saturating_mul(records));
+    (bytes, records)
+}
+
+/// Expand a track to its bounded rolling window and publish the new maxima.
+fn grant_rolling_flow(key: TrackKey, track: &mut TrackEntry) {
+    let (bytes, records) = rolling_flow_window(track);
+    track.state.flow.raise_maxima(bytes, records);
+    send_flow_update(key, track);
+}
+
 /// Return the flow allowance a finished delivery was holding.
 ///
 /// A pane producer spends allowance when it writes a record and only gets it back when the
@@ -4806,25 +4875,10 @@ fn release_delivery_allowance(state: &mut State, delivery: &PendingDelivery) {
         .saturating_add(delivery.bytes);
     let returned_records = track.state.flow.maximum_media_records.saturating_add(1);
     let maximum_record_body = u64::from(track.configuration.maximum_record_body);
-    let rolling_records = if projected {
-        ROLLING_FLOW_RECORDS.min(
-            track
-                .configuration
-                .maximum_inflight_body_bytes
-                .checked_div(maximum_record_body)
-                .unwrap_or(0)
-                .max(INITIAL_FLOW_RECORDS),
-        )
+    let (rolling_bytes, rolling_records) = if projected {
+        rolling_flow_window(track)
     } else {
-        INITIAL_FLOW_RECORDS
-    };
-    let rolling_bytes = if projected {
-        track
-            .configuration
-            .maximum_inflight_body_bytes
-            .min(maximum_record_body.saturating_mul(rolling_records))
-    } else {
-        maximum_record_body
+        (maximum_record_body, INITIAL_FLOW_RECORDS)
     };
     let available_bytes = returned_bytes.saturating_sub(track.state.flow.sent_body_bytes);
     let available_records = returned_records.saturating_sub(track.state.flow.sent_media_records);
@@ -6329,6 +6383,196 @@ mod tests {
         let delivered = received.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(delivered.source, source);
         assert!(!presenter.complete_bridge_delivery(delivered.delivery_id, true));
+        client.close().unwrap();
+    }
+
+    /// A seek retires both channels, and the outer relay will not publish the replacement PLAY
+    /// until every linked member has submitted pre-roll. Parking the replacement audio behind the
+    /// linked video's recovery, or making it earn its prebuffer window from an outer delivery that
+    /// PLAY gates, closes a cycle the producer resolves only by dropping sound for the rest of the
+    /// file.
+    #[test]
+    fn seek_hands_over_replacement_audio_without_waiting_on_video_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(32);
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let video = client
+            .create_track(video(context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let audio = client
+            .create_track(audio(context, 9, 12), &RequestMetadata::default())
+            .unwrap();
+        let video_channel = client.open_track_channel(&video).unwrap();
+        let audio_channel = client.open_track_channel(&audio).unwrap();
+        let prepared = presenter
+            .prepare_projection_snapshot_with_viewports(&HashSet::from([7]), &HashMap::new());
+        let video_source = prepared
+            .sources
+            .iter()
+            .find(|source| matches!(source.descriptor, SourceDescriptor::Video(_)))
+            .unwrap()
+            .key;
+        let audio_source = prepared
+            .sources
+            .iter()
+            .find(|source| matches!(source.descriptor, SourceDescriptor::Audio(_)))
+            .unwrap()
+            .key;
+        presenter.activate_bridge_projection(
+            &prepared.sources.iter().map(|source| source.key).collect(),
+        );
+
+        // Present one generation of each track so the seek below is a replacement handoff.
+        video_channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 40_000,
+                key: true,
+                data: &[0, 0, 0, 1, 0x65, 0x88],
+            })
+            .unwrap();
+        let first_video = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first_video.source, video_source);
+        assert!(!presenter.complete_bridge_delivery(first_video.delivery_id, true));
+        audio_channel
+            .send_audio(media::AudioPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 20_000,
+                trim_start_samples: 0,
+                trim_end_samples: 0,
+                data: &[0; 16],
+            })
+            .unwrap();
+        let first_audio = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first_audio.source, audio_source);
+        assert!(!presenter.complete_bridge_delivery(first_audio.delivery_id, true));
+
+        // Seek: retire both generations, then arm the linked-audio recovery gate exactly as the
+        // outer presenter does when it recreates the video track for the new epoch.
+        client
+            .advance_channel(&video, 1, &RequestMetadata::default())
+            .unwrap();
+        let _ = video_channel.close();
+        client.flush(&video, 2).unwrap();
+        let video_channel = client.open_track_channel(&video).unwrap();
+        client
+            .advance_channel(&audio, 1, &RequestMetadata::default())
+            .unwrap();
+        let _ = audio_channel.close();
+        client.flush(&audio, 2).unwrap();
+        let audio_channel = client.open_track_channel(&audio).unwrap();
+        assert_eq!(
+            presenter.request_keyframe(video_source, None, 5),
+            KeyframeRequestOutcome::Forwarded
+        );
+        {
+            let state = lock(&presenter.state);
+            let track = state.tracks.get(&inner_track_key(video_source)).unwrap();
+            assert!(track.recovery_pending && track.gate_linked_audio_for_recovery);
+        }
+
+        // The producer's next step is its 100 ms prebuffer, and it has not sent a replacement
+        // keyframe yet. Both must complete against the retired-generation flow the track already
+        // earned, with no outer acknowledgement available.
+        let target_pts_us = 8_000_000;
+        let audio_channel = Arc::new(audio_channel);
+        let (written, writes) = mpsc::sync_channel(8);
+        let prebuffer_channel = audio_channel.clone();
+        let prebuffer = thread::spawn(move || {
+            for packet_id in 2_u64..=6 {
+                let pts_us = target_pts_us + i64::try_from(packet_id - 2).unwrap() * 20_000;
+                prebuffer_channel
+                    .send_audio(media::AudioPacket {
+                        epoch: 2,
+                        packet_id,
+                        pts_us,
+                        dts_us: pts_us,
+                        duration_us: 20_000,
+                        trim_start_samples: 0,
+                        trim_end_samples: 0,
+                        data: &[0; 16],
+                    })
+                    .unwrap();
+                written.send(packet_id).unwrap();
+            }
+        });
+        for packet_id in 2_u64..=6 {
+            assert_eq!(
+                writes.recv_timeout(Duration::from_secs(2)).ok(),
+                Some(packet_id),
+                "replacement audio blocked on a window only the outer PLAY it gates could return"
+            );
+        }
+        client
+            .wait_track(
+                &audio,
+                TrackWaitCondition::MilestoneSet,
+                Some(MILESTONE_OUTPUT_READY),
+                500_000,
+            )
+            .expect("replacement audio readiness waited on the linked video's recovery");
+        let handoff = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            handoff.source, audio_source,
+            "the replacement audio the outer relay needs before PLAY never reached the bridge"
+        );
+        assert!(!presenter.complete_bridge_delivery(handoff.delivery_id, true));
+
+        // Accepting the replacement keyframe releases the gate for the rest of the generation and
+        // arms the catch-up floor that keeps retired-epoch samples out of the new clock.
+        video_channel
+            .send_video(media::VideoPacket {
+                epoch: 3,
+                packet_id: 2,
+                pts_us: target_pts_us - 400_000,
+                dts_us: target_pts_us - 400_000,
+                duration_us: 40_000,
+                key: true,
+                data: &[0, 0, 0, 1, 0x65, 0xaa],
+            })
+            .unwrap();
+        let recovered = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(recovered.source, video_source);
+        assert_eq!(
+            recovered.recovered_keyframe,
+            Some((3, target_pts_us - 400_000))
+        );
+        {
+            let state = lock(&presenter.state);
+            let track = state.tracks.get(&inner_track_key(video_source)).unwrap();
+            assert!(
+                !track.gate_linked_audio_for_recovery,
+                "linked audio stayed parked on an acknowledgement that the activation it gates has to precede"
+            );
+        }
+        for _ in 0..4 {
+            let queued = received.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(queued.source, audio_source);
+            assert!(!presenter.complete_bridge_delivery(queued.delivery_id, true));
+        }
+
+        prebuffer.join().unwrap();
+        let _ = video_channel.close();
+        let _ = audio_channel.close();
         client.close().unwrap();
     }
 

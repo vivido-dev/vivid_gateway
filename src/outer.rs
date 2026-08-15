@@ -1262,6 +1262,22 @@ impl OuterBridge {
                 .ok_or_else(|| invalid_data("active outer track is missing"))?;
             let status = self.session.query_track(&track.track)?;
             if status.milestones & vivid_sdk::MILESTONE_OUTPUT_READY == 0 {
+                // Slot activation needs decoded output, and a decoder routinely wants several
+                // access units before it emits its first picture. The bounded pre-roll allowance
+                // is what feeds it, and a blocked attempt is stable evidence that the records
+                // already forwarded were not enough - so admit one more, up to the ceiling this
+                // track declared. Without this the allowance and the readiness it is waiting for
+                // each wait on the other: the producer's atomic activation never lands, its flow
+                // is never returned, and the pane stops responding.
+                let track = self
+                    .tracks
+                    .get_mut(key)
+                    .ok_or_else(|| invalid_data("active outer track is missing"))?;
+                let next = track
+                    .media_submitted
+                    .saturating_add(1)
+                    .min(track.preplay_ceiling);
+                track.preplay_limit = track.preplay_limit.max(next);
                 return Ok(());
             }
             bindings.push(SlotBinding {
@@ -2790,6 +2806,171 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(completed, HashSet::from([1, 2, 3, 4]));
+    }
+
+    /// A decoder routinely wants several access units before it emits its first picture, and slot
+    /// activation waits on that picture. The bounded pre-roll allowance is the only thing that
+    /// feeds it, so if a blocked attempt is not itself the evidence that admits one more record,
+    /// the allowance and the readiness wait on each other: the nested producer's atomic activation
+    /// never lands, its flow is never returned, and its pane stops responding.
+    #[test]
+    #[cfg(unix)]
+    fn a_blocked_slot_activation_admits_one_more_bounded_pre_roll_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("preroll.sock");
+        let listener = match TestSocketListener::bind(socket.clone()) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping pre-roll allowance socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("pre-roll listener failed: {error}"),
+        };
+        let presenter =
+            crate::presenter::VirtualVivid::start(listener, crate::types::MediaConfig::default())
+                .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut bridge = OuterBridge::connect(
+            format!("unix:{}", socket.display()),
+            Zeroizing::new(secret),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+
+        let video_key = BridgeSourceKey {
+            producer: 3,
+            context: 1,
+            surface: 7,
+            track: 11,
+        };
+        let surface = BridgeSurface {
+            key: BridgeSurfaceKey {
+                producer: video_key.producer,
+                context: video_key.context,
+                surface: video_key.surface,
+            },
+            logical_width: 16,
+            logical_height: 16,
+            capture_policy: 0,
+            descriptor: crate::types::BridgeSourceDescriptor {
+                role: 1,
+                title: "seek pre-roll".into(),
+                content_revision: 1,
+                semantic_availability: 0,
+                locator: String::new(),
+            },
+        };
+        let video = BridgeSource {
+            key: video_key,
+            kind: BridgeSourceKind::Video {
+                codec: "h264".into(),
+                packetization: "h264-annexb-au-v1".into(),
+                extradata: Vec::new(),
+                width: 16,
+                height: 16,
+                profile: 0,
+                level: 0,
+                bitrate: 8_000_000,
+                color_primaries: 1,
+                transfer: 1,
+                matrix: 1,
+                range: 1,
+                sar_num: 1,
+                sar_den: 1,
+                max_access_unit_bytes: 1024,
+                codec_string: None,
+                decoder_config: None,
+            },
+            live: false,
+            active: true,
+            audio_gain: None,
+            capture_policy: 0,
+            descriptor: None,
+            playing: false,
+            play_request: default_play_request(),
+            eos_epoch: None,
+            causation_id: None,
+        };
+        let node = BridgeNode {
+            producer: video_key.producer,
+            node: 1,
+            fragment: 0,
+            surface: surface.key,
+            x: 0,
+            y: 0,
+            width: 16_i64 << 32,
+            height: 16_i64 << 32,
+            z_index: 0,
+            visible: true,
+            clip: crate::types::BridgeClipRect {
+                x: 0,
+                y: 0,
+                width: 16_i64 << 32,
+                height: 16_i64 << 32,
+            },
+        };
+        bridge.rebuild(&[surface], &[video], &[node]).unwrap();
+
+        // Model a decoder that has not produced a picture yet: ask the outer presenter for a
+        // recovery unit above the epoch this pre-roll carries, so it consumes the record without
+        // reaching `MILESTONE_OUTPUT_READY`.
+        let outer_source = presenter.projection_snapshot(&HashSet::from([7])).sources[0].key;
+        assert_eq!(
+            presenter.request_keyframe(outer_source, Some(9), 5),
+            crate::KeyframeRequestOutcome::Forwarded
+        );
+
+        let body = media::video_packet_body(media::VideoPacket {
+            epoch: 1,
+            packet_id: 1,
+            pts_us: 0,
+            dts_us: 0,
+            duration_us: 40_000,
+            key: true,
+            data: &[0, 0, 0, 1, 0x65, 0x88],
+        })
+        .unwrap();
+        assert!(
+            bridge
+                .media_chunk(
+                    1,
+                    video_key,
+                    messages::VIDEO_PACKET,
+                    0,
+                    body.len() as u32,
+                    true,
+                    body,
+                )
+                .unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bridge.tracks[&video_key].media_inflight != 0 {
+            let _ = bridge.take_media_completions();
+            assert!(
+                Instant::now() < deadline,
+                "the first pre-roll record never returned its ingress allowance"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !bridge.can_accept_media(video_key),
+            "the initial pre-roll grant is one record"
+        );
+
+        bridge.retry_pending_activation().unwrap();
+        assert!(
+            !bridge.tracks[&video_key].activated,
+            "the outer track has no decoded output to activate on"
+        );
+        assert!(
+            bridge.can_accept_media(video_key),
+            "a blocked activation must admit one more bounded pre-roll record, or the allowance and the readiness it feeds wait on each other"
+        );
+        assert!(
+            bridge.tracks[&video_key].preplay_limit <= bridge.tracks[&video_key].preplay_ceiling,
+            "the pre-roll allowance must stay inside the ceiling this track declared"
+        );
     }
 
     const RASTER_WIDTH: u32 = 4;
