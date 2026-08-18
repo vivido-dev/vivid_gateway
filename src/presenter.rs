@@ -469,6 +469,13 @@ struct NodeKey {
     node: u64,
 }
 
+#[derive(Clone, Copy)]
+struct TerminalAnchor {
+    row: i32,
+    column: usize,
+    alternate: bool,
+}
+
 struct SessionRuntime {
     pane: PaneId,
     closed: bool,
@@ -480,7 +487,8 @@ struct SessionRuntime {
     root_context: u64,
     scene_revision: SceneRevision,
     target_generation: TargetGeneration,
-    anchors: HashMap<(u64, u64), (i32, usize)>,
+    anchors: HashMap<(u64, u64), TerminalAnchor>,
+    alternate_screen: bool,
     seen_anchors: HashSet<(u64, u64)>,
     cancelled_waits: HashSet<u64>,
     pending_waits: usize,
@@ -586,6 +594,7 @@ struct State {
     leases: HashMap<(u64, u64), LeaseEntry>,
     metrics: HashMap<PaneId, Metrics>,
     targets: HashMap<PaneId, TargetState>,
+    alternate_panes: HashSet<PaneId>,
     sessions: HashMap<u64, SessionRuntime>,
     surfaces: HashMap<SurfaceKey, SurfaceEntry>,
     tracks: HashMap<TrackKey, TrackEntry>,
@@ -604,6 +613,23 @@ struct State {
     play_commands: Vec<BridgeSourceKey>,
     connections: usize,
     delivery_metrics: DeliveryMetrics,
+}
+
+fn notify_anchor_gone(session: &SessionRuntime, context: u64, anchor: u64) {
+    if let Ok(body) = Envelope::new(
+        0,
+        vec![
+            (0, Value::Unsigned(context)),
+            (1, Value::Unsigned(anchor)),
+            (2, Value::Unsigned(1)),
+        ],
+    )
+    .encode()
+    {
+        let _ = session
+            .writer
+            .write_record(messages::ANCHOR_GONE, anchor, &body);
+    }
 }
 
 pub struct VirtualVivid {
@@ -664,6 +690,7 @@ impl VirtualVivid {
             leases: HashMap::new(),
             metrics: HashMap::new(),
             targets: HashMap::new(),
+            alternate_panes: HashSet::new(),
             sessions: HashMap::new(),
             surfaces: HashMap::new(),
             tracks: HashMap::new(),
@@ -735,6 +762,7 @@ impl VirtualVivid {
         }
         state.metrics.remove(&pane);
         state.targets.remove(&pane);
+        state.alternate_panes.remove(&pane);
         advance_projection(&mut state);
     }
 
@@ -938,7 +966,14 @@ impl VirtualVivid {
         Ok(1)
     }
 
-    pub fn observe_marker(&self, pane: PaneId, value: &str, row: i32, column: usize) {
+    pub fn observe_marker(
+        &self,
+        pane: PaneId,
+        value: &str,
+        row: i32,
+        column: usize,
+        alternate: bool,
+    ) {
         let marker = anchor::parse_marker(value).or_else(|_| anchor::parse_conpty_marker(value));
         let Ok(marker) = marker else {
             return;
@@ -961,7 +996,14 @@ impl VirtualVivid {
             return;
         }
         session.seen_anchors.insert(key);
-        session.anchors.insert(key, (row, column));
+        session.anchors.insert(
+            key,
+            TerminalAnchor {
+                row,
+                column,
+                alternate,
+            },
+        );
         let body = Envelope::new(
             0,
             vec![
@@ -985,7 +1027,7 @@ impl VirtualVivid {
         advance_projection(&mut state);
     }
 
-    pub fn scroll_anchors(&self, pane: PaneId, lines: i32) {
+    pub fn scroll_anchors(&self, pane: PaneId, lines: i32, alternate: bool) {
         let mut state = lock(&self.state);
         if !state.config.target.accepts_anchors() {
             return;
@@ -995,14 +1037,18 @@ impl VirtualVivid {
             .values_mut()
             .filter(|session| session.pane == pane)
         {
-            for (line, _) in session.anchors.values_mut() {
-                *line = line.saturating_sub(lines);
+            for anchor in session
+                .anchors
+                .values_mut()
+                .filter(|anchor| anchor.alternate == alternate)
+            {
+                anchor.row = anchor.row.saturating_sub(lines);
             }
         }
         advance_projection(&mut state);
     }
 
-    pub fn clear_anchors(&self, pane: PaneId) {
+    pub fn clear_anchors(&self, pane: PaneId, alternate: bool) {
         let mut state = lock(&self.state);
         if !state.config.target.accepts_anchors() {
             return;
@@ -1012,21 +1058,44 @@ impl VirtualVivid {
             .values_mut()
             .filter(|session| session.pane == pane)
         {
-            let anchors = std::mem::take(&mut session.anchors);
-            for ((context, anchor), _) in anchors {
-                if let Ok(body) = Envelope::new(
-                    0,
-                    vec![
-                        (0, Value::Unsigned(context)),
-                        (1, Value::Unsigned(anchor)),
-                        (2, Value::Unsigned(1)),
-                    ],
-                )
-                .encode()
-                {
-                    let _ = session
-                        .writer
-                        .write_record(messages::ANCHOR_GONE, anchor, &body);
+            let removed = session
+                .anchors
+                .iter()
+                .filter_map(|(&key, anchor)| (anchor.alternate == alternate).then_some(key))
+                .collect::<Vec<_>>();
+            for (context, anchor) in removed {
+                session.anchors.remove(&(context, anchor));
+                notify_anchor_gone(session, context, anchor);
+            }
+        }
+        advance_projection(&mut state);
+    }
+
+    pub fn set_alternate_screen(&self, pane: PaneId, alternate: bool) {
+        let mut state = lock(&self.state);
+        let changed = if alternate {
+            state.alternate_panes.insert(pane)
+        } else {
+            state.alternate_panes.remove(&pane)
+        };
+        if !changed {
+            return;
+        }
+        for session in state
+            .sessions
+            .values_mut()
+            .filter(|session| session.pane == pane)
+        {
+            session.alternate_screen = alternate;
+            if !alternate {
+                let removed = session
+                    .anchors
+                    .iter()
+                    .filter_map(|(&key, anchor)| anchor.alternate.then_some(key))
+                    .collect::<Vec<_>>();
+                for (context, anchor) in removed {
+                    session.anchors.remove(&(context, anchor));
+                    notify_anchor_gone(session, context, anchor);
                 }
             }
         }
@@ -2299,6 +2368,7 @@ fn establish_session(
             SceneRevision::ZERO,
             TargetGeneration::new(target.generation),
         ));
+    let alternate_screen = state.alternate_panes.contains(&pane);
     state.sessions.insert(
         session_id,
         SessionRuntime {
@@ -2313,6 +2383,7 @@ fn establish_session(
             scene_revision,
             target_generation,
             anchors: HashMap::new(),
+            alternate_screen,
             seen_anchors: HashSet::new(),
             cancelled_waits: HashSet::new(),
             pending_waits: 0,
@@ -2947,9 +3018,9 @@ fn dispatch_control(
                 (1, Value::Unsigned(anchor)),
                 (2, Value::Unsigned(if position.is_some() { 1 } else { 0 })),
             ];
-            if let Some((row, column)) = position {
-                payload.push((3, Value::Unsigned(*column as u64)));
-                payload.push((4, nonnegative(*row)));
+            if let Some(position) = position {
+                payload.push((3, Value::Unsigned(position.column as u64)));
+                payload.push((4, nonnegative(position.row)));
                 payload.push((5, Value::Bool(true)));
             }
             payload.push((6, Value::Unsigned(session.target_generation.get())));
@@ -4284,9 +4355,12 @@ fn projected_node_config(
     let anchor_id = if kind == 2 {
         let context = geometry.required_u64(6).ok()?;
         let anchor = geometry.required_u64(7).ok()?;
-        let (row, column) = session.anchors.get(&(context, anchor)).copied()?;
-        x = x.checked_add(i64::try_from(column).ok()?.checked_shl(32)?)?;
-        y = y.checked_add(i64::from(row).checked_shl(32)?)?;
+        let position = session.anchors.get(&(context, anchor)).copied()?;
+        if position.alternate != session.alternate_screen {
+            return None;
+        }
+        x = x.checked_add(i64::try_from(position.column).ok()?.checked_shl(32)?)?;
+        y = y.checked_add(i64::from(position.row).checked_shl(32)?)?;
         Some(anchor)
     } else if kind == 1 {
         None
@@ -4809,7 +4883,7 @@ fn detach_session(state: &mut State, session: u64) {
 
 fn node_uses_live_anchor(
     node: &ProtocolSceneNode,
-    anchors: &HashMap<(u64, u64), (i32, usize)>,
+    anchors: &HashMap<(u64, u64), TerminalAnchor>,
 ) -> bool {
     let geometry = Value::Map(node.geometry.clone());
     let Ok(geometry) = StrictMap::new(
@@ -7224,7 +7298,7 @@ mod tests {
         assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
 
         let marker = client.anchor_marker(context, 13).unwrap();
-        presenter.observe_marker(7, &marker[2..marker.len() - 2], 2, 3);
+        presenter.observe_marker(7, &marker[2..marker.len() - 2], 2, 3, false);
         client
             .create_node(
                 &SceneNode {
@@ -7252,6 +7326,48 @@ mod tests {
                 &RequestMetadata::default(),
             )
             .unwrap();
+        client
+            .create_node(
+                &SceneNode {
+                    owning_context_id: context,
+                    node_id: 18,
+                    surface_context_id: surface.context_id(),
+                    surface_id: surface.id(),
+                    geometry: vec![
+                        (0, Value::Unsigned(1)),
+                        (1, Value::Unsigned(0)),
+                        (2, Value::Unsigned(0)),
+                        (3, Value::Unsigned(80_u64 << 32)),
+                        (4, Value::Unsigned(24_u64 << 32)),
+                        (5, Value::Unsigned(1)),
+                    ],
+                    fit: Fit::Contain,
+                    linear_sampling: true,
+                    z_index: 1,
+                    visible: true,
+                    opacity: u16::MAX,
+                    clip: None,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+
+        presenter.set_alternate_screen(7, true);
+        let alternate = presenter.projection_snapshot(&HashSet::from([7]));
+        assert_eq!(alternate.nodes.len(), 1);
+        assert_eq!(alternate.nodes[0].config.node.node_id, 18);
+        assert_eq!(alternate.nodes[0].config.node.anchor_id, None);
+        presenter.set_alternate_screen(7, false);
+        assert_eq!(
+            presenter
+                .projection_snapshot(&HashSet::from([7]))
+                .nodes
+                .len(),
+            2
+        );
+        client
+            .delete_node(context, 18, &RequestMetadata::default())
+            .unwrap();
         client.close().unwrap();
 
         let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
@@ -7268,6 +7384,24 @@ mod tests {
             scrolled.nodes[0].config.node.y,
             6_i64 << 32,
             "revealing four scrollback rows must push an anchor at row two down to row six"
+        );
+
+        presenter.set_alternate_screen(7, true);
+        assert!(
+            presenter
+                .projection_snapshot(&HashSet::from([7]))
+                .nodes
+                .is_empty(),
+            "primary-screen images must be hidden behind an alternate-screen application"
+        );
+        presenter.set_alternate_screen(7, false);
+        assert_eq!(
+            presenter
+                .projection_snapshot(&HashSet::from([7]))
+                .nodes
+                .len(),
+            1,
+            "leaving the alternate screen must reveal the retained primary-screen image"
         );
     }
 
@@ -7437,7 +7571,7 @@ mod tests {
                 .create_track(raster(context, 9, 11), &RequestMetadata::default())
                 .unwrap();
             let marker = client.anchor_marker(context, 13).unwrap();
-            presenter.observe_marker(pane, &marker[2..marker.len() - 2], 2, 3);
+            presenter.observe_marker(pane, &marker[2..marker.len() - 2], 2, 3, false);
             client
                 .create_node(
                     &SceneNode {
