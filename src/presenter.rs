@@ -4293,7 +4293,10 @@ fn projected_node_config(
     } else {
         return None;
     };
-    y = y.checked_sub(i64::try_from(viewport_offset).ok()?.checked_shl(32)?)?;
+    // Copy mode displays logical row `r` at viewport row `r + offset`: revealing older
+    // scrollback pushes the live grid, and media anchored to it, down the pane.  Applying the
+    // inverse transform here made anchored images climb upward while their text moved downward.
+    y = y.checked_add(i64::try_from(viewport_offset).ok()?.checked_shl(32)?)?;
     let clip = node.clip.as_ref().and_then(|clip| {
         let clip_value = Value::Map(clip.clone());
         let clip = StrictMap::new("terminal clip", &clip_value, &[0, 1, 2, 3]).ok()?;
@@ -7258,6 +7261,14 @@ mod tests {
         assert_eq!(snapshot.sources[0].key.producer, session);
         assert!(snapshot.sources[0].retained_raster.is_some());
         assert_eq!(snapshot.nodes[0].config.node.anchor_id, Some(13));
+
+        let scrolled = presenter
+            .projection_snapshot_with_viewports(&HashSet::from([7]), &HashMap::from([(7, 4)]));
+        assert_eq!(
+            scrolled.nodes[0].config.node.y,
+            6_i64 << 32,
+            "revealing four scrollback rows must push an anchor at row two down to row six"
+        );
     }
 
     #[test]
