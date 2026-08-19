@@ -218,6 +218,7 @@ impl ProjectionSnapshot {
             .map(|source| BridgeSource {
                 key: source.key,
                 kind: bridge_source_kind(source),
+                decoder_reset_serial: source.decoder_reset_serial,
                 live: source.live,
                 active: source.active,
                 audio_gain: source.audio_gain.map(AudioGain::raw),
@@ -365,6 +366,7 @@ pub struct SnapshotSurface {
 pub struct SnapshotSource {
     pub key: SourceKey,
     pub descriptor: SourceDescriptor,
+    pub decoder_reset_serial: u64,
     pub live: bool,
     pub active: bool,
     pub audio_gain: Option<AudioGain>,
@@ -517,6 +519,9 @@ struct SurfaceEntry {
 struct TrackEntry {
     configuration: TrackConfiguration,
     state: TrackState,
+    decoder_reset_serial: u64,
+    flush_pending_channel_advance: bool,
+    channel_advance_pending_flush: bool,
     audio_gain: AudioGain,
     channel_writer: Option<Arc<Writer>>,
     retained: Option<Arc<[u8]>>,
@@ -1183,6 +1188,7 @@ impl VirtualVivid {
             .map(|(key, track)| SnapshotSource {
                 key: bridge_track_key(*key),
                 descriptor: source_descriptor(&state.tracks, *key, track),
+                decoder_reset_serial: track.decoder_reset_serial,
                 live: track.configuration.mode == TrackMode::Live,
                 active: state.surfaces.get(&key.surface).is_some_and(|surface| {
                     surface
@@ -1384,8 +1390,17 @@ impl VirtualVivid {
         release_delivery_allowance(&mut state, &delivery);
         if let Some(track) = state.tracks.get_mut(&delivery.track) {
             if delivered {
+                let first_outer_delivery = !track.outer_presented;
                 track.outer_presented = true;
                 track.state.milestones |= MILESTONE_PRESENTED;
+                if first_outer_delivery {
+                    // The initial one-record grant proves that this exact source can traverse the
+                    // bridge. Open its bounded rolling window once; subsequent completions return
+                    // only the record they retired. Reopening the whole window after every
+                    // completion makes cumulative flow credit grow by ROLLING_FLOW_RECORDS - 1
+                    // per packet and eventually overruns the foreground client's bounded queue.
+                    grant_rolling_flow(delivery.track, track);
+                }
                 if delivery.random_access && track.recovery_pending {
                     // A keyframe has recovered the nested path only after the foreground bridge
                     // confirms that it reached the outer track. Clearing this at inner ingest
@@ -2695,6 +2710,9 @@ fn dispatch_control(
                 TrackEntry {
                     configuration,
                     state: track_state,
+                    decoder_reset_serial: 1,
+                    flush_pending_channel_advance: false,
+                    channel_advance_pending_flush: false,
                     audio_gain: AudioGain::UNITY,
                     channel_writer: None,
                     retained: None,
@@ -2760,10 +2778,22 @@ fn dispatch_control(
                     ChannelGeneration::new(required_u64(&map, 4)?),
                 )
                 .map_err(|_| ControlError::state("channel advance is stale"))?;
+            if track.flush_pending_channel_advance {
+                track.flush_pending_channel_advance = false;
+            } else {
+                track.decoder_reset_serial = track
+                    .decoder_reset_serial
+                    .checked_add(1)
+                    .ok_or_else(|| ControlError::state("decoder reset serial exhausted"))?;
+                track.channel_advance_pending_flush = true;
+            }
             track.channel_writer = None;
             track.recovery_pending = true;
             track.recovery_requested = false;
             track.discard_blocked_for_recovery = false;
+            let generation = track.state.channel_generation.get();
+            let revision = track.state.revision.get();
+            advance_projection(&mut state);
             (
                 messages::CHANNEL_ADVANCED,
                 record.object_id,
@@ -2773,9 +2803,9 @@ fn dispatch_control(
                         (0, Value::Unsigned(key.surface.context)),
                         (1, Value::Unsigned(key.surface.surface)),
                         (2, Value::Unsigned(key.track)),
-                        (3, Value::Unsigned(track.state.channel_generation.get())),
+                        (3, Value::Unsigned(generation)),
                         (4, Value::Unsigned(CHANNEL_OPEN_DEADLINE_US)),
-                        (5, Value::Unsigned(track.state.revision.get())),
+                        (5, Value::Unsigned(revision)),
                     ],
                 )
                 .encode(),
@@ -3159,6 +3189,15 @@ fn dispatch_control(
                     track.discard_blocked_for_recovery = false;
                     track.retained = None;
                     track.retained_raster = None;
+                    if track.channel_advance_pending_flush {
+                        track.channel_advance_pending_flush = false;
+                    } else {
+                        track.decoder_reset_serial = track
+                            .decoder_reset_serial
+                            .checked_add(1)
+                            .ok_or_else(|| ControlError::state("decoder reset serial exhausted"))?;
+                        track.flush_pending_channel_advance = true;
+                    }
                 }
                 messages::DRAIN => {
                     if track.eos_epoch.is_none() {
@@ -3528,6 +3567,8 @@ fn track_loop(
                     random_access,
                 )
                 .map_err(io::Error::other)?;
+            track.flush_pending_channel_advance = false;
+            track.channel_advance_pending_flush = false;
             track.state.milestones |= MILESTONE_DECODER_INITIALIZED | MILESTONE_OUTPUT_READY;
             track.last_record_sequence = record.sequence;
             track.last_pts_us = pts;
@@ -3633,6 +3674,8 @@ fn track_loop(
                         random_access,
                     )
                     .map_err(io::Error::other)?;
+                track.flush_pending_channel_advance = false;
+                track.channel_advance_pending_flush = false;
                 if !discard_locally {
                     track.state.milestones |=
                         MILESTONE_DECODER_INITIALIZED | MILESTONE_OUTPUT_READY;
@@ -4926,7 +4969,10 @@ fn rolling_flow_window(track: &TrackEntry) -> (u64, u64) {
 /// Expand a track to its bounded rolling window and publish the new maxima.
 fn grant_rolling_flow(key: TrackKey, track: &mut TrackEntry) {
     let (bytes, records) = rolling_flow_window(track);
-    track.state.flow.raise_maxima(bytes, records);
+    track.state.flow.raise_maxima(
+        track.state.flow.sent_body_bytes.saturating_add(bytes),
+        track.state.flow.sent_media_records.saturating_add(records),
+    );
     send_flow_update(key, track);
 }
 
@@ -4939,30 +4985,21 @@ fn grant_rolling_flow(key: TrackKey, track: &mut TrackEntry) {
 /// the bridge either way. Withholding the allowance from those would shrink the producer's window
 /// by one record each time until it reaches zero and the producer blocks in a credit wait forever.
 fn release_delivery_allowance(state: &mut State, delivery: &PendingDelivery) {
-    let projected = state
-        .projected_sources
-        .contains(&bridge_track_key(delivery.track));
     let Some(track) = state.tracks.get_mut(&delivery.track) else {
         return;
     };
-    let returned_bytes = track
-        .state
-        .flow
-        .maximum_body_bytes
-        .saturating_add(delivery.bytes);
-    let returned_records = track.state.flow.maximum_media_records.saturating_add(1);
-    let maximum_record_body = u64::from(track.configuration.maximum_record_body);
-    let (rolling_bytes, rolling_records) = if projected {
-        rolling_flow_window(track)
-    } else {
-        (maximum_record_body, INITIAL_FLOW_RECORDS)
-    };
-    let available_bytes = returned_bytes.saturating_sub(track.state.flow.sent_body_bytes);
-    let available_records = returned_records.saturating_sub(track.state.flow.sent_media_records);
-    let bytes = returned_bytes.saturating_add(rolling_bytes.saturating_sub(available_bytes));
-    let records =
-        returned_records.saturating_add(rolling_records.saturating_sub(available_records));
-    track.state.flow.raise_maxima(bytes, records);
+    // Flow maxima and sent totals are cumulative. A completed delivery returns exactly the bytes
+    // and one record that it occupied; topping the *available* balance back up to the full rolling
+    // window here would grant a fresh window for every one record retired. The one-time transition
+    // from the initial grant to rolling flow is handled by `complete_bridge_delivery`.
+    track.state.flow.raise_maxima(
+        track
+            .state
+            .flow
+            .maximum_body_bytes
+            .saturating_add(delivery.bytes),
+        track.state.flow.maximum_media_records.saturating_add(1),
+    );
     send_flow_update(delivery.track, track);
 }
 
@@ -6387,6 +6424,56 @@ mod tests {
                 "audio remained stop-and-wait instead of receiving its bounded rolling window"
             );
         }
+        let rolling_audio_deliveries = (0..ROLLING_FLOW_RECORDS)
+            .map(|_| received.recv_timeout(Duration::from_secs(2)).unwrap())
+            .map(|delivery| {
+                assert_eq!(delivery.source.track, 12);
+                delivery.delivery_id
+            })
+            .collect::<Vec<_>>();
+
+        // Retiring one record from a full rolling window must admit exactly one replacement.
+        // The former cumulative-credit arithmetic topped the available balance back up to eight
+        // after every completion, so this second write also succeeded and outstanding audio grew
+        // until the vvmux client queue began dropping packets.
+        assert!(!presenter.complete_bridge_delivery(rolling_audio_deliveries[0], true));
+        let (replacement_written, replacement_writes) = mpsc::sync_channel(2);
+        let replacement_channel = audio_channel.clone();
+        let replacement_writer = thread::spawn(move || {
+            for packet_id in ROLLING_FLOW_RECORDS + 2..=ROLLING_FLOW_RECORDS + 3 {
+                replacement_channel
+                    .send_audio(media::AudioPacket {
+                        epoch: 1,
+                        packet_id,
+                        pts_us: i64::try_from(packet_id - 1).unwrap() * 21_333,
+                        dts_us: i64::try_from(packet_id - 1).unwrap() * 21_333,
+                        duration_us: 21_333,
+                        trim_start_samples: 0,
+                        trim_end_samples: 0,
+                        data: &[0; 16],
+                    })
+                    .unwrap();
+                replacement_written.send(packet_id).unwrap();
+            }
+        });
+        assert_eq!(
+            replacement_writes.recv_timeout(Duration::from_secs(2)).ok(),
+            Some(ROLLING_FLOW_RECORDS + 2)
+        );
+        assert!(
+            replacement_writes
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "one audio completion replenished more than the one record it retired"
+        );
+        let replacement_delivery = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(replacement_delivery.source.track, 12);
+        assert!(!presenter.complete_bridge_delivery(rolling_audio_deliveries[1], true));
+        assert_eq!(
+            replacement_writes.recv_timeout(Duration::from_secs(2)).ok(),
+            Some(ROLLING_FLOW_RECORDS + 3)
+        );
+        replacement_writer.join().unwrap();
         assert!(
             video_writes
                 .recv_timeout(Duration::from_millis(100))
@@ -6396,6 +6483,10 @@ mod tests {
 
         assert!(!presenter.complete_bridge_delivery(video_delivery, true));
         video_writes.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(presenter.bridge_delivery_is_pending(
+            replacement_delivery.delivery_id,
+            replacement_delivery.source
+        ));
         audio_writer.join().unwrap();
         video_writer.join().unwrap();
         client.close().unwrap();
@@ -6557,6 +6648,18 @@ mod tests {
         let _ = audio_channel.close();
         client.flush(&audio, 2).unwrap();
         let audio_channel = client.open_track_channel(&audio).unwrap();
+        {
+            let state = lock(&presenter.state);
+            for source in [video_source, audio_source] {
+                let track = state.tracks.get(&inner_track_key(source)).unwrap();
+                assert_eq!(
+                    track.decoder_reset_serial, 2,
+                    "a paired FLUSH and ADVANCE_CHANNEL must publish one outer decoder reset"
+                );
+                assert!(!track.flush_pending_channel_advance);
+                assert!(!track.channel_advance_pending_flush);
+            }
+        }
         assert_eq!(
             presenter.request_keyframe(video_source, None, 5),
             KeyframeRequestOutcome::Forwarded

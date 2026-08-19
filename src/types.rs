@@ -439,6 +439,12 @@ pub enum BridgeSourceKind {
 pub struct BridgeSource {
     pub key: BridgeSourceKey,
     pub kind: BridgeSourceKind,
+    /// Gateway-local identity for the decoder contents represented by this source.
+    ///
+    /// This is not an inner protocol generation and is never installed as an outer generation.
+    /// A changed value tells a terminating bridge to allocate a fresh independent outer track.
+    #[serde(default)]
+    pub decoder_reset_serial: u64,
     /// The inner track uses live rather than media-timed delivery semantics.
     ///
     /// This is independent of `playing`: live audio begins when its surface slot is activated and

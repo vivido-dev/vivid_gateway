@@ -81,6 +81,7 @@ struct OuterTrack {
     media_sender: mpsc::SyncSender<OuterMediaCommand>,
     slot_activated: Arc<AtomicBool>,
     kind: BridgeSourceKind,
+    decoder_reset_serial: u64,
     mode: TrackMode,
     /// Control-side mirror of [`OuterTrack::slot_activated`], read without atomic ordering.
     activated: bool,
@@ -432,7 +433,9 @@ impl OuterBridge {
         let mut recreated = HashSet::new();
         for source in sources {
             let changed = self.tracks.get(&source.key).is_some_and(|track| {
-                track.kind != source.kind || (track.mode == TrackMode::Live) != source.live
+                track.kind != source.kind
+                    || track.decoder_reset_serial != source.decoder_reset_serial
+                    || (track.mode == TrackMode::Live) != source.live
             });
             if changed {
                 self.remove_track(source.key)?;
@@ -1027,6 +1030,7 @@ impl OuterBridge {
                 media_sender,
                 slot_activated,
                 kind: source.kind.clone(),
+                decoder_reset_serial: source.decoder_reset_serial,
                 mode,
                 activated: false,
                 media_inflight: 0,
@@ -2375,6 +2379,7 @@ mod tests {
             },
         };
         let video = |producer| BridgeSource {
+            decoder_reset_serial: 1,
             key: BridgeSourceKey {
                 producer,
                 context: 7,
@@ -2502,6 +2507,7 @@ mod tests {
             start_policy: 1,
         };
         let video = BridgeSource {
+            decoder_reset_serial: 1,
             key: video_key,
             kind: BridgeSourceKind::Video {
                 codec_string: None,
@@ -2533,6 +2539,7 @@ mod tests {
             play_request: request,
         };
         let audio = BridgeSource {
+            decoder_reset_serial: 1,
             key: audio_key,
             kind: BridgeSourceKind::Audio {
                 codec_string: None,
@@ -2644,6 +2651,7 @@ mod tests {
         };
         let request = default_play_request();
         let raster = BridgeSource {
+            decoder_reset_serial: 1,
             key: raster_key,
             kind: BridgeSourceKind::Raster {
                 width: 2,
@@ -2663,6 +2671,7 @@ mod tests {
             causation_id: None,
         };
         let audio = BridgeSource {
+            decoder_reset_serial: 1,
             key: audio_key,
             kind: BridgeSourceKind::Audio {
                 linked_video: None,
@@ -2862,6 +2871,7 @@ mod tests {
             },
         };
         let video = BridgeSource {
+            decoder_reset_serial: 1,
             key: video_key,
             kind: BridgeSourceKind::Video {
                 codec: "h264".into(),
@@ -3192,6 +3202,7 @@ mod tests {
             )
             .unwrap();
         let source = BridgeSource {
+            decoder_reset_serial: 1,
             key: BridgeSourceKey {
                 producer: 1,
                 context: 1,
