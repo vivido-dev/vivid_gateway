@@ -2732,6 +2732,7 @@ fn dispatch_control(
     if !state.sessions.contains_key(&session_id) {
         return Err(ControlError::missing("session does not exist"));
     }
+    let projection_revision_before = state.projection_revision;
     let mutation_cache = if is_idempotent_mutation(record.record_type) {
         envelope.idempotency_key.map(|key| {
             (
@@ -3487,6 +3488,17 @@ fn dispatch_control(
                 body: response.2.clone(),
             },
         );
+    }
+    let wakeup = (state.projection_revision != projection_revision_before)
+        .then(|| state.media_wakeup.clone())
+        .flatten();
+    drop(state);
+    if let Some(wakeup) = wakeup {
+        // Control and media use independent producer connections. In particular, PAUSE normally
+        // stops the packet stream immediately, so there may be no later media event to wake the
+        // session actor and publish this projection edge. Notify after releasing presenter state
+        // so a callback may safely inspect the new authoritative snapshot.
+        wakeup();
     }
     Ok(Some(response))
 }
@@ -5741,6 +5753,47 @@ mod tests {
             messages::decode_control(&recorrelated).unwrap().request_id,
             99
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn play_and_pause_control_edges_wake_projection_without_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control-wakeup.sock");
+        let listener = match TestSocketListener::bind(socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping control wakeup socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("control wakeup listener failed: {error}"),
+        };
+        let presenter = VirtualVivid::start(listener, MediaConfig::default()).unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let track = client
+            .create_track(video(context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+
+        let (wakeup_sender, wakeup_receiver) = mpsc::sync_channel(4);
+        presenter.set_media_wakeup(Arc::new(move || {
+            let _ = wakeup_sender.try_send(());
+        }));
+
+        client.play(&track, 0, 1, 1_000_000).unwrap();
+        wakeup_receiver
+            .recv_timeout(Duration::from_millis(200))
+            .expect("PLAY did not wake the projection consumer");
+        client.pause(&track).unwrap();
+        wakeup_receiver
+            .recv_timeout(Duration::from_millis(200))
+            .expect("PAUSE did not wake the projection consumer");
     }
 
     #[test]

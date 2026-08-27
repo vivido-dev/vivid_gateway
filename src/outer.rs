@@ -630,7 +630,15 @@ impl OuterBridge {
         {
             return Ok(());
         }
-        let clock = preferred_surface_clock(&self.active_sources, surface_key, key);
+        self.play_surface_clock(key, surface_key)
+    }
+
+    fn play_surface_clock(
+        &mut self,
+        key: BridgeSourceKey,
+        surface: BridgeSurfaceKey,
+    ) -> io::Result<()> {
+        let clock = preferred_surface_clock(&self.active_sources, surface, key);
         let request = self
             .active_sources
             .get(&key)
@@ -648,6 +656,20 @@ impl OuterBridge {
             request.minimum_buffer_us.max(1),
             request.maximum_latency_us.max(1),
         )?;
+        let playing_members = self
+            .active_sources
+            .values()
+            .filter(|source| {
+                surface_key(source) == surface
+                    && source_is_effectively_playing(&self.active_sources, source)
+            })
+            .map(|source| source.key)
+            .collect::<Vec<_>>();
+        for member in playing_members {
+            if let Some(track) = self.tracks.get_mut(&member) {
+                track.playing = true;
+            }
+        }
         self.playback.push((
             key,
             PlaybackSnapshot {
@@ -1360,6 +1382,16 @@ impl OuterBridge {
         if members.is_empty() {
             return Ok(());
         }
+        if members
+            .iter()
+            .all(|(member, _, _)| self.tracks[member].activated)
+        {
+            // PAUSE keeps the surface's slots and decoded output active. Resuming that surface is
+            // only a clock edge: waiting for another completed packet here makes PLAY depend on
+            // media Vivi intentionally stopped while paused, producing a visible start/stall
+            // cycle. Initial startup still follows the bounded pre-roll and activation path below.
+            return self.play_surface_clock(key, surface_key);
+        }
         if members.iter().any(|(member, _, _)| {
             let track = &self.tracks[member];
             track.media_completed == 0 && track.media_inflight == 0
@@ -1471,17 +1503,9 @@ impl OuterBridge {
             {
                 track.slot_activated.store(true, Ordering::Release);
                 track.activated = true;
-                track.playing = true;
             }
         }
-        self.playback.push((
-            key,
-            PlaybackSnapshot {
-                state: 2,
-                eos_state: 0,
-            },
-        ));
-        Ok(())
+        self.play_surface_clock(key, surface_key)
     }
 
     fn poll_channel_events(&mut self, key: BridgeSourceKey) -> io::Result<()> {
@@ -2574,6 +2598,175 @@ mod tests {
             preferred_surface_clock(&sources, surface_key(&sources[&video_key]), video_key),
             audio_key,
             "recovery PLAY must configure and restart the physical audio output"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn paused_active_surface_resumes_without_waiting_for_more_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("pause-resume.sock");
+        let listener = match TestSocketListener::bind(socket.clone()) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping pause/resume socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("pause/resume listener failed: {error}"),
+        };
+        let presenter =
+            crate::presenter::VirtualVivid::start(listener, crate::types::MediaConfig::default())
+                .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut bridge = OuterBridge::connect(
+            format!("unix:{}", socket.display()),
+            Zeroizing::new(secret),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+
+        let audio_key = BridgeSourceKey {
+            producer: 3,
+            context: 1,
+            surface: 7,
+            track: 11,
+        };
+        let surface = BridgeSurface {
+            key: BridgeSurfaceKey {
+                producer: audio_key.producer,
+                context: audio_key.context,
+                surface: audio_key.surface,
+            },
+            logical_width: 16,
+            logical_height: 16,
+            capture_policy: 0,
+            descriptor: crate::types::BridgeSourceDescriptor {
+                role: 1,
+                title: "pause resume".into(),
+                content_revision: 1,
+                semantic_availability: 0,
+                locator: String::new(),
+            },
+        };
+        let request = BridgePlayRequest {
+            start_pts_us: 0,
+            minimum_buffer_us: 1,
+            maximum_latency_us: 1_000_000,
+            rate_32_32: 1_i64 << 32,
+            late_policy: 1,
+            loop_count: 0,
+            start_policy: 1,
+        };
+        let paused = BridgeSource {
+            decoder_reset_serial: 1,
+            key: audio_key,
+            kind: BridgeSourceKind::Audio {
+                linked_video: None,
+                codec: "pcm_s16le".into(),
+                packetization: "pcm-packet-v1".into(),
+                extradata: Vec::new(),
+                sample_rate: 48_000,
+                channels: 2,
+                channel_mask: 3,
+                bitrate: 1_536_000,
+                max_access_unit_bytes: 256,
+                codec_string: None,
+            },
+            live: false,
+            active: true,
+            audio_gain: Some(AudioGain::UNITY.raw()),
+            capture_policy: 0,
+            descriptor: None,
+            playing: false,
+            play_request: request,
+            eos_epoch: None,
+            causation_id: None,
+        };
+        bridge
+            .rebuild(&[surface], std::slice::from_ref(&paused), &[])
+            .unwrap();
+        presenter.projection_snapshot(&HashSet::from([7]));
+
+        let body = media::audio_packet_body(AudioPacket {
+            epoch: 1,
+            packet_id: 1,
+            pts_us: 0,
+            dts_us: 0,
+            duration_us: 10_000,
+            trim_start_samples: 0,
+            trim_end_samples: 0,
+            data: &[0; 32],
+        })
+        .unwrap();
+        assert!(
+            bridge
+                .media_chunk(
+                    1,
+                    audio_key,
+                    messages::AUDIO_PACKET,
+                    0,
+                    body.len() as u32,
+                    true,
+                    body,
+                )
+                .unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !bridge.tracks[&audio_key].activated {
+            let _ = bridge.take_media_completions();
+            bridge.retry_pending_activation().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "the timed audio slot never became active"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let mut playing = paused.clone();
+        playing.playing = true;
+        bridge
+            .update_playback(
+                std::slice::from_ref(&paused),
+                std::slice::from_ref(&playing),
+            )
+            .unwrap();
+        assert!(bridge.tracks[&audio_key].playing);
+
+        bridge
+            .update_playback(
+                std::slice::from_ref(&playing),
+                std::slice::from_ref(&paused),
+            )
+            .unwrap();
+        assert!(!bridge.tracks[&audio_key].playing);
+        let submitted_before_resume = bridge.tracks[&audio_key].media_submitted;
+
+        let mut resumed = playing;
+        resumed.play_request.start_pts_us = 4_000_000;
+        bridge
+            .update_playback(
+                std::slice::from_ref(&paused),
+                std::slice::from_ref(&resumed),
+            )
+            .unwrap();
+
+        assert!(
+            bridge.tracks[&audio_key].playing,
+            "resume remained pending on media that cannot arrive while Vivi is paused"
+        );
+        assert_eq!(
+            bridge.tracks[&audio_key].media_submitted, submitted_before_resume,
+            "resume consumed another pre-roll record instead of restarting the active clock"
+        );
+        assert!(
+            presenter
+                .projection_snapshot(&HashSet::from([7]))
+                .sources
+                .iter()
+                .find(|source| source.key.track == bridge.tracks[&audio_key].track.id())
+                .is_some_and(|source| source.playing),
+            "the physical presenter did not observe resumed playback"
         );
     }
 
