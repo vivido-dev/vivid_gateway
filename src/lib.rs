@@ -16,9 +16,9 @@ pub use outer::{
     CapabilityChange, ConnectionFactory, OuterBridge, PlaybackSnapshot, intersect_surface_policy,
 };
 pub use presenter::{
-    AudioSourceConfig, BridgeProjection, ClipRect, GatewayLeaseReady, KeyframeRequestOutcome,
-    MediaEvent, NodeConfig, OuterMediaProjection, PlayRequest, ProducerId, ProjectionSnapshot,
-    RetainedRaster, SceneNode, SceneNodeConfig, SemanticDescriptor, SnapshotSource,
-    SnapshotSurface, SourceDescriptor, SourceKey, VirtualVivid,
+    AudioSourceConfig, BridgeProjection, CaptureContent, CaptureLayer, ClipRect, GatewayLeaseReady,
+    KeyframeRequestOutcome, MediaEvent, NodeConfig, OuterMediaProjection, PlayRequest, ProducerId,
+    ProjectionSnapshot, RetainedRaster, SceneNode, SceneNodeConfig, SemanticDescriptor,
+    SnapshotSource, SnapshotSurface, SourceDescriptor, SourceKey, VirtualVivid,
 };
 pub use types::*;

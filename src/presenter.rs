@@ -386,6 +386,30 @@ pub struct SnapshotSource {
     pub raster_delta_operation_limit: Option<u32>,
 }
 
+/// One node's retained pixels and the rectangle they occupy, for a read-only pane capture.
+#[derive(Debug, Clone)]
+pub struct CaptureLayer {
+    pub source: SourceKey,
+    pub node_id: u64,
+    pub z_index: i64,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+    pub clip: Option<ClipRect>,
+    pub content: CaptureContent,
+}
+
+/// Retained pixels in whichever form the track holds them.
+///
+/// Raster tracks are held decoded and already composed through their delta chain. Encoded-image
+/// tracks keep the producer's original bytes, which a capture can serve without a re-encode.
+#[derive(Debug, Clone)]
+pub enum CaptureContent {
+    Raster(RetainedRaster),
+    EncodedImage(Arc<[u8]>),
+}
+
 #[derive(Debug, Clone)]
 pub struct RetainedRaster {
     pub epoch: u32,
@@ -1147,6 +1171,73 @@ impl VirtualVivid {
     /// A relay uses this form while it submits the snapshot to a physical presenter. It must call
     /// [`Self::activate_bridge_projection`] only after that presenter acknowledges the exact
     /// snapshot. Sources removed by the snapshot are parked immediately.
+    /// The retained pixels for one pane, ordered back to front, without moving any state.
+    ///
+    /// Deliberately not a projection snapshot: preparing one parks falling edges and publishes
+    /// rising ones on the acknowledgement, so an observation taken that way would move the
+    /// projection it is observing. A capture is `observe`-class and must not.
+    ///
+    /// A layer appears only when the gateway already holds its pixels. A track that has sent
+    /// nothing, or whose delta chain broke and is awaiting recovery, is skipped rather than
+    /// reported as a blank layer.
+    pub fn capture_pane(&self, pane: PaneId, viewport_offset: usize) -> Vec<CaptureLayer> {
+        let state = lock(&self.state);
+        let mut layers = Vec::new();
+        for (key, entry) in &state.nodes {
+            if entry.pane != pane {
+                continue;
+            }
+            let surface = SurfaceKey {
+                session: key.session,
+                context: entry.node.surface_context_id,
+                surface: entry.node.surface_id,
+            };
+            let Some(track_key) = selected_visual_track(&state, surface) else {
+                continue;
+            };
+            let Some(session) = state.sessions.get(&key.session) else {
+                continue;
+            };
+            let Some(config) = projected_node_config(
+                &entry.node,
+                bridge_track_key(track_key),
+                session,
+                viewport_offset,
+                state.config.target.profile_name(),
+                state.config.target.extent(),
+            ) else {
+                continue;
+            };
+            if !config.node.visible {
+                continue;
+            }
+            let Some(track) = state.tracks.get(&track_key) else {
+                continue;
+            };
+            let content = if let Some(raster) = track.retained_raster.clone() {
+                CaptureContent::Raster(raster)
+            } else if let Some(encoded) = track.retained.clone() {
+                CaptureContent::EncodedImage(encoded)
+            } else {
+                continue;
+            };
+            layers.push(CaptureLayer {
+                source: config.node.track,
+                node_id: config.node.node_id,
+                z_index: config.node.z_index,
+                x: config.node.x,
+                y: config.node.y,
+                width: config.node.width,
+                height: config.node.height,
+                clip: config.clip,
+                content,
+            });
+        }
+        // Back to front, with the node id breaking a tie so a capture is reproducible.
+        layers.sort_by_key(|layer| (layer.z_index, layer.node_id));
+        layers
+    }
+
     pub fn prepare_projection_snapshot_with_viewports(
         &self,
         panes: &HashSet<PaneId>,
@@ -7505,6 +7596,156 @@ mod tests {
                 .len(),
             1,
             "leaving the alternate screen must reveal the retained primary-screen image"
+        );
+    }
+
+    #[test]
+    fn two_owners_reusing_local_ids_capture_only_their_own_pixels() {
+        // Both producers use the identical context, surface, track, and node numbers. Capture is
+        // addressed by pane, so anything keyed on the local numbers alone would hand one owner the
+        // other's screen — the failure this test exists to make impossible.
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(8);
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        presenter.update_metrics(8, 80, 24, (8, 16));
+
+        let mut clients = Vec::new();
+        for (pane, fill) in [(7_u64, 0x11_u8), (8, 0x22)] {
+            let secret = presenter.issue_pane_capability(pane).unwrap();
+            let mut client =
+                vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+            let context = client.info().root_context_id;
+            let surface = client
+                .create_surface(surface(context, 9), &RequestMetadata::default())
+                .unwrap();
+            let track = client
+                .create_track(raster(context, 9, 11), &RequestMetadata::default())
+                .unwrap();
+            let channel = client.open_track_channel(&track).unwrap();
+            client
+                .create_node(
+                    &SceneNode {
+                        owning_context_id: context,
+                        node_id: 21,
+                        surface_context_id: surface.context_id(),
+                        surface_id: surface.id(),
+                        geometry: vec![
+                            (0, Value::Unsigned(1)),
+                            (1, Value::Unsigned(0)),
+                            (2, Value::Unsigned(0)),
+                            (3, Value::Unsigned(80_u64 << 32)),
+                            (4, Value::Unsigned(24_u64 << 32)),
+                            (5, Value::Unsigned(1)),
+                        ],
+                        fit: Fit::Contain,
+                        linear_sampling: true,
+                        z_index: 0,
+                        visible: true,
+                        opacity: u16::MAX,
+                        clip: None,
+                    },
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+            channel.send_raster(1, 1, &[fill; 16], false).unwrap();
+            let event = received.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
+            clients.push((client, channel));
+        }
+
+        for (pane, fill) in [(7_u64, 0x11_u8), (8, 0x22)] {
+            let layers = presenter.capture_pane(pane, 0);
+            assert_eq!(
+                layers.len(),
+                1,
+                "pane {pane} captured the wrong layer count"
+            );
+            let CaptureContent::Raster(raster) = &layers[0].content else {
+                panic!("pane {pane} captured a non-raster layer");
+            };
+            assert!(
+                raster.pixels.iter().all(|byte| *byte == fill),
+                "pane {pane} captured another owner's pixels"
+            );
+            assert_eq!(layers[0].width, 80_i64 << 32);
+            assert_eq!(layers[0].height, 24_i64 << 32);
+        }
+
+        // Capture is observe-class: after reading both panes, each owner's retained canvas and its
+        // projection must be exactly where they were.
+        for (pane, fill) in [(7_u64, 0x11_u8), (8, 0x22)] {
+            let snapshot = presenter.projection_snapshot(&HashSet::from([pane]));
+            let retained = snapshot.sources[0]
+                .retained_raster
+                .as_ref()
+                .expect("capture consumed a retained canvas");
+            assert!(retained.pixels.iter().all(|byte| *byte == fill));
+        }
+
+        // And a pane nobody is producing into captures nothing rather than someone else's screen.
+        assert!(presenter.capture_pane(9, 0).is_empty());
+    }
+
+    #[test]
+    fn a_hidden_node_is_left_out_of_a_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(4);
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        let surface = client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let track = client
+            .create_track(raster(context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let channel = client.open_track_channel(&track).unwrap();
+        client
+            .create_node(
+                &SceneNode {
+                    owning_context_id: context,
+                    node_id: 21,
+                    surface_context_id: surface.context_id(),
+                    surface_id: surface.id(),
+                    geometry: vec![
+                        (0, Value::Unsigned(1)),
+                        (1, Value::Unsigned(0)),
+                        (2, Value::Unsigned(0)),
+                        (3, Value::Unsigned(80_u64 << 32)),
+                        (4, Value::Unsigned(24_u64 << 32)),
+                        (5, Value::Unsigned(1)),
+                    ],
+                    fit: Fit::Contain,
+                    linear_sampling: true,
+                    z_index: 0,
+                    visible: false,
+                    opacity: u16::MAX,
+                    clip: None,
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        channel.send_raster(1, 1, &[0xab; 16], false).unwrap();
+        let event = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
+
+        assert!(
+            presenter.capture_pane(7, 0).is_empty(),
+            "a node the producer marked invisible must not appear in a capture"
         );
     }
 
