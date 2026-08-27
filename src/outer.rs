@@ -24,8 +24,8 @@ use vivid_sdk::{
 use zeroize::Zeroizing;
 
 use crate::types::{
-    BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind,
-    BridgeSurface, BridgeSurfaceKey, DisplayMetrics,
+    BridgeKeyframeRequest, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceKey,
+    BridgeSourceKind, BridgeSurface, BridgeSurfaceKey, DisplayMetrics,
 };
 
 pub use vivid_sdk::ConnectionFactory;
@@ -98,6 +98,12 @@ struct OuterTrack {
     /// one new submission proves the feed is moving again without waiting for presenter capacity,
     /// which can itself depend on PLAY when the paused audio ring is full.
     resume_after_submission: Option<usize>,
+    /// The surface position this outer track was last told, or `None` while it has never been
+    /// given one.
+    ///
+    /// A replacement track created for a seek starts here, which is what distinguishes "the
+    /// producer has not positioned this surface" from "the position it holds was never relayed".
+    published_play_request: Option<BridgePlayRequest>,
     playing: bool,
     eos_requested: bool,
     eos: bool,
@@ -184,6 +190,12 @@ pub struct OuterBridge {
     full_frames: HashSet<BridgeSourceKey>,
     losses: HashSet<BridgeSourceKey>,
     playback: Vec<(BridgeSourceKey, PlaybackSnapshot)>,
+    /// The last position this bridge published for each outer surface clock.
+    ///
+    /// Its presence is the evidence that the nested producer has positioned that surface at all,
+    /// which a track's own `play_request` cannot say: an unplayed track carries the inner
+    /// presenter's baseline request, not a producer position.
+    surface_clock: HashMap<BridgeSurfaceKey, BridgePlayRequest>,
     outer_applied_revision: u64,
     diagnostic_generation: u64,
 }
@@ -330,6 +342,7 @@ impl OuterBridge {
             full_frames: HashSet::new(),
             losses: HashSet::new(),
             playback: Vec::new(),
+            surface_clock: HashMap::new(),
             outer_applied_revision: 0,
             diagnostic_generation: 1,
         })
@@ -491,6 +504,7 @@ impl OuterBridge {
         self.nodes.clear();
         self.pending.clear();
         self.active_sources.clear();
+        self.surface_clock.clear();
         // Say goodbye to the session being abandoned. Dropping it leaves its control connection
         // open - the reader thread still holds the socket - so the presenter goes on counting it
         // against its session capacity. Each replacement would consume one more slot until every
@@ -635,7 +649,7 @@ impl OuterBridge {
                 track.eos_requested = true;
             }
         }
-        Ok(())
+        self.reconcile_paused_clocks()
     }
 
     fn rebase_surface_clock(&mut self, key: BridgeSourceKey) -> io::Result<()> {
@@ -697,6 +711,7 @@ impl OuterBridge {
                 track.resume_after_submission = None;
             }
         }
+        self.record_published_clock(surface, request);
         self.playback.push((
             key,
             PlaybackSnapshot {
@@ -704,6 +719,138 @@ impl OuterBridge {
                 eos_state: 0,
             },
         ));
+        Ok(())
+    }
+
+    /// Remember the position the outer session now holds for one surface.
+    ///
+    /// Vivido applies PLAY to every active timed slot on the named surface, so the record is
+    /// surface-wide, but only the slots it actually reached received the clock.
+    fn record_published_clock(&mut self, surface: BridgeSurfaceKey, request: BridgePlayRequest) {
+        self.surface_clock.insert(surface, request);
+        for track in self
+            .tracks
+            .values_mut()
+            .filter(|track| track.surface_key == surface && track.activated)
+        {
+            track.published_play_request = Some(request);
+        }
+    }
+
+    /// The paused position one surface holds that the outer session has not been given.
+    ///
+    /// `playing` is an edge; the position a paused surface sits at is level state. A nested
+    /// producer publishes it as PLAY followed immediately by PAUSE - Vivi does exactly that to
+    /// place a seek target without starting time - and consecutive projection snapshots coalesce,
+    /// so that rising edge is routinely never observed here. A seek also replaces the timed
+    /// tracks, and a replacement outer track has no clock of its own. Either way the outer
+    /// presenter holds every decoded picture and the pane goes blank until the producer next
+    /// resumes, which is not something the user asked for by seeking while paused.
+    fn pending_paused_clock(
+        &self,
+        surface: BridgeSurfaceKey,
+    ) -> Option<(BridgeSourceKey, BridgePlayRequest)> {
+        // Without a previously published position, `play_request` is the inner presenter's
+        // baseline rather than anything the producer chose. There is nothing to restore.
+        self.surface_clock.get(&surface)?;
+        let mut members = self
+            .active_sources
+            .values()
+            .filter(|source| {
+                surface_key(source) == surface
+                    && source.active
+                    && matches!(
+                        source.kind,
+                        BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            return None;
+        }
+        members.sort_by_key(|source| source.key.track);
+        if members
+            .iter()
+            .any(|source| source_is_effectively_playing(&self.active_sources, source))
+        {
+            return None;
+        }
+        // Vivido refuses PLAY for a surface with no active timed slot. Wait for the ordinary
+        // pre-roll path to activate rather than turning that refusal into outer-session loss.
+        let outer = members
+            .iter()
+            .map(|source| self.tracks.get(&source.key))
+            .collect::<Option<Vec<_>>>()?;
+        if !outer.iter().all(|track| track.activated) {
+            return None;
+        }
+        // Name the video track. Vivido applies PLAY to every active timed slot on the surface, so
+        // this positions linked audio too, while leaving the physical audio output - which follows
+        // only a PLAY naming the audio track - stopped, as a paused surface requires.
+        let clock = members
+            .iter()
+            .position(|source| matches!(source.kind, BridgeSourceKind::Video { .. }))
+            .unwrap_or(0);
+        let request = members[clock].play_request;
+        outer
+            .iter()
+            .any(|track| track.published_play_request != Some(request))
+            .then_some((members[clock].key, request))
+    }
+
+    /// Republish one paused surface's authoritative position to the outer session.
+    fn rebase_paused_clock(
+        &mut self,
+        clock: BridgeSourceKey,
+        surface: BridgeSurfaceKey,
+        request: BridgePlayRequest,
+    ) -> io::Result<()> {
+        let track = self
+            .tracks
+            .get(&clock)
+            .ok_or_else(|| invalid_data("outer paused clock is missing"))?
+            .track
+            .clone();
+        match self.session.play(
+            &track,
+            request.start_pts_us,
+            request.minimum_buffer_us.max(1),
+            request.maximum_latency_us.max(1),
+        ) {
+            Ok(_) => {}
+            // The activation this republication reads is the bridge's own mirror of an
+            // independently serviced control connection. A refusal means the outer surface has
+            // moved on, not that the outer session was lost; the next reconcile retries.
+            Err(error) if presenter_code(&error) == Some(messages::ERROR_BAD_STATE) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        // PLAY is the only way to say where a flushed timed surface resumes; the PAUSE that
+        // follows is what keeps it there. Publish the pair together so the outer clock is
+        // positioned without ever running.
+        self.session.pause(&track)?;
+        for track in self
+            .tracks
+            .values_mut()
+            .filter(|track| track.surface_key == surface)
+        {
+            track.playing = false;
+        }
+        self.record_published_clock(surface, request);
+        Ok(())
+    }
+
+    /// Reconcile every paused surface against the position its producer published.
+    fn reconcile_paused_clocks(&mut self) -> io::Result<()> {
+        let mut surfaces = self.surfaces.keys().copied().collect::<Vec<_>>();
+        surfaces.sort_by_key(|surface| (surface.producer, surface.context, surface.surface));
+        for surface in surfaces {
+            let Some((clock, request)) = self.pending_paused_clock(surface) else {
+                continue;
+            };
+            self.rebase_paused_clock(clock, surface, request)?;
+        }
         Ok(())
     }
 
@@ -761,7 +908,10 @@ impl OuterBridge {
         for key in pending {
             self.try_start_surface(key)?;
         }
-        Ok(())
+        // A paused surface's position needs the same retry: the snapshot that carries it usually
+        // arrives before its replacement tracks have decoded output, so the activation this
+        // republication depends on has not happened yet.
+        self.reconcile_paused_clocks()
     }
 
     /// Recheck authoritative slot readiness without assuming that a completed socket write has
@@ -809,8 +959,17 @@ impl OuterBridge {
         if track.eos || track.media_inflight >= OUTER_MEDIA_WRITER_QUEUE {
             return false;
         }
+        // The pre-roll window bounds the activation handshake only. Once the outer slot holds
+        // this track there is no readiness check left for media to run ahead of, and the writer
+        // has already stopped pacing one record at a time, so the outer channel's own byte and
+        // record flow is the correct bound. Keeping the cumulative wall past that point makes a
+        // paused source unable to accept anything ever again: nothing raises `preplay_limit` for
+        // an activated track, the record is never popped from the foreground queue, its delivery
+        // never completes, and the nested producer blocks in a credit wait that cannot return -
+        // including on the one resume submission `try_start_surface` waits for before PLAY.
         track.mode == TrackMode::Live
             || track.playing
+            || track.activated
             || (track.media_inflight == 0 && track.media_submitted < track.preplay_limit)
     }
 
@@ -1089,6 +1248,7 @@ impl OuterBridge {
                 preplay_limit: 1,
                 preplay_ceiling: OUTER_TIMED_PREROLL_RECORDS,
                 resume_after_submission: None,
+                published_play_request: None,
                 playing: false,
                 eos_requested: false,
                 eos: false,
@@ -1154,6 +1314,7 @@ impl OuterBridge {
             .filter(|key| !desired_keys.contains(key))
             .collect::<Vec<_>>();
         for key in removed {
+            self.surface_clock.remove(&key);
             if let Some(surface) = self.surfaces.remove(&key) {
                 self.session
                     .destroy_surface(&surface, &RequestMetadata::default())?;
@@ -2828,6 +2989,308 @@ mod tests {
                 .find(|source| source.key.track == bridge.tracks[&audio_key].track.id())
                 .is_some_and(|source| source.playing),
             "the physical presenter did not observe resumed playback"
+        );
+    }
+
+    /// One paused, active, audio-only surface attached to a live virtual presenter.
+    ///
+    /// This is the shape a nested Vivi seek leaves behind: the timed tracks are replaced while
+    /// the producer stays paused, so no `playing` edge ever reaches the bridge.
+    #[cfg(unix)]
+    struct PausedSurfaceFixture {
+        _directory: tempfile::TempDir,
+        presenter: crate::presenter::VirtualVivid,
+        bridge: OuterBridge,
+        surface: BridgeSurface,
+        source: BridgeSource,
+        packet_id: u64,
+    }
+
+    #[cfg(unix)]
+    impl PausedSurfaceFixture {
+        fn start(name: &str) -> Option<Self> {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join(name);
+            let listener = match TestSocketListener::bind(socket.clone()) {
+                Ok(listener) => listener,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    eprintln!("skipping {name} socket test: {error}");
+                    return None;
+                }
+                Err(error) => panic!("{name} listener failed: {error}"),
+            };
+            let presenter = crate::presenter::VirtualVivid::start(
+                listener,
+                crate::types::MediaConfig::default(),
+            )
+            .unwrap();
+            presenter.update_metrics(7, 80, 24, (8, 16));
+            let secret = presenter.issue_pane_capability(7).unwrap();
+            let bridge = OuterBridge::connect(
+                format!("unix:{}", socket.display()),
+                Zeroizing::new(secret),
+                DisplayMetrics::default(),
+            )
+            .unwrap();
+            let key = BridgeSourceKey {
+                producer: 3,
+                context: 1,
+                surface: 7,
+                track: 11,
+            };
+            let surface = BridgeSurface {
+                key: BridgeSurfaceKey {
+                    producer: key.producer,
+                    context: key.context,
+                    surface: key.surface,
+                },
+                logical_width: 16,
+                logical_height: 16,
+                capture_policy: 0,
+                descriptor: crate::types::BridgeSourceDescriptor {
+                    role: 1,
+                    title: "paused seek".into(),
+                    content_revision: 1,
+                    semantic_availability: 0,
+                    locator: String::new(),
+                },
+            };
+            let source = BridgeSource {
+                decoder_reset_serial: 1,
+                key,
+                kind: BridgeSourceKind::Audio {
+                    linked_video: None,
+                    codec: "pcm_s16le".into(),
+                    packetization: "pcm-packet-v1".into(),
+                    extradata: Vec::new(),
+                    sample_rate: 48_000,
+                    channels: 2,
+                    channel_mask: 3,
+                    bitrate: 1_536_000,
+                    max_access_unit_bytes: 256,
+                    codec_string: None,
+                },
+                live: false,
+                active: true,
+                audio_gain: Some(AudioGain::UNITY.raw()),
+                capture_policy: 0,
+                descriptor: None,
+                playing: false,
+                play_request: BridgePlayRequest {
+                    start_pts_us: 0,
+                    minimum_buffer_us: 1,
+                    maximum_latency_us: 1_000_000,
+                    rate_32_32: 1_i64 << 32,
+                    late_policy: 1,
+                    loop_count: 0,
+                    start_policy: 1,
+                },
+                eos_epoch: None,
+                causation_id: None,
+            };
+            Some(Self {
+                _directory: directory,
+                presenter,
+                bridge,
+                surface,
+                source,
+                packet_id: 0,
+            })
+        }
+
+        fn key(&self) -> BridgeSourceKey {
+            self.source.key
+        }
+
+        fn submit_packet(&mut self, pts_us: i64) -> bool {
+            self.packet_id += 1;
+            let body = media::audio_packet_body(AudioPacket {
+                epoch: 1,
+                packet_id: self.packet_id,
+                pts_us,
+                dts_us: pts_us,
+                duration_us: 10_000,
+                trim_start_samples: 0,
+                trim_end_samples: 0,
+                data: &[0; 32],
+            })
+            .unwrap();
+            self.bridge
+                .media_chunk(
+                    self.packet_id,
+                    self.source.key,
+                    messages::AUDIO_PACKET,
+                    0,
+                    body.len() as u32,
+                    true,
+                    body,
+                )
+                .unwrap()
+        }
+
+        /// Publish the bridge's own outer session as a projected producer of the test presenter.
+        fn project(&self) {
+            self.presenter.projection_snapshot(&HashSet::from([7]));
+        }
+
+        /// Service the bridge until the outer slot holds this source.
+        fn settle_activation(&mut self, pts_us: i64) {
+            let key = self.source.key;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !self.bridge.tracks[&key].activated {
+                self.project();
+                let _ = self.bridge.take_media_completions();
+                self.bridge.retry_pending_activation().unwrap();
+                self.bridge.retry_pending_playback().unwrap();
+                if self.bridge.can_accept_media(key) {
+                    self.submit_packet(pts_us);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the timed audio slot never became active"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            let _ = self.bridge.take_media_completions();
+        }
+
+        fn outer_playback(&self) -> (i64, bool) {
+            let outer_track = self.bridge.tracks[&self.source.key].track.id();
+            let snapshot = self.presenter.projection_snapshot(&HashSet::from([7]));
+            let source = snapshot
+                .sources
+                .iter()
+                .find(|source| source.key.track == outer_track)
+                .expect("the outer presenter lost the relayed track");
+            (source.play_request.start_pts_us, source.playing)
+        }
+    }
+
+    /// Seeking while paused replaces the timed tracks and never publishes a `playing` edge the
+    /// bridge can observe: consecutive projection snapshots coalesce the producer's PLAY-then-PAUSE
+    /// pair into one paused snapshot. Without republishing the position from level state, the
+    /// replacement outer track has no clock at all, the physical presenter holds every decoded
+    /// picture, and the pane stays blank until the user happens to resume.
+    #[test]
+    #[cfg(unix)]
+    fn a_paused_seek_positions_the_replacement_outer_track() {
+        let Some(mut fixture) = PausedSurfaceFixture::start("paused-seek.sock") else {
+            return;
+        };
+        let key = fixture.key();
+        let surface = fixture.surface.clone();
+        let paused = fixture.source.clone();
+        fixture
+            .bridge
+            .rebuild(
+                std::slice::from_ref(&surface),
+                std::slice::from_ref(&paused),
+                &[],
+            )
+            .unwrap();
+        fixture.project();
+        assert!(fixture.submit_packet(0));
+        fixture.settle_activation(0);
+
+        let mut playing = paused.clone();
+        playing.playing = true;
+        fixture
+            .bridge
+            .update_playback(
+                std::slice::from_ref(&paused),
+                std::slice::from_ref(&playing),
+            )
+            .unwrap();
+        fixture
+            .bridge
+            .update_playback(
+                std::slice::from_ref(&playing),
+                std::slice::from_ref(&paused),
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.outer_playback().0,
+            0,
+            "the initial position did not reach the outer presenter"
+        );
+
+        // The seek: a replacement decoder, a new authoritative target, and no playing edge.
+        const TARGET_PTS_US: i64 = 9_000_000;
+        let mut sought = paused.clone();
+        sought.decoder_reset_serial = 2;
+        sought.play_request.start_pts_us = TARGET_PTS_US;
+        fixture
+            .bridge
+            .rebuild(
+                std::slice::from_ref(&surface),
+                std::slice::from_ref(&sought),
+                &[],
+            )
+            .unwrap();
+        fixture.project();
+        fixture.source = sought;
+        assert!(
+            fixture.bridge.tracks[&key].published_play_request.is_none(),
+            "the replacement outer track was created already positioned"
+        );
+
+        assert!(fixture.submit_packet(TARGET_PTS_US));
+        fixture.settle_activation(TARGET_PTS_US);
+        fixture.bridge.retry_pending_playback().unwrap();
+
+        assert_eq!(
+            fixture.outer_playback(),
+            (TARGET_PTS_US, false),
+            "the paused seek target never reached the outer presenter"
+        );
+        fixture.bridge.retry_pending_playback().unwrap();
+        assert_eq!(
+            fixture.outer_playback(),
+            (TARGET_PTS_US, false),
+            "an already published paused position was republished"
+        );
+    }
+
+    /// The bounded pre-roll window exists for the activation handshake. Holding it as a permanent
+    /// cumulative wall after the slot is activated deadlocks a paused seek: nothing raises
+    /// `preplay_limit` for an activated track, so the record is never popped from the foreground
+    /// queue, its delivery never completes, and the nested producer blocks in a credit wait that
+    /// can never return - including on the one resume submission PLAY itself waits for.
+    #[test]
+    #[cfg(unix)]
+    fn an_activated_paused_source_keeps_accepting_bounded_pre_roll() {
+        let Some(mut fixture) = PausedSurfaceFixture::start("paused-preroll.sock") else {
+            return;
+        };
+        let key = fixture.key();
+        let surface = fixture.surface.clone();
+        let paused = fixture.source.clone();
+        fixture
+            .bridge
+            .rebuild(
+                std::slice::from_ref(&surface),
+                std::slice::from_ref(&paused),
+                &[],
+            )
+            .unwrap();
+        fixture.project();
+        assert!(fixture.submit_packet(0));
+        fixture.settle_activation(0);
+
+        let track = fixture.bridge.tracks.get_mut(&key).unwrap();
+        assert!(!track.playing, "the fixture source is not paused");
+        track.preplay_limit = track.media_submitted;
+        track.preplay_ceiling = track.media_submitted;
+        assert!(
+            fixture.bridge.can_accept_media(key),
+            "an exhausted pre-roll window wedged an activated paused source"
+        );
+
+        let track = fixture.bridge.tracks.get_mut(&key).unwrap();
+        track.activated = false;
+        assert!(
+            !fixture.bridge.can_accept_media(key),
+            "pre-PLAY pre-roll stopped being bounded before activation"
         );
     }
 
