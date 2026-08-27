@@ -386,6 +386,69 @@ pub struct SnapshotSource {
     pub raster_delta_operation_limit: Option<u32>,
 }
 
+/// Everything one pane's capture found: what it could compose, and what it deliberately could not.
+#[derive(Debug, Clone)]
+pub struct PaneCapture {
+    pub layers: Vec<CaptureLayer>,
+    /// Visual sources that contributed nothing, each with the reason. A blank capture that says
+    /// why is a fact; a blank capture that says nothing reads as a broken request.
+    pub skipped: Vec<SkippedSource>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkippedSource {
+    pub source: SourceKey,
+    pub node_id: u64,
+    pub reason: SkipReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Encoded video is relayed to the presenter and never decoded here, so there are no pixels
+    /// to compose and there never will be without a decoder.
+    UndecodedVideo,
+    /// The track is one this could compose, but the gateway holds nothing for it yet: it has sent
+    /// no frame, or its delta chain broke and it is awaiting recovery.
+    NoRetainedPixels,
+    /// The producer marked the node invisible.
+    NodeHidden,
+}
+
+impl SkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UndecodedVideo => "undecoded_video",
+            Self::NoRetainedPixels => "no_retained_pixels",
+            Self::NodeHidden => "node_hidden",
+        }
+    }
+}
+
+/// A pane's media without its pixels, for discovery across a whole session.
+#[derive(Debug, Clone)]
+pub struct PaneMediaSummary {
+    pub surfaces: Vec<String>,
+    pub tracks: Vec<PaneTrackSummary>,
+}
+
+impl PaneMediaSummary {
+    pub fn is_empty(&self) -> bool {
+        self.surfaces.is_empty() && self.tracks.is_empty()
+    }
+
+    /// Whether a capture of this pane would produce anything at all.
+    pub fn capturable(&self) -> bool {
+        self.tracks.iter().any(|track| track.capturable)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PaneTrackSummary {
+    pub source: SourceKey,
+    pub kind: &'static str,
+    pub capturable: bool,
+}
+
 /// One node's retained pixels and the rectangle they occupy, for a read-only pane capture.
 #[derive(Debug, Clone)]
 pub struct CaptureLayer {
@@ -1180,9 +1243,10 @@ impl VirtualVivid {
     /// A layer appears only when the gateway already holds its pixels. A track that has sent
     /// nothing, or whose delta chain broke and is awaiting recovery, is skipped rather than
     /// reported as a blank layer.
-    pub fn capture_pane(&self, pane: PaneId, viewport_offset: usize) -> Vec<CaptureLayer> {
+    pub fn capture_pane(&self, pane: PaneId, viewport_offset: usize) -> PaneCapture {
         let state = lock(&self.state);
         let mut layers = Vec::new();
+        let mut skipped = Vec::new();
         for (key, entry) in &state.nodes {
             if entry.pane != pane {
                 continue;
@@ -1208,22 +1272,41 @@ impl VirtualVivid {
             ) else {
                 continue;
             };
-            if !config.node.visible {
-                continue;
-            }
             let Some(track) = state.tracks.get(&track_key) else {
                 continue;
             };
+            let source = bridge_track_key(track_key);
+            let node_id = entry.node.node_id;
+            if !config.node.visible {
+                skipped.push(SkippedSource {
+                    source,
+                    node_id,
+                    reason: SkipReason::NodeHidden,
+                });
+                continue;
+            }
             let content = if let Some(raster) = track.retained_raster.clone() {
                 CaptureContent::Raster(raster)
             } else if let Some(encoded) = track.retained.clone() {
                 CaptureContent::EncodedImage(encoded)
             } else {
+                // Say why nothing was contributed. A silently blank capture reads as a bug in the
+                // caller's own request, and the two reasons want completely different responses:
+                // encoded video is never going to appear here, while a track awaiting recovery
+                // will as soon as its keyframe lands.
+                skipped.push(SkippedSource {
+                    source,
+                    node_id,
+                    reason: match track.configuration.kind {
+                        KindConfiguration::Video(_) => SkipReason::UndecodedVideo,
+                        _ => SkipReason::NoRetainedPixels,
+                    },
+                });
                 continue;
             };
             layers.push(CaptureLayer {
-                source: config.node.track,
-                node_id: config.node.node_id,
+                source,
+                node_id,
                 z_index: config.node.z_index,
                 x: config.node.x,
                 y: config.node.y,
@@ -1235,7 +1318,56 @@ impl VirtualVivid {
         }
         // Back to front, with the node id breaking a tie so a capture is reproducible.
         layers.sort_by_key(|layer| (layer.z_index, layer.node_id));
-        layers
+        skipped.sort_by_key(|entry| entry.node_id);
+        PaneCapture { layers, skipped }
+    }
+
+    /// What media a pane carries, without its pixels.
+    ///
+    /// The cheap half of [`Self::capture_pane`], for answering "which pane is the browser, and can
+    /// I capture it" across a whole session in one call rather than one round trip per pane.
+    pub fn pane_media_summary(&self, pane: PaneId) -> PaneMediaSummary {
+        let state = lock(&self.state);
+        let mut surfaces = Vec::new();
+        let mut tracks = Vec::new();
+        for (key, surface) in &state.surfaces {
+            if state
+                .sessions
+                .get(&key.session)
+                .is_none_or(|session| session.pane != pane)
+            {
+                continue;
+            }
+            let title = surface.state.definition.descriptor.title.clone();
+            if !title.is_empty() && !surfaces.contains(&title) {
+                surfaces.push(title);
+            }
+        }
+        for (key, track) in &state.tracks {
+            if state
+                .sessions
+                .get(&key.surface.session)
+                .is_none_or(|session| session.pane != pane)
+            {
+                continue;
+            }
+            let (kind, visual) = match track.configuration.kind {
+                KindConfiguration::Raster(_) => ("raster", true),
+                KindConfiguration::EncodedImage(_) => ("image", true),
+                KindConfiguration::Video(_) => ("video", true),
+                KindConfiguration::Audio(_) => ("audio", false),
+            };
+            tracks.push(PaneTrackSummary {
+                source: bridge_track_key(*key),
+                kind,
+                // Capturable means the pixels are in hand right now, which is a stronger claim
+                // than the track being visual: video never is, and a raster awaiting recovery
+                // is not yet.
+                capturable: visual && (track.retained_raster.is_some() || track.retained.is_some()),
+            });
+        }
+        tracks.sort_by_key(|track| (track.source.surface, track.source.track));
+        PaneMediaSummary { surfaces, tracks }
     }
 
     pub fn prepare_projection_snapshot_with_viewports(
@@ -7660,7 +7792,8 @@ mod tests {
         }
 
         for (pane, fill) in [(7_u64, 0x11_u8), (8, 0x22)] {
-            let layers = presenter.capture_pane(pane, 0);
+            let captured = presenter.capture_pane(pane, 0);
+            let layers = &captured.layers;
             assert_eq!(
                 layers.len(),
                 1,
@@ -7689,7 +7822,8 @@ mod tests {
         }
 
         // And a pane nobody is producing into captures nothing rather than someone else's screen.
-        assert!(presenter.capture_pane(9, 0).is_empty());
+        let empty = presenter.capture_pane(9, 0);
+        assert!(empty.layers.is_empty() && empty.skipped.is_empty());
     }
 
     #[test]
@@ -7743,9 +7877,15 @@ mod tests {
         let event = received.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
 
+        let captured = presenter.capture_pane(7, 0);
         assert!(
-            presenter.capture_pane(7, 0).is_empty(),
+            captured.layers.is_empty(),
             "a node the producer marked invisible must not appear in a capture"
+        );
+        assert_eq!(
+            captured.skipped.first().map(|entry| entry.reason),
+            Some(SkipReason::NodeHidden),
+            "and the capture must say why it composed nothing"
         );
     }
 
