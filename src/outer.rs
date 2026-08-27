@@ -91,6 +91,13 @@ struct OuterTrack {
     preplay_queried: usize,
     preplay_limit: usize,
     preplay_ceiling: usize,
+    /// Submission count at the last PAUSE, cleared by the following PLAY.
+    ///
+    /// An activated audio slot can retain decoded samples while paused, but restarting it before
+    /// the nested producer has resumed its feed lets that tail drain into an underrun. Waiting for
+    /// one new submission proves the feed is moving again without waiting for presenter capacity,
+    /// which can itself depend on PLAY when the paused audio ring is full.
+    resume_after_submission: Option<usize>,
     playing: bool,
     eos_requested: bool,
     eos: bool,
@@ -605,6 +612,9 @@ impl OuterBridge {
                         .filter(|track| track.surface_key == surface)
                     {
                         track.playing = false;
+                        track.resume_after_submission =
+                            matches!(track.kind, BridgeSourceKind::Audio { .. })
+                                .then_some(track.media_submitted);
                         track.preplay_queried = track.media_completed;
                         track.preplay_limit = track.media_submitted.saturating_add(1);
                         track.preplay_ceiling = track
@@ -684,6 +694,7 @@ impl OuterBridge {
         for member in playing_members {
             if let Some(track) = self.tracks.get_mut(&member) {
                 track.playing = true;
+                track.resume_after_submission = None;
             }
         }
         self.playback.push((
@@ -1077,6 +1088,7 @@ impl OuterBridge {
                 preplay_queried: 0,
                 preplay_limit: 1,
                 preplay_ceiling: OUTER_TIMED_PREROLL_RECORDS,
+                resume_after_submission: None,
                 playing: false,
                 eos_requested: false,
                 eos: false,
@@ -1409,10 +1421,20 @@ impl OuterBridge {
             .iter()
             .all(|(member, _, _)| self.tracks[member].activated)
         {
-            // PAUSE keeps the surface's slots and decoded output active. Resuming that surface is
-            // only a clock edge: waiting for another completed packet here makes PLAY depend on
-            // media Vivi intentionally stopped while paused, producing a visible start/stall
-            // cycle. Initial startup still follows the bounded pre-roll and activation path below.
+            // PAUSE keeps the surface's slots and decoded output active, so resume must not repeat
+            // initial activation or wait for a keyframe. It does need evidence that linked audio
+            // has restarted: playing its retained tail before Vivi has submitted another packet
+            // drains into an underrun, after which audio jumps and video follows the wrong clock.
+            // A submission is enough. Waiting for its completion could deadlock on a full paused
+            // audio ring, whose capacity is returned only after PLAY starts consuming it.
+            if self.tracks.get(&clock).is_some_and(|track| {
+                !track.eos
+                    && track
+                        .resume_after_submission
+                        .is_some_and(|floor| track.media_submitted <= floor)
+            }) {
+                return Ok(());
+            }
             return self.play_surface_clock(key, surface_key);
         }
         if members.iter().any(|(member, _, _)| {
@@ -2605,7 +2627,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn paused_active_surface_resumes_without_waiting_for_more_media() {
+    fn paused_active_surface_waits_for_one_fresh_audio_submission() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("pause-resume.sock");
         let listener = match TestSocketListener::bind(socket.clone()) {
@@ -2754,12 +2776,49 @@ mod tests {
             .unwrap();
 
         assert!(
-            bridge.tracks[&audio_key].playing,
-            "resume remained pending on media that cannot arrive while Vivi is paused"
+            !bridge.tracks[&audio_key].playing,
+            "resume played the retained tail before the nested audio feed restarted"
         );
         assert_eq!(
             bridge.tracks[&audio_key].media_submitted, submitted_before_resume,
-            "resume consumed another pre-roll record instead of restarting the active clock"
+            "the pending resume changed media accounting"
+        );
+
+        let body = media::audio_packet_body(AudioPacket {
+            epoch: 1,
+            packet_id: 2,
+            pts_us: 4_000_000,
+            dts_us: 4_000_000,
+            duration_us: 10_000,
+            trim_start_samples: 0,
+            trim_end_samples: 0,
+            data: &[0; 32],
+        })
+        .unwrap();
+        assert!(
+            bridge
+                .media_chunk(
+                    2,
+                    audio_key,
+                    messages::AUDIO_PACKET,
+                    0,
+                    body.len() as u32,
+                    true,
+                    body,
+                )
+                .unwrap(),
+            "PAUSE did not admit one bounded resume packet"
+        );
+        bridge.retry_pending_playback().unwrap();
+
+        assert!(
+            bridge.tracks[&audio_key].playing,
+            "one fresh audio submission did not release the pending PLAY"
+        );
+        assert_eq!(
+            bridge.tracks[&audio_key].media_submitted,
+            submitted_before_resume + 1,
+            "resume admitted more than the one record needed to restart the feed"
         );
         assert!(
             presenter
