@@ -24,8 +24,8 @@ use vivid_sdk::{
 use zeroize::Zeroizing;
 
 use crate::types::{
-    BridgeKeyframeRequest, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceKey,
-    BridgeSourceKind, BridgeSurface, BridgeSurfaceKey, DisplayMetrics,
+    BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind,
+    BridgeSurface, BridgeSurfaceKey, DisplayMetrics,
 };
 
 pub use vivid_sdk::ConnectionFactory;
@@ -498,6 +498,11 @@ impl OuterBridge {
         previous: &[BridgeSource],
         current: &[BridgeSource],
     ) -> io::Result<()> {
+        let previous_sources = previous
+            .iter()
+            .cloned()
+            .map(|source| (source.key, source))
+            .collect::<HashMap<_, _>>();
         // Playback helpers must read the new authoritative request. Keeping this assignment until
         // the end made a changed PLAY either use the old PTS or disappear entirely because the
         // outer tracks were already marked playing.
@@ -573,12 +578,23 @@ impl OuterBridge {
                     self.try_start_surface(source.key)?;
                 }
             } else if !source.playing && old.is_some_and(|old| old.playing) {
-                let (surface, track) = self
+                let surface = self
                     .tracks
                     .get(&source.key)
-                    .map(|track| (track.surface_key, track.track.clone()))
+                    .map(|track| track.surface_key)
                     .ok_or_else(|| invalid_data("playback track is missing"))?;
                 if paused_surfaces.insert(surface) {
+                    // PAUSE updates the whole surface clock, but Vivido only stops the physical
+                    // audio output when the named object is the audio track. The source snapshot
+                    // comes from a hash map, so using the first falling edge made pause latency
+                    // depend on whether video or audio happened to be visited first.
+                    let clock = preferred_surface_clock(&previous_sources, surface, source.key);
+                    let track = self
+                        .tracks
+                        .get(&clock)
+                        .ok_or_else(|| invalid_data("outer playback clock is missing"))?
+                        .track
+                        .clone();
                     self.session.pause(&track)?;
                     // PAUSE is surface-group state. Keep the bridge's bookkeeping equally
                     // broad so the recovery PLAY is not mistaken for a redundant PLAY on the
@@ -1382,6 +1398,13 @@ impl OuterBridge {
         if members.is_empty() {
             return Ok(());
         }
+        let clock = preferred_surface_clock(&self.active_sources, surface_key, key);
+        if self.tracks.get(&clock).is_some_and(|track| track.playing) {
+            // Video and linked audio can both carry the same rising surface edge. The first call
+            // starts their shared clock and marks every effective member playing; the second must
+            // not emit another PLAY and reconfigure the physical audio output again.
+            return Ok(());
+        }
         if members
             .iter()
             .all(|(member, _, _)| self.tracks[member].activated)
@@ -1416,15 +1439,9 @@ impl OuterBridge {
             return Ok(());
         }
         let mut bindings = Vec::new();
-        let mut clock = key;
-        for (member, outer_track, audio) in &members {
+        for (_, outer_track, audio) in &members {
             bindings.push(SlotBinding {
-                slot: if *audio {
-                    clock = *member;
-                    SLOT_AUDIO
-                } else {
-                    SLOT_VIDEO
-                },
+                slot: if *audio { SLOT_AUDIO } else { SLOT_VIDEO },
                 track_id: outer_track.id(),
                 expected_channel_generation: outer_track.channel_generation(),
                 required_milestone: vivid_sdk::MILESTONE_OUTPUT_READY,
@@ -1478,23 +1495,6 @@ impl OuterBridge {
             }
             Err(error) => return Err(error),
         }
-        let request = self
-            .active_sources
-            .get(&key)
-            .map(|source| source.play_request)
-            .unwrap_or_else(default_play_request);
-        let clock_track = self
-            .tracks
-            .get(&clock)
-            .ok_or_else(|| invalid_data("outer playback clock is missing"))?
-            .track
-            .clone();
-        self.session.play(
-            &clock_track,
-            request.start_pts_us,
-            request.minimum_buffer_us.max(1),
-            request.maximum_latency_us.max(1),
-        )?;
         for binding in bindings {
             if let Some((_, track)) = self
                 .tracks
@@ -2277,8 +2277,9 @@ fn signed(value: i64) -> Value {
     }
 }
 
-fn default_play_request() -> BridgePlayRequest {
-    BridgePlayRequest {
+#[cfg(test)]
+fn default_play_request() -> crate::types::BridgePlayRequest {
+    crate::types::BridgePlayRequest {
         start_pts_us: 0,
         minimum_buffer_us: 1,
         maximum_latency_us: 1_000_000,
@@ -2328,6 +2329,7 @@ fn source_is_effectively_playing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::BridgePlayRequest;
 
     #[cfg(unix)]
     struct TestSocketListener {
