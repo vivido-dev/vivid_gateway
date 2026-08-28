@@ -397,6 +397,32 @@ impl OuterBridge {
         values
     }
 
+    /// Adopt the decoder-reset serial published in response to this outer track's own recovery
+    /// request without replacing that track.
+    ///
+    /// The physical decoder has already reset when it emits `NEED_KEYFRAME`. Recreating it again
+    /// when the nested producer answers with `ADVANCE_CHANNEL`/`FLUSH` closes media already queued
+    /// to the recovering track and turns an in-place recovery into a source-loss loop. Callers must
+    /// use this only for a reset correlated with a request read from the same live outer track.
+    pub fn acknowledge_outer_requested_decoder_reset(
+        &mut self,
+        key: BridgeSourceKey,
+        decoder_reset_serial: u64,
+    ) -> io::Result<()> {
+        let track = self
+            .tracks
+            .get_mut(&key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "outer track is missing"))?;
+        if decoder_reset_serial < track.decoder_reset_serial {
+            return Err(invalid_data("outer decoder reset serial moved backward"));
+        }
+        track.decoder_reset_serial = decoder_reset_serial;
+        if let Some(source) = self.active_sources.get_mut(&key) {
+            source.decoder_reset_serial = decoder_reset_serial;
+        }
+        Ok(())
+    }
+
     pub fn rebuild(
         &mut self,
         surfaces: &[BridgeSurface],
@@ -2653,7 +2679,7 @@ mod tests {
             },
         };
         let surfaces = vec![surface(11), surface(12)];
-        let sources = vec![video(11), video(12)];
+        let mut sources = vec![video(11), video(12)];
         let nodes = vec![node(11, 0), node(12, 20)];
         bridge.rebuild(&surfaces, &sources, &nodes).unwrap();
 
@@ -2664,6 +2690,22 @@ mod tests {
         let unrelated_surface = bridge.outer_surface_id(surfaces[1].key).unwrap();
         let recovering_node = bridge.nodes.get(&(11, 9, 0)).unwrap().clone();
         let unrelated_node = bridge.nodes.get(&(12, 9, 0)).unwrap().clone();
+
+        sources[1].decoder_reset_serial += 1;
+        bridge
+            .acknowledge_outer_requested_decoder_reset(
+                unrelated_key,
+                sources[1].decoder_reset_serial,
+            )
+            .unwrap();
+        assert!(
+            bridge
+                .rebuild(&surfaces, &sources, &nodes)
+                .unwrap()
+                .is_empty(),
+            "an acknowledged outer-requested reset recreated its existing decoder"
+        );
+        assert_eq!(bridge.outer_track_id(unrelated_key), Some(unrelated_track));
 
         bridge
             .rebuild_resetting(

@@ -695,6 +695,13 @@ struct State {
     next_session: u64,
     projection_revision: u64,
     projected_sources: HashSet<SourceKey>,
+    /// Decoder-reset serial acknowledged by the outer presenter for each projected source.
+    ///
+    /// A timed seek preserves the logical source key while replacing its channel and decoder.
+    /// Keeping only the key would let the new generation enter an outer decoder that is still
+    /// applying the previous snapshot. The exact serial therefore participates in the delivery
+    /// gate even though it is not part of source identity.
+    projected_decoder_resets: HashMap<SourceKey, u64>,
     deliveries: HashMap<u64, PendingDelivery>,
     idempotency: HashMap<(u64, [u8; messages::IDEMPOTENCY_KEY_BYTES]), CachedMutation>,
     idempotency_order: std::collections::VecDeque<(u64, [u8; messages::IDEMPOTENCY_KEY_BYTES])>,
@@ -791,6 +798,7 @@ impl VirtualVivid {
             next_session: 0,
             projection_revision: 0,
             projected_sources: HashSet::new(),
+            projected_decoder_resets: HashMap::new(),
             deliveries: HashMap::new(),
             idempotency: HashMap::new(),
             idempotency_order: std::collections::VecDeque::new(),
@@ -1492,6 +1500,10 @@ impl VirtualVivid {
             .iter()
             .map(|source| source.key)
             .collect::<HashSet<_>>();
+        let projected_decoder_resets = sources
+            .iter()
+            .map(|source| (source.key, source.decoder_reset_serial))
+            .collect::<HashMap<_, _>>();
         let hidden_sources = state
             .projected_sources
             .difference(&projected_sources)
@@ -1537,12 +1549,19 @@ impl VirtualVivid {
         }
         if activate_immediately {
             state.projected_sources = projected_sources;
+            state.projected_decoder_resets = projected_decoder_resets;
         } else {
             // Falling edges are immediate: once a tab is hidden, no later timed packet may enter
-            // the outer bridge being torn down. Rising edges wait for the exact applied ack.
+            // the outer bridge being torn down. A decoder-reset serial change is also a falling
+            // edge even though the source key stays stable: the old acknowledgement must not
+            // release packets belonging to the replacement decoder. Rising edges wait for the
+            // exact applied ack.
             state
                 .projected_sources
                 .retain(|source| projected_sources.contains(source));
+            state
+                .projected_decoder_resets
+                .retain(|source, _| projected_sources.contains(source));
         }
         let videos_needing_keyframes = state
             .tracks
@@ -1574,13 +1593,38 @@ impl VirtualVivid {
 
     /// Publish the exact source set acknowledged by the foreground physical presenter.
     pub fn activate_bridge_projection(&self, sources: &HashSet<SourceKey>) {
-        lock(&self.state).projected_sources = sources.clone();
+        let mut state = lock(&self.state);
+        state.projected_decoder_resets = sources
+            .iter()
+            .filter_map(|source| {
+                state
+                    .tracks
+                    .get(&inner_track_key(*source))
+                    .map(|track| (*source, track.decoder_reset_serial))
+            })
+            .collect();
+        state.projected_sources = sources.clone();
+        drop(state);
+        self.delivery_changed.notify_all();
+    }
+
+    /// Publish a bridge snapshot with the decoder generations it actually acknowledged.
+    ///
+    /// Unlike [`Self::activate_bridge_projection`], this accepts historical serials. That matters
+    /// when several snapshots are in flight: applying an older snapshot must not wake a worker
+    /// whose source key is unchanged but whose seek generation is newer.
+    pub fn activate_bridge_projection_at_resets(&self, sources: &HashMap<SourceKey, u64>) {
+        let mut state = lock(&self.state);
+        state.projected_sources = sources.keys().copied().collect();
+        state.projected_decoder_resets = sources.clone();
+        drop(state);
         self.delivery_changed.notify_all();
     }
 
     pub fn deactivate_bridge(&self) {
         let mut state = lock(&self.state);
         state.projected_sources.clear();
+        state.projected_decoder_resets.clear();
         for track in state.tracks.values_mut() {
             if matches!(track.configuration.kind, KindConfiguration::Video(_)) && track.playing {
                 track.recovery_pending = true;
@@ -2991,32 +3035,48 @@ fn dispatch_control(
             let map = StrictMap::new("ADVANCE_CHANNEL", &value, &[0, 1, 2, 3, 4, 5])
                 .map_err(|_| ControlError::bad("invalid channel advance"))?;
             let key = track_key_from_map(session_id, &map)?;
-            let track = state
-                .tracks
-                .get_mut(&key)
-                .ok_or_else(|| ControlError::missing("track does not exist"))?;
-            track
-                .state
-                .advance_channel(
-                    ChannelGeneration::new(required_u64(&map, 3)?),
-                    ChannelGeneration::new(required_u64(&map, 4)?),
+            let reason = required_u64(&map, 5)?;
+            let (generation, revision) = {
+                let track = state
+                    .tracks
+                    .get_mut(&key)
+                    .ok_or_else(|| ControlError::missing("track does not exist"))?;
+                track
+                    .state
+                    .advance_channel(
+                        ChannelGeneration::new(required_u64(&map, 3)?),
+                        ChannelGeneration::new(required_u64(&map, 4)?),
+                    )
+                    .map_err(|_| ControlError::state("channel advance is stale"))?;
+                if track.flush_pending_channel_advance {
+                    track.flush_pending_channel_advance = false;
+                } else {
+                    track.decoder_reset_serial = track
+                        .decoder_reset_serial
+                        .checked_add(1)
+                        .ok_or_else(|| ControlError::state("decoder reset serial exhausted"))?;
+                    track.channel_advance_pending_flush = true;
+                }
+                track.channel_writer = None;
+                track.recovery_pending = true;
+                track.recovery_requested = false;
+                track.discard_blocked_for_recovery = false;
+                // A timeline discontinuity carrying a causation ID is an explicit linked-track
+                // reset group. Snapshots expose that direct cause so a terminating gateway can
+                // wait for the matching linked members instead of projecting half a seek.
+                track.causation_id = (reason
+                    == vivid_protocol::registry::channel_advance_reason::TIMELINE_DISCONTINUITY)
+                    .then_some(envelope.causation_id)
+                    .flatten();
+                (
+                    track.state.channel_generation.get(),
+                    track.state.revision.get(),
                 )
-                .map_err(|_| ControlError::state("channel advance is stale"))?;
-            if track.flush_pending_channel_advance {
-                track.flush_pending_channel_advance = false;
-            } else {
-                track.decoder_reset_serial = track
-                    .decoder_reset_serial
-                    .checked_add(1)
-                    .ok_or_else(|| ControlError::state("decoder reset serial exhausted"))?;
-                track.channel_advance_pending_flush = true;
-            }
-            track.channel_writer = None;
-            track.recovery_pending = true;
-            track.recovery_requested = false;
-            track.discard_blocked_for_recovery = false;
-            let generation = track.state.channel_generation.get();
-            let revision = track.state.revision.get();
+            };
+            // Actor-queued records were admitted under the retired generation. Removing their
+            // delivery identities makes the actor drop their event shells instead of forwarding
+            // them after the replacement projection is acknowledged.
+            retire_track_deliveries(&mut state, key);
             advance_projection(&mut state);
             (
                 messages::CHANNEL_ADVANCED,
@@ -3355,6 +3415,7 @@ fn dispatch_control(
             let key = track_key_from_value(session_id, &value)?;
             let mut linked_play = None;
             let mut linked_pause = false;
+            let mut retire_deliveries = false;
             let track = state
                 .tracks
                 .get_mut(&key)
@@ -3413,6 +3474,7 @@ fn dispatch_control(
                     track.discard_blocked_for_recovery = false;
                     track.retained = None;
                     track.retained_raster = None;
+                    retire_deliveries = true;
                     if track.channel_advance_pending_flush {
                         track.channel_advance_pending_flush = false;
                     } else {
@@ -3452,6 +3514,9 @@ fn dispatch_control(
                         track.playing = false;
                     }
                 }
+            }
+            if retire_deliveries {
+                retire_track_deliveries(&mut state, key);
             }
             advance_projection(&mut state);
             (messages::OK, record.object_id, Ok(messages::ok(request_id)))
@@ -3810,7 +3875,10 @@ fn track_loop(
             changed.notify_all();
         }
         loop {
-            let projected = state.projected_sources.contains(&source);
+            let projected = state.projected_sources.contains(&source)
+                && state.tracks.get(&key).is_some_and(|track| {
+                    state.projected_decoder_resets.get(&source) == Some(&track.decoder_reset_serial)
+                });
             // The recovery gate holds linked audio that still belongs to the retired epoch. A seek
             // hands over a whole replacement generation instead, and the outer relay publishes the
             // replacement PLAY only once every linked member has submitted pre-roll — so parking
@@ -4904,10 +4972,7 @@ fn require_root_context(
     }
 }
 
-fn remove_track(state: &mut State, key: TrackKey) -> Result<(), ControlError> {
-    if !state.tracks.contains_key(&key) {
-        return Err(ControlError::missing("track does not exist"));
-    }
+fn retire_track_deliveries(state: &mut State, key: TrackKey) {
     let pending_deliveries = state
         .deliveries
         .iter()
@@ -4915,11 +4980,18 @@ fn remove_track(state: &mut State, key: TrackKey) -> Result<(), ControlError> {
         .collect::<Vec<_>>();
     for delivery_id in pending_deliveries {
         if let Some(delivery) = state.deliveries.remove(&delivery_id) {
-            // Release while the track and its channel writer still exist. Dropping the delivery
-            // first strands a paced outer writer in its capacity wait during seek teardown.
+            // Release while the track and its channel writer still exist. The actor can retain the
+            // event shell, but its missing delivery identity makes that shell harmless.
             release_delivery_allowance(state, &delivery);
         }
     }
+}
+
+fn remove_track(state: &mut State, key: TrackKey) -> Result<(), ControlError> {
+    if !state.tracks.contains_key(&key) {
+        return Err(ControlError::missing("track does not exist"));
+    }
+    retire_track_deliveries(state, key);
     state
         .tracks
         .remove(&key)
@@ -5700,6 +5772,21 @@ mod tests {
         }
     }
 
+    fn wait_for_connection_count(presenter: &VirtualVivid, maximum: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let connections = lock(&presenter.state).connections;
+            if connections <= maximum {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "retired track transports remained counted: {connections} > {maximum}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn audio(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
         let maximum_record_body = media::audio_body_len(256).unwrap();
         TrackConfiguration {
@@ -5728,6 +5815,82 @@ mod tests {
             maximum_latency_us: 1_000_000,
             retained_pixel_charge: 0,
         }
+    }
+
+    #[test]
+    fn retired_track_transports_release_connection_slots_without_touching_another_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let presenter = VirtualVivid::start(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret_a = presenter.issue_pane_capability(7).unwrap();
+        let mut owner_a =
+            vivid_sdk::Session::connect(producer(presenter.endpoint().to_owned(), &secret_a))
+                .unwrap();
+        let secret_b = presenter.issue_pane_capability(7).unwrap();
+        let mut owner_b =
+            vivid_sdk::Session::connect(producer(presenter.endpoint().to_owned(), &secret_b))
+                .unwrap();
+        let context_a = owner_a.info().root_context_id;
+        let context_b = owner_b.info().root_context_id;
+        // Both owners deliberately reuse every local numeric ID. Transport retirement must remain
+        // scoped to the complete session/context/surface/track identity.
+        let surface_a = owner_a
+            .create_surface(surface(context_a, 9), &RequestMetadata::default())
+            .unwrap();
+        let surface_b = owner_b
+            .create_surface(surface(context_b, 9), &RequestMetadata::default())
+            .unwrap();
+        let track_a = owner_a
+            .create_track(
+                raster(context_a, surface_a.id(), 11),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let track_b = owner_b
+            .create_track(
+                raster(context_b, surface_b.id(), 11),
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let unrelated_channel = owner_b.open_track_channel(&track_b).unwrap();
+
+        for epoch in 1_u32..=u32::try_from(MAX_CONNECTIONS + 8).unwrap() {
+            let channel = owner_a
+                .open_track_channel(&track_a)
+                .unwrap_or_else(|error| {
+                    let status = owner_a.query_track(&track_a);
+                    let connections = lock(&presenter.state).connections;
+                    panic!(
+                        "replacement channel {epoch} exhausted connection slots: {error}; \
+                         connections={connections}; status={status:?}"
+                    )
+                });
+            owner_a
+                .advance_channel(
+                    &track_a,
+                    vivid_protocol::registry::channel_advance_reason::RECOVERY,
+                    &RequestMetadata::default(),
+                )
+                .unwrap();
+            channel.close().unwrap();
+            drop(channel);
+            owner_a.flush(&track_a, epoch.saturating_add(1)).unwrap();
+            // Two control connections and owner B's still-live track connection remain.
+            wait_for_connection_count(&presenter, 3);
+        }
+
+        let unrelated = owner_b.query_track(&track_b).unwrap();
+        assert_eq!(unrelated.attachment_state, 1);
+        assert_eq!(track_b.channel_generation(), ChannelGeneration::ONE);
+        unrelated_channel.close().unwrap();
+        drop(unrelated_channel);
+        wait_for_connection_count(&presenter, 2);
+        owner_a.close().unwrap();
+        owner_b.close().unwrap();
     }
 
     #[test]
@@ -6225,6 +6388,9 @@ mod tests {
             .advance_channel(&seeking_track, 1, &RequestMetadata::default())
             .unwrap();
         let seeking_new_channel = seeking.open_track_channel(&seeking_track).unwrap();
+        // The replacement decoder is not eligible to deliver until the outer presenter has
+        // acknowledged a projection carrying this exact reset serial.
+        presenter.projection_snapshot(&HashSet::from([7]));
         seeking_old_channel.close().unwrap();
         drop(seeking_old_channel);
 
@@ -6336,6 +6502,7 @@ mod tests {
             .unwrap();
         let seeking_channel = Arc::new(seeking.open_track_channel(&seeking_track).unwrap());
         let neighbor_channel = Arc::new(neighbor.open_track_channel(&neighbor_track).unwrap());
+        let neighbor_keepalive = neighbor_channel.clone();
 
         let spawn_two_packets = |channel: Arc<vivid_sdk::TrackChannel>, pts_us: i64| {
             let (done_sender, done_receiver) = mpsc::sync_channel(1);
@@ -6440,6 +6607,7 @@ mod tests {
         seeking_worker.join().unwrap();
         neighbor_worker.join().unwrap();
         replacement.close().unwrap();
+        neighbor_keepalive.close().unwrap();
         seeking.close().unwrap();
         neighbor.close().unwrap();
     }
@@ -6912,14 +7080,27 @@ mod tests {
 
         // Seek: retire both generations, then arm the linked-audio recovery gate exactly as the
         // outer presenter does when it recreates the video track for the new epoch.
+        let seek_group = [0x5a; messages::CAUSATION_ID_BYTES];
+        let seek_metadata = RequestMetadata {
+            causation_id: Some(seek_group),
+            ..RequestMetadata::default()
+        };
         client
-            .advance_channel(&video, 1, &RequestMetadata::default())
+            .advance_channel(
+                &video,
+                vivid_protocol::registry::channel_advance_reason::TIMELINE_DISCONTINUITY,
+                &seek_metadata,
+            )
             .unwrap();
         let _ = video_channel.close();
         client.flush(&video, 2).unwrap();
         let video_channel = client.open_track_channel(&video).unwrap();
         client
-            .advance_channel(&audio, 1, &RequestMetadata::default())
+            .advance_channel(
+                &audio,
+                vivid_protocol::registry::channel_advance_reason::TIMELINE_DISCONTINUITY,
+                &seek_metadata,
+            )
             .unwrap();
         let _ = audio_channel.close();
         client.flush(&audio, 2).unwrap();
@@ -6934,6 +7115,11 @@ mod tests {
                 );
                 assert!(!track.flush_pending_channel_advance);
                 assert!(!track.channel_advance_pending_flush);
+                assert_eq!(
+                    track.causation_id,
+                    Some(seek_group),
+                    "the linked discontinuity lost its projection group"
+                );
             }
         }
         assert_eq!(
@@ -6945,6 +7131,15 @@ mod tests {
             let track = state.tracks.get(&inner_track_key(video_source)).unwrap();
             assert!(track.recovery_pending && track.gate_linked_audio_for_recovery);
         }
+        let replacement = presenter
+            .prepare_projection_snapshot_with_viewports(&HashSet::from([7]), &HashMap::new());
+        presenter.activate_bridge_projection_at_resets(
+            &replacement
+                .sources
+                .iter()
+                .map(|source| (source.key, source.decoder_reset_serial))
+                .collect(),
+        );
 
         // The producer's next step is its 100 ms prebuffer, and it has not sent a replacement
         // keyframe yet. Both must complete against the retired-generation flow the track already
@@ -7029,6 +7224,117 @@ mod tests {
         prebuffer.join().unwrap();
         let _ = video_channel.close();
         let _ = audio_channel.close();
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn seek_generation_waits_for_its_exact_projection_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(8);
+        let presenter = VirtualVivid::start_with_events(
+            TestSocketListener::bind(directory.path().join("vivid.sock")).unwrap(),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let video = client
+            .create_track(video(context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let first_channel = client.open_track_channel(&video).unwrap();
+        let initial = presenter
+            .prepare_projection_snapshot_with_viewports(&HashSet::from([7]), &HashMap::new());
+        let source = initial.sources[0].key;
+        let initial_resets = initial
+            .sources
+            .iter()
+            .map(|source| (source.key, source.decoder_reset_serial))
+            .collect::<HashMap<_, _>>();
+        presenter.activate_bridge_projection_at_resets(&initial_resets);
+
+        first_channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 40_000,
+                key: true,
+                data: &[0, 0, 0, 1, 0x65, 0x88],
+            })
+            .unwrap();
+        let first = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!presenter.complete_bridge_delivery(first.delivery_id, true));
+
+        // Leave one old-generation event in the actor's hands. The channel advance must retire
+        // its delivery identity before any replacement acknowledgement can make it observable.
+        first_channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 2,
+                pts_us: 40_000,
+                dts_us: 40_000,
+                duration_us: 40_000,
+                key: false,
+                data: &[0, 0, 0, 1, 0x41, 0x88],
+            })
+            .unwrap();
+        let retired = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        client
+            .advance_channel(&video, 1, &RequestMetadata::default())
+            .unwrap();
+        assert!(
+            !presenter.bridge_delivery_is_pending(retired.delivery_id, source),
+            "the actor could still forward a record admitted under the retired generation"
+        );
+        let _ = first_channel.close();
+        client.flush(&video, 2).unwrap();
+        let replacement_channel = client.open_track_channel(&video).unwrap();
+        let replacement = presenter
+            .prepare_projection_snapshot_with_viewports(&HashSet::from([7]), &HashMap::new());
+        let replacement_resets = replacement
+            .sources
+            .iter()
+            .map(|source| (source.key, source.decoder_reset_serial))
+            .collect::<HashMap<_, _>>();
+        assert_ne!(replacement_resets, initial_resets);
+
+        let (returned, did_return) = mpsc::sync_channel(1);
+        let sender = thread::spawn(move || {
+            replacement_channel
+                .send_video(media::VideoPacket {
+                    epoch: 2,
+                    packet_id: 3,
+                    pts_us: 8_000_000,
+                    dts_us: 8_000_000,
+                    duration_us: 40_000,
+                    key: true,
+                    data: &[0, 0, 0, 1, 0x65, 0xaa],
+                })
+                .unwrap();
+            returned.send(()).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+
+        // An older in-flight projection names the same source, but not the replacement decoder.
+        // Its acknowledgement must leave the new keyframe parked.
+        presenter.activate_bridge_projection_at_resets(&initial_resets);
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+
+        presenter.activate_bridge_projection_at_resets(&replacement_resets);
+        let replacement = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(replacement.source, source);
+        assert_eq!(replacement.recovered_keyframe, Some((2, 8_000_000)));
+        did_return.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!presenter.complete_bridge_delivery(replacement.delivery_id, true));
+        sender.join().unwrap();
         client.close().unwrap();
     }
 
