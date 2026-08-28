@@ -949,6 +949,20 @@ impl OuterBridge {
     /// video socket while still supplying enough reordered video and linked audio to become
     /// output-ready. A pre-roll round completes only after the outer presenter returns its ingress
     /// capacity; after PLAY, the per-track writer bound is the source-scoped boundary.
+    ///
+    /// The window sizes that handshake and nothing more. Once the outer slot holds this track
+    /// there is no readiness check left for media to run ahead of, the writer has already stopped
+    /// pacing one record at a time, and the outer channel's own byte and record flow is the bound
+    /// that belongs there. Keeping the cumulative wall past activation is what strands a seek
+    /// taken while paused: bringing a replacement generation up to the target its producer
+    /// published takes a whole key-frame interval of decoder references, nothing raises
+    /// `preplay_limit` for an activated track, and the pane holds the wrong picture until the
+    /// producer resumes.
+    ///
+    /// This does not admit the tail of a stream that merely stopped. Whether a paused producer's
+    /// records may move at all is its own question, answered by the caller that owns the
+    /// producer's playback state, because the answer there is to leave them queued rather than to
+    /// drop them.
     pub fn can_accept_media(&self, key: BridgeSourceKey) -> bool {
         if self.pending.contains_key(&key) {
             return true;
@@ -959,14 +973,6 @@ impl OuterBridge {
         if track.eos || track.media_inflight >= OUTER_MEDIA_WRITER_QUEUE {
             return false;
         }
-        // The pre-roll window bounds the activation handshake only. Once the outer slot holds
-        // this track there is no readiness check left for media to run ahead of, and the writer
-        // has already stopped pacing one record at a time, so the outer channel's own byte and
-        // record flow is the correct bound. Keeping the cumulative wall past that point makes a
-        // paused source unable to accept anything ever again: nothing raises `preplay_limit` for
-        // an activated track, the record is never popped from the foreground queue, its delivery
-        // never completes, and the nested producer blocks in a credit wait that cannot return -
-        // including on the one resume submission `try_start_surface` waits for before PLAY.
         track.mode == TrackMode::Live
             || track.playing
             || track.activated
@@ -3251,14 +3257,14 @@ mod tests {
         );
     }
 
-    /// The bounded pre-roll window exists for the activation handshake. Holding it as a permanent
-    /// cumulative wall after the slot is activated deadlocks a paused seek: nothing raises
-    /// `preplay_limit` for an activated track, so the record is never popped from the foreground
-    /// queue, its delivery never completes, and the nested producer blocks in a credit wait that
-    /// can never return - including on the one resume submission PLAY itself waits for.
+    /// The bounded pre-roll window sizes an activation handshake, and nothing raises it once the
+    /// slot is activated. A seek taken while paused needs a whole key-frame interval of decoder
+    /// references to reach the target its producer published, so the window becomes a wall that
+    /// replacement generation can never get past and the pane holds the wrong picture until the
+    /// producer resumes.
     #[test]
     #[cfg(unix)]
-    fn an_activated_paused_source_keeps_accepting_bounded_pre_roll() {
+    fn an_activated_paused_source_keeps_accepting_pre_roll() {
         let Some(mut fixture) = PausedSurfaceFixture::start("paused-preroll.sock") else {
             return;
         };
@@ -3283,7 +3289,7 @@ mod tests {
         track.preplay_ceiling = track.media_submitted;
         assert!(
             fixture.bridge.can_accept_media(key),
-            "an exhausted pre-roll window wedged an activated paused source"
+            "an exhausted pre-roll window walled off an activated paused source"
         );
 
         let track = fixture.bridge.tracks.get_mut(&key).unwrap();
