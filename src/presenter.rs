@@ -5667,7 +5667,10 @@ mod tests {
 
     fn producer(endpoint: String, secret: &str) -> ProducerConfig {
         ProducerConfig {
-            endpoint_control: Some(endpoint),
+            endpoint_control: Some(endpoint.clone()),
+            endpoint_interactive: Some(endpoint.clone()),
+            endpoint_realtime: Some(endpoint.clone()),
+            endpoint_bulk: Some(endpoint),
             authentication: ProducerAuthentication::root_hex(secret).unwrap(),
             producer_name: "vvmux-inner-test".into(),
             producer_version: "1.5".into(),

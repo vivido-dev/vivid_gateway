@@ -1972,6 +1972,13 @@ fn producer_config(
             ));
         }
     };
+    // These endpoints have already been resolved by the gateway's caller. Pin every native lane
+    // so an ambient producer-discovery environment cannot redirect one part of this independently
+    // authenticated outer session to another presenter. The protocol fallbacks are interactive to
+    // control, bulk to control, and realtime to bulk.
+    let endpoint_bulk = endpoint_bulk.or_else(|| endpoint_control.clone());
+    let endpoint_realtime = endpoint_realtime.or_else(|| endpoint_bulk.clone());
+    config.endpoint_interactive = endpoint_control.clone();
     config.endpoint_control = endpoint_control;
     config.endpoint_realtime = endpoint_realtime;
     config.endpoint_bulk = endpoint_bulk;
@@ -2545,6 +2552,27 @@ fn source_is_effectively_playing(
 mod tests {
     use super::*;
     use crate::types::BridgePlayRequest;
+
+    #[test]
+    fn native_outer_config_pins_lane_fallbacks_to_its_control_presenter() {
+        let endpoint = "tcp:127.0.0.1:12345".to_owned();
+        let config = producer_config(
+            Some(endpoint.clone()),
+            None,
+            None,
+            &Secret32::new([7; 32]),
+            registry::TERMINAL_SURFACE,
+        )
+        .unwrap();
+
+        assert_eq!(config.endpoint_control.as_deref(), Some(endpoint.as_str()));
+        assert_eq!(
+            config.endpoint_interactive.as_deref(),
+            Some(endpoint.as_str())
+        );
+        assert_eq!(config.endpoint_realtime.as_deref(), Some(endpoint.as_str()));
+        assert_eq!(config.endpoint_bulk.as_deref(), Some(endpoint.as_str()));
+    }
 
     #[cfg(unix)]
     struct TestSocketListener {

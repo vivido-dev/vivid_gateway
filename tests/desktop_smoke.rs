@@ -81,9 +81,16 @@ fn desktop_target(width: u32, height: u32) -> DesktopTarget {
     }
 }
 
+fn pin_endpoints(producer: &mut ProducerConfig, endpoint: String) {
+    producer.endpoint_control = Some(endpoint.clone());
+    producer.endpoint_interactive = Some(endpoint.clone());
+    producer.endpoint_realtime = Some(endpoint.clone());
+    producer.endpoint_bulk = Some(endpoint);
+}
+
 fn connect_test_presenter(presenter: &TestPresenter, name: &str) -> io::Result<Session> {
     let mut producer = ProducerConfig::desktop();
-    producer.endpoint_control = Some(presenter.endpoint().into());
+    pin_endpoints(&mut producer, presenter.endpoint().into());
     producer.authentication = ProducerAuthentication::Root {
         root_secret: Secret32::from_hex(ROOT_SECRET_HEX).map_err(io::Error::other)?,
     };
@@ -227,7 +234,7 @@ fn identical_desktop_script_is_record_neutral_across_the_terminating_gateway() -
     let principal = 71;
     let root = inner.issue_pane_capability(principal)?;
     let mut producer = ProducerConfig::desktop();
-    producer.endpoint_control = Some(inner.endpoint());
+    pin_endpoints(&mut producer, inner.endpoint());
     producer.authentication = ProducerAuthentication::Root {
         root_secret: Secret32::from_hex(&root).map_err(io::Error::other)?,
     };
@@ -308,7 +315,7 @@ fn desktop_surface_crosses_both_terminating_hops() -> io::Result<()> {
     let root = inner.issue_pane_capability(principal)?;
 
     let mut producer = ProducerConfig::desktop();
-    producer.endpoint_control = Some(inner.endpoint());
+    pin_endpoints(&mut producer, inner.endpoint());
     producer.authentication = ProducerAuthentication::Root {
         root_secret: Secret32::from_hex(&root).map_err(io::Error::other)?,
     };
@@ -446,7 +453,7 @@ fn identical_inner_local_ids_map_to_distinct_outer_objects() -> io::Result<()> {
     for principal in [7_u64, 8] {
         let root = inner.issue_pane_capability(principal)?;
         let mut producer = ProducerConfig::desktop();
-        producer.endpoint_control = Some(inner.endpoint());
+        pin_endpoints(&mut producer, inner.endpoint());
         producer.authentication = ProducerAuthentication::Root {
             root_secret: Secret32::from_hex(&root).map_err(io::Error::other)?,
         };
