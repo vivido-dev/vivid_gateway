@@ -23,7 +23,7 @@ use vivid_sdk::{
 };
 use zeroize::Zeroizing;
 
-use crate::types::{
+use crate::presenter::{
     BridgeKeyframeRequest, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceKey,
     BridgeSourceKind, BridgeSurface, BridgeSurfaceKey, DisplayMetrics,
 };
@@ -34,9 +34,9 @@ const SLOT_VIDEO: u64 = 1;
 const SLOT_AUDIO: u64 = 2;
 const SLOT_RASTER: u64 = 3;
 const SLOT_POSTER: u64 = 4;
-pub const KEYFRAME_REASON_INITIAL: u64 = 1;
-pub const KEYFRAME_REASON_DECODER_ERROR: u64 = 2;
-pub const KEYFRAME_REASON_TRANSPORT_LOSS: u64 = 5;
+pub use vivid_sdk::presenter::{
+    KEYFRAME_REASON_DECODER_ERROR, KEYFRAME_REASON_INITIAL, KEYFRAME_REASON_TRANSPORT_LOSS,
+};
 /// How long a scene commit keeps following a moving outer target before it asks for a fresh
 /// projection instead.
 const TARGET_FOLLOW_TIMEOUT: Duration = Duration::from_millis(500);
@@ -2500,8 +2500,8 @@ fn signed(value: i64) -> Value {
 }
 
 #[cfg(test)]
-fn default_play_request() -> crate::types::BridgePlayRequest {
-    crate::types::BridgePlayRequest {
+fn default_play_request() -> crate::presenter::BridgePlayRequest {
+    crate::presenter::BridgePlayRequest {
         start_pts_us: 0,
         minimum_buffer_us: 1,
         maximum_latency_us: 1_000_000,
@@ -2551,7 +2551,7 @@ fn source_is_effectively_playing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::BridgePlayRequest;
+    use crate::presenter::BridgePlayRequest;
 
     #[test]
     fn native_outer_config_pins_lane_fallbacks_to_its_control_presenter() {
@@ -2639,7 +2639,7 @@ mod tests {
             logical_width: 16,
             logical_height: 16,
             capture_policy: 0,
-            descriptor: crate::types::BridgeSourceDescriptor {
+            descriptor: crate::presenter::BridgeSourceDescriptor {
                 role: 1,
                 title: format!("owner {producer}"),
                 content_revision: 1,
@@ -2699,7 +2699,7 @@ mod tests {
             height: 16,
             z_index: 0,
             visible: true,
-            clip: crate::types::BridgeClipRect {
+            clip: crate::presenter::BridgeClipRect {
                 x: 0,
                 y: 0,
                 width: 16,
@@ -2875,9 +2875,11 @@ mod tests {
             }
             Err(error) => panic!("pause/resume listener failed: {error}"),
         };
-        let presenter =
-            crate::presenter::VirtualVivid::start(listener, crate::types::MediaConfig::default())
-                .unwrap();
+        let presenter = crate::presenter::VirtualVivid::start(
+            listener,
+            crate::presenter::MediaConfig::default(),
+        )
+        .unwrap();
         presenter.update_metrics(7, 80, 24, (8, 16));
         let secret = presenter.issue_pane_capability(7).unwrap();
         let mut bridge = OuterBridge::connect(
@@ -2902,7 +2904,7 @@ mod tests {
             logical_width: 16,
             logical_height: 16,
             capture_policy: 0,
-            descriptor: crate::types::BridgeSourceDescriptor {
+            descriptor: crate::presenter::BridgeSourceDescriptor {
                 role: 1,
                 title: "pause resume".into(),
                 content_revision: 1,
@@ -3097,7 +3099,7 @@ mod tests {
             };
             let presenter = crate::presenter::VirtualVivid::start(
                 listener,
-                crate::types::MediaConfig::default(),
+                crate::presenter::MediaConfig::default(),
             )
             .unwrap();
             presenter.update_metrics(7, 80, 24, (8, 16));
@@ -3123,7 +3125,7 @@ mod tests {
                 logical_width: 16,
                 logical_height: 16,
                 capture_policy: 0,
-                descriptor: crate::types::BridgeSourceDescriptor {
+                descriptor: crate::presenter::BridgeSourceDescriptor {
                     role: 1,
                     title: "paused seek".into(),
                     content_revision: 1,
@@ -3403,9 +3405,11 @@ mod tests {
             }
             Err(error) => panic!("live browser listener failed: {error}"),
         };
-        let presenter =
-            crate::presenter::VirtualVivid::start(listener, crate::types::MediaConfig::default())
-                .unwrap();
+        let presenter = crate::presenter::VirtualVivid::start(
+            listener,
+            crate::presenter::MediaConfig::default(),
+        )
+        .unwrap();
         presenter.update_metrics(7, 80, 24, (8, 16));
         let secret = presenter.issue_pane_capability(7).unwrap();
         let mut bridge = OuterBridge::connect(
@@ -3434,7 +3438,7 @@ mod tests {
             logical_width: 2,
             logical_height: 1,
             capture_policy: 0,
-            descriptor: crate::types::BridgeSourceDescriptor {
+            descriptor: crate::presenter::BridgeSourceDescriptor {
                 role: 1,
                 title: "live browser".into(),
                 content_revision: 1,
@@ -3499,7 +3503,7 @@ mod tests {
             height: 1_i64 << 32,
             z_index: 0,
             visible: true,
-            clip: crate::types::BridgeClipRect {
+            clip: crate::presenter::BridgeClipRect {
                 x: 0,
                 y: 0,
                 width: 2_i64 << 32,
@@ -3628,9 +3632,11 @@ mod tests {
             }
             Err(error) => panic!("pre-roll listener failed: {error}"),
         };
-        let presenter =
-            crate::presenter::VirtualVivid::start(listener, crate::types::MediaConfig::default())
-                .unwrap();
+        let presenter = crate::presenter::VirtualVivid::start(
+            listener,
+            crate::presenter::MediaConfig::default(),
+        )
+        .unwrap();
         presenter.update_metrics(7, 80, 24, (8, 16));
         let secret = presenter.issue_pane_capability(7).unwrap();
         let mut bridge = OuterBridge::connect(
@@ -3655,7 +3661,7 @@ mod tests {
             logical_width: 16,
             logical_height: 16,
             capture_policy: 0,
-            descriptor: crate::types::BridgeSourceDescriptor {
+            descriptor: crate::presenter::BridgeSourceDescriptor {
                 role: 1,
                 title: "seek pre-roll".into(),
                 content_revision: 1,
@@ -3706,7 +3712,7 @@ mod tests {
             height: 16_i64 << 32,
             z_index: 0,
             visible: true,
-            clip: crate::types::BridgeClipRect {
+            clip: crate::presenter::BridgeClipRect {
                 x: 0,
                 y: 0,
                 width: 16_i64 << 32,

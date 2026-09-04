@@ -1,17 +1,18 @@
 [package]
 name = "vivid_gateway"
-version = "1.5.6"
+version = "1.5.7"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/vivido-dev/vivid_gateway"
-description = "Reusable terminating Vivid 1.5 presenter and re-origination gateway"
+description = "Vivid 1.5 re-origination gateway over the vivid_sdk presenter"
 
 [features]
 # Test-support API for gateway consumers (vvmux) that drive the presenter from their own test
 # suites. Off by default: it is only compiled into crates that ask for it, and it never affects a
-# production build of the gateway.
-testing = []
+# production build of the gateway. The presenter half of that API now lives in `vivid_sdk`, so this
+# forwards rather than gating anything locally.
+testing = ["vivid_sdk/testing"]
 
 [dependencies]
 getrandom = "0.4"
@@ -19,7 +20,7 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
 vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
-vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["presenter"] }
 zeroize = "1.9"
 
 [dev-dependencies]
