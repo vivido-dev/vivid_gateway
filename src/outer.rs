@@ -168,6 +168,7 @@ struct MediaCompletion {
 /// Every object allocated here belongs exclusively to the outer session. Inner IDs are lookup
 /// keys only and never become outer Vivid IDs, revisions, generations, epochs, or media IDs.
 pub struct OuterBridge {
+    microphones: crate::microphone::Microphones,
     session: vivid_sdk::Session,
     authentication: Secret32,
     connection_factory: Option<Arc<dyn ConnectionFactory>>,
@@ -201,6 +202,14 @@ pub struct OuterBridge {
 }
 
 impl OuterBridge {
+    pub fn sync_microphones(&mut self, requests: &[crate::MicrophoneRequest]) -> io::Result<()> {
+        self.microphones.sync(&mut self.session, requests)
+    }
+
+    pub fn take_microphone_packets(&mut self) -> io::Result<Vec<(BridgeSourceKey, u64, Vec<u8>)>> {
+        self.microphones.take()
+    }
+
     #[allow(dead_code)]
     pub fn connect(
         endpoint: String,
@@ -321,6 +330,7 @@ impl OuterBridge {
         let (writer_completions_tx, writer_completions_rx) = mpsc::channel();
         Ok(Self {
             session,
+            microphones: crate::microphone::Microphones::default(),
             authentication,
             connection_factory,
             endpoint_control,
@@ -521,6 +531,8 @@ impl OuterBridge {
             None => vivid_sdk::Session::connect(config)?,
         };
         let replaced = std::mem::replace(&mut self.session, session);
+        let microphone_requests = self.microphones.requests();
+        self.microphones = crate::microphone::Microphones::default();
         self.display = display_from_target(&self.session, self.display)?;
         self.surfaces.clear();
         for track in self.tracks.values() {
@@ -537,6 +549,7 @@ impl OuterBridge {
         // later replacement is refused, which no amount of retrying can recover from.
         let _ = replaced.close();
         self.diagnostic_generation = self.diagnostic_generation.saturating_add(1);
+        self.sync_microphones(&microphone_requests)?;
         self.rebuild(surfaces, sources, nodes)
     }
 
@@ -1961,7 +1974,7 @@ fn producer_config(
                 vivid_sdk::TIMED_MEDIA.into(),
                 vivid_sdk::CORE_CONTROL.into(),
             ],
-            optional_profiles: vec![],
+            optional_profiles: vec![registry::AUDIO_INPUT.into()],
             ..ProducerConfig::default()
         },
         registry::DESKTOP_SURFACE => ProducerConfig::desktop(),
@@ -2256,6 +2269,7 @@ fn track_configuration(
             }
         };
     Ok(TrackConfiguration {
+        direction: Default::default(),
         context_id: surface.context_id(),
         surface_id: surface.id(),
         track_id: session.allocate_id()?,
@@ -3819,6 +3833,7 @@ mod tests {
         let track = session
             .create_track(
                 TrackConfiguration {
+                    direction: Default::default(),
                     context_id,
                     surface_id: surface.id(),
                     track_id: 2,

@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod microphone;
 pub mod outer;
 
 /// The terminating presenter, which now lives in `vivid_sdk`.

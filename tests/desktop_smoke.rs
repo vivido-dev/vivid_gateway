@@ -88,6 +88,194 @@ fn pin_endpoints(producer: &mut ProducerConfig, endpoint: String) {
     producer.endpoint_bulk = Some(endpoint);
 }
 
+#[test]
+fn microphone_crosses_two_authenticated_sessions_without_crossing_owners() -> io::Result<()> {
+    use std::time::{Duration, Instant};
+    use vivid_protocol::audio_input::{self, InputPacket, PCM_BYTES};
+    let inner = VirtualVivid::start(TcpPresenterListener::bind()?, MediaConfig::default())?;
+    let outer = VirtualVivid::start(TcpPresenterListener::bind()?, MediaConfig::default())?;
+    let mut owners = Vec::new();
+    for pane in [7, 8] {
+        inner.update_metrics(pane, 80, 24, (8, 16));
+        let secret = inner.issue_pane_capability(pane)?;
+        let mut config = ProducerConfig::default();
+        pin_endpoints(&mut config, inner.endpoint());
+        config.authentication = ProducerAuthentication::Root {
+            root_secret: Secret32::from_hex(&secret).map_err(io::Error::other)?,
+        };
+        config
+            .optional_profiles
+            .push(vivid_protocol::registry::AUDIO_INPUT.into());
+        config.optional_profiles.sort();
+        let mut session = Session::connect(config)?;
+        let context = session.info().root_context_id;
+        session.create_surface(
+            SurfaceDefinition {
+                context_id: context,
+                surface_id: 9,
+                semantic_profile: "generic-content-v1".into(),
+                coordinate_model: CoordinateModel::CanvasLogicalUnits,
+                logical_width: 1,
+                logical_height: 1,
+                scale_numerator: 1,
+                scale_denominator: 1,
+                rotation: 0,
+                descriptor: SurfaceDescriptor {
+                    role: SurfaceRole::ApplicationCanvas,
+                    title: format!("microphone {pane}"),
+                    semantic_content_revision: 0,
+                    semantic_availability: 0,
+                    locator_hint: String::new(),
+                },
+                policy: 0,
+                profile_parameters: Vec::new(),
+            },
+            &RequestMetadata::default(),
+        )?;
+        let track = session.create_track(
+            audio_input::configuration(context, 9, 11),
+            &RequestMetadata::default(),
+        )?;
+        let channel = session.open_track_channel(&track)?;
+        channel.grant_audio_input()?;
+        owners.push((session, track, channel));
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while inner.microphone_requests().len() != 2 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let requests = inner.microphone_requests();
+    assert_eq!(requests[0].source.track, requests[1].source.track);
+    assert_ne!(requests[0].source.producer, requests[1].source.producer);
+    outer.update_metrics(1, 80, 24, (8, 16));
+    let secret = outer.issue_pane_capability(1)?;
+    let mut bridge = OuterBridge::connect_native(
+        outer.endpoint(),
+        Some(outer.endpoint()),
+        Some(outer.endpoint()),
+        Zeroizing::new(secret),
+        DisplayMetrics::default(),
+    )?;
+    bridge.sync_microphones(&requests)?;
+    while outer.microphone_requests().len() != 2 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let routes = outer.microphone_requests();
+    assert!(routes.iter().all(|route| route.source.track != 11));
+    let mut received = [false; 2];
+    let mut tick = 0;
+    while !received.iter().all(|value| *value) {
+        assert!(
+            Instant::now() < deadline,
+            "uplink did not cross the gateway"
+        );
+        for route in &routes {
+            let packet = InputPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: tick * 20_000,
+                pcm: [17; PCM_BYTES],
+            };
+            outer.queue_microphone(route.source, route.generation, &packet.encode()?)?;
+        }
+        for (source, generation, packet) in bridge.take_microphone_packets()? {
+            inner.queue_microphone(source, generation, &packet)?;
+        }
+        for (index, (_, _, channel)) in owners.iter().enumerate() {
+            if let Some(packet) = channel.take_audio_input()? {
+                assert_eq!(packet.pcm, [17; PCM_BYTES]);
+                received[index] = true;
+                channel.grant_audio_input()?;
+            }
+        }
+        tick += 1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let revoked = requests.iter().find(|request| request.pane == 7).unwrap();
+    inner.queue_microphone(revoked.source, revoked.generation, &[])?;
+    assert!(
+        !inner.queue_microphone(
+            revoked.source,
+            revoked.generation + 1,
+            &InputPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: tick * 20_000,
+                pcm: [0; PCM_BYTES]
+            }
+            .encode()?
+        )?
+    );
+    while owners[0].2.take_audio_input().is_ok() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        owners[1].2.take_audio_input().is_ok(),
+        "revoking one owner closed the other"
+    );
+    let outer_before = routes
+        .iter()
+        .find(|route| route.title.contains("microphone 7"))
+        .unwrap();
+    let (session, track, channel) = &mut owners[0];
+    session.advance_channel(track, 1, &RequestMetadata::default())?;
+    *channel = session.open_track_channel(track)?;
+    channel.grant_audio_input()?;
+    loop {
+        assert!(Instant::now() < deadline);
+        let requests = inner.microphone_requests();
+        if requests.iter().any(|request| {
+            request.source == revoked.source && request.generation > revoked.generation
+        }) {
+            bridge.sync_microphones(&requests)?;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let replacement = loop {
+        assert!(Instant::now() < deadline);
+        if let Some(route) = outer.microphone_requests().into_iter().find(|route| {
+            route.source == outer_before.source && route.generation > outer_before.generation
+        }) {
+            break route;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // A mute/re-enable cycle keeps recipient selection stable but retires old-generation input.
+    assert!(!outer.queue_microphone(outer_before.source, outer_before.generation, &[])?);
+    let mut fresh_tick = 0;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "replacement microphone did not resume"
+        );
+        let packet = InputPacket {
+            epoch: 1,
+            packet_id: 1,
+            pts_us: fresh_tick * 20_000,
+            pcm: [23; PCM_BYTES],
+        };
+        outer.queue_microphone(
+            replacement.source,
+            replacement.generation,
+            &packet.encode()?,
+        )?;
+        for (source, generation, packet) in bridge.take_microphone_packets()? {
+            inner.queue_microphone(source, generation, &packet)?;
+        }
+        if let Some(packet) = owners[0].2.take_audio_input()? {
+            assert_eq!(packet.pcm, [23; PCM_BYTES]);
+            break;
+        }
+        fresh_tick += 1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 fn connect_test_presenter(presenter: &TestPresenter, name: &str) -> io::Result<Session> {
     let mut producer = ProducerConfig::desktop();
     pin_endpoints(&mut producer, presenter.endpoint().into());
@@ -156,6 +344,7 @@ fn present_desktop_scene(session: &mut Session, title: &str) -> io::Result<()> {
         media::rgba8_raw_frame_body_len(1280, 720).map_err(io::Error::other)?;
     session.create_track(
         TrackConfiguration {
+            direction: Default::default(),
             context_id: context,
             surface_id: surface.id(),
             track_id: 1,
