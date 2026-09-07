@@ -170,11 +170,46 @@ struct MediaCompletion {
     eos: bool,
 }
 
+/// Cancellation shared across replacement sessions of one bridge route.
+#[derive(Clone)]
+pub struct BridgeCancel {
+    cancelled: Arc<AtomicBool>,
+    current: Arc<std::sync::Mutex<Arc<dyn Fn() + Send + Sync>>>,
+    factory: Option<Arc<dyn ConnectionFactory>>,
+}
+
+impl BridgeCancel {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(factory) = &self.factory {
+            factory.cancel();
+        }
+        let cancel = self
+            .current
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        cancel();
+    }
+    fn install(&self, session: &vivid_sdk::Session) -> io::Result<()> {
+        *self.current.lock().unwrap_or_else(|p| p.into_inner()) = session.cancel_handle();
+        if self.cancelled.load(Ordering::Acquire) {
+            self.cancel();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "bridge cancelled",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Vivid 1.5 producer side of the nested presenter.
 ///
 /// Every object allocated here belongs exclusively to the outer session. Inner IDs are lookup
 /// keys only and never become outer Vivid IDs, revisions, generations, epochs, or media IDs.
 pub struct OuterBridge {
+    cancellation: BridgeCancel,
     microphones: crate::microphone::Microphones,
     session: vivid_sdk::Session,
     authentication: Secret32,
@@ -213,6 +248,10 @@ pub struct OuterBridge {
 }
 
 impl OuterBridge {
+    pub fn cancel_handle(&self) -> BridgeCancel {
+        self.cancellation.clone()
+    }
+
     pub fn sync_microphones(&mut self, requests: &[crate::MicrophoneRequest]) -> io::Result<()> {
         self.microphones.sync(&mut self.session, requests)
     }
@@ -339,7 +378,13 @@ impl OuterBridge {
         let display = display_from_target(&session, fallback_display)?;
         let target_profile = session.info().target_profile.clone();
         let (writer_completions_tx, writer_completions_rx) = mpsc::channel();
+        let cancellation = BridgeCancel {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            current: Arc::new(std::sync::Mutex::new(session.cancel_handle())),
+            factory: connection_factory.clone(),
+        };
         Ok(Self {
+            cancellation,
             session,
             microphones: crate::microphone::Microphones::default(),
             authentication,
@@ -547,6 +592,12 @@ impl OuterBridge {
         nodes: &[BridgeNode],
     ) -> io::Result<HashSet<BridgeSourceKey>> {
         validate_snapshot(surfaces, sources, nodes)?;
+        if self.cancellation.cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "bridge cancelled",
+            ));
+        }
         let config = producer_config(
             self.endpoint_control.clone(),
             self.endpoint_realtime.clone(),
@@ -559,6 +610,7 @@ impl OuterBridge {
             None => vivid_sdk::Session::connect(config)?,
         };
         let display = display_from_target(&session, self.display)?;
+        self.cancellation.install(&session)?;
         let replaced = std::mem::replace(&mut self.session, session);
         // Drop cancels the retired SDK transport without waiting for GOODBYE.
         drop(replaced);
