@@ -563,6 +563,7 @@ dependencies = [
  "serde",
  "sha2",
  "vivid_protocol",
+ "zeroize",
 ]
 
 [[package]]

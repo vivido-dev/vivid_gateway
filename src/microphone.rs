@@ -17,6 +17,7 @@ struct Route {
 #[derive(Default)]
 pub(crate) struct Microphones {
     routes: HashMap<BridgeSourceKey, Route>,
+    unfinished: HashMap<BridgeSourceKey, Surface>,
 }
 
 impl Microphones {
@@ -46,6 +47,10 @@ impl Microphones {
         if requests.len() > 64 {
             return Err(io::Error::other("too many microphone routes"));
         }
+        for key in self.unfinished.keys().copied().collect::<Vec<_>>() {
+            session.destroy_surface(&self.unfinished[&key], &RequestMetadata::default())?;
+            self.unfinished.remove(&key);
+        }
         let retired: Vec<_> = self
             .routes
             .iter()
@@ -53,10 +58,11 @@ impl Microphones {
             .map(|(key, _)| *key)
             .collect();
         for key in retired {
-            if let Some(route) = self.routes.remove(&key) {
+            if let Some(route) = self.routes.get(&key) {
                 let _ = route.channel.close();
-                session.destroy_track(&route.track, &RequestMetadata::default())?;
+                // Surface destruction also destroys its microphone track atomically.
                 session.destroy_surface(&route.surface, &RequestMetadata::default())?;
+                self.routes.remove(&key);
             }
         }
         for request in requests {
@@ -67,7 +73,10 @@ impl Microphones {
                     let _ = route.channel.close();
                     session.advance_channel(&route.track, 1, &RequestMetadata::default())?;
                     let channel = session.open_track_channel(&route.track)?;
-                    channel.grant_audio_input()?;
+                    if let Err(error) = channel.grant_audio_input() {
+                        let _ = channel.close();
+                        return Err(error);
+                    }
                     route.channel = channel;
                     route.ended = false;
                 }
@@ -76,6 +85,7 @@ impl Microphones {
             }
             let context = session.info().root_context_id;
             let id = session.allocate_id()?;
+            let track_id = session.allocate_id()?;
             let title = format!("pane {}: {}", request.pane, request.title);
             let surface = session.create_surface(
                 SurfaceDefinition {
@@ -100,28 +110,41 @@ impl Microphones {
                 },
                 &RequestMetadata::default(),
             )?;
-            let id = session.allocate_id()?;
+            self.unfinished.insert(request.source, surface.clone());
             let track = match session.create_track(
-                audio_input::configuration(context, surface.id(), id),
+                audio_input::configuration(context, surface.id(), track_id),
                 &RequestMetadata::default(),
             ) {
                 Ok(track) => track,
                 Err(error) => {
-                    let _ = session.destroy_surface(&surface, &RequestMetadata::default());
+                    if session
+                        .destroy_surface(&surface, &RequestMetadata::default())
+                        .is_ok()
+                    {
+                        self.unfinished.remove(&request.source);
+                    }
                     return Err(error);
                 }
             };
             let channel = match session.open_track_channel(&track).and_then(|channel| {
-                channel.grant_audio_input()?;
+                if let Err(error) = channel.grant_audio_input() {
+                    let _ = channel.close();
+                    return Err(error);
+                }
                 Ok(channel)
             }) {
                 Ok(channel) => channel,
                 Err(error) => {
-                    let _ = session.destroy_track(&track, &RequestMetadata::default());
-                    let _ = session.destroy_surface(&surface, &RequestMetadata::default());
+                    if session
+                        .destroy_surface(&surface, &RequestMetadata::default())
+                        .is_ok()
+                    {
+                        self.unfinished.remove(&request.source);
+                    }
                     return Err(error);
                 }
             };
+            self.unfinished.remove(&request.source);
             self.routes.insert(
                 request.source,
                 Route {

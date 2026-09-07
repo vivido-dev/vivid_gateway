@@ -15,6 +15,24 @@ The inner target is configurable through `PresentationTarget`; terminal and desk
 included. Resource contracts, supported profiles, and additional capture restrictions are route
 policy.
 
+Media assembly validates source, record kind, declared size, offset, completion flag and delivery
+identity before reserving storage. Incomplete bodies share a 64 MiB budget, with at most 256
+assemblies; entries older than 30 seconds are discarded on the next chunk admission. A source
+replacement or removal also discards its incomplete body. Invalid chunks fail without consuming
+another source's assembly. Raster deltas must reference the last successfully forwarded inner
+frame; recovery remains pending until a new full frame is forwarded successfully.
+
+Both event-polling APIs preserve terminal errors and pending display changes. `poll_outer_session`
+reports whether that call advanced the target; `service_session_events` consumes the pending
+display change and continues reporting a terminal error until session replacement. Replacement
+cancels the abandoned root session without waiting for GOODBYE and retires its queued playback,
+loss and recovery notifications. Delivery completions retain their existing writer-identity checks.
+
+Failed remote object setup retains cleanup ownership until destruction succeeds. Failed scene,
+track and surface deletion likewise retains the identity needed to retry; replacing the entire
+session discards those retired handles. Microphone cleanup destroys its owning surface and track
+together, with failed setup retained for cleanup on the next synchronization.
+
 Run the standalone gates from this directory:
 
 ```text
