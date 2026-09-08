@@ -40,3 +40,19 @@ cargo fmt --all --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
+
+## Playback position feedback
+
+The outer bridge has one bounded background TRACK_STATUS observer with one outstanding query,
+round-robin across active timed tracks at up to 20 queries per second. Control reconciliation and
+media forwarding do not wait on that observer. Results are checked against the source owner,
+writer identity, channel generation, decoder-reset serial and current playback request before
+being forwarded as private `BridgePositionSnapshot` metadata. Session replacement and shutdown
+cancel outstanding observations and join the observer. Playback-ended observations share this
+worker. No protocol assignments or media wire formats change.
+
+EOS completion is reported by the background physical-status observer. The foreground bridge
+never synchronously drains a track after EOS; paused audio must leave seek/resume control live.
+
+Playback completion snapshots include the source decoder reset serial; consumers must pass it
+back to the virtual presenter so a late EOS report cannot end a replacement generation.

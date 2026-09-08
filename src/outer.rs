@@ -57,6 +57,58 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 /// ingress capacity has actually been returned by the presenter.
 const OUTER_TIMED_PREROLL_RECORDS: usize = 32;
 
+struct PositionJob {
+    key: BridgeSourceKey,
+    writer_id: u64,
+    track: Track,
+    decoder_reset_serial: u64,
+    playing: bool,
+    start_pts_us: i64,
+}
+struct PositionObserver {
+    input: Option<mpsc::SyncSender<PositionJob>>,
+    output: mpsc::Receiver<(PositionJob, io::Result<vivid_sdk::TrackStatus>)>,
+    worker: Option<thread::JoinHandle<()>>,
+    busy: bool,
+}
+impl PositionObserver {
+    fn new(session: &vivid_sdk::Session) -> io::Result<Option<Self>> {
+        let Some(query) = session.track_query_handle() else {
+            return Ok(None);
+        };
+        let (input, jobs) = mpsc::sync_channel::<PositionJob>(1);
+        let (results, output) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("vivid-position".into())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let status = query(&job.track);
+                    if results.send((job, status)).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Some(Self {
+            input: Some(input),
+            output,
+            worker: Some(worker),
+            busy: false,
+        }))
+    }
+}
+impl Drop for PositionObserver {
+    fn drop(&mut self) {
+        // The owning bridge cancels the session before dropping this observer.
+        self.input.take();
+        if self.busy {
+            let _ = self.output.recv();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// One scene mutation, named so a stale reply can be retried against the target that caused it.
 #[derive(Debug, Clone, Copy)]
 enum NodeCommit<'a> {
@@ -67,6 +119,7 @@ enum NodeCommit<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PlaybackSnapshot {
+    pub decoder_reset_serial: u64,
     pub state: u64,
     pub eos_state: u64,
 }
@@ -235,6 +288,13 @@ pub struct OuterBridge {
     full_frames: HashSet<BridgeSourceKey>,
     losses: HashSet<BridgeSourceKey>,
     playback: Vec<(BridgeSourceKey, PlaybackSnapshot)>,
+    positions: Vec<(
+        BridgeSourceKey,
+        vivid_sdk::presenter::BridgePositionSnapshot,
+    )>,
+    position_poll_at: Instant,
+    position_cursor: usize,
+    position_observer: Option<PositionObserver>,
     /// The last position this bridge published for each outer surface clock.
     ///
     /// Its presence is the evidence that the nested producer has positioned that surface at all,
@@ -383,6 +443,7 @@ impl OuterBridge {
             current: Arc::new(std::sync::Mutex::new(session.cancel_handle())),
             factory: connection_factory.clone(),
         };
+        let position_observer = PositionObserver::new(&session)?;
         Ok(Self {
             cancellation,
             session,
@@ -410,6 +471,10 @@ impl OuterBridge {
             full_frames: HashSet::new(),
             losses: HashSet::new(),
             playback: Vec::new(),
+            positions: Vec::new(),
+            position_poll_at: Instant::now(),
+            position_cursor: 0,
+            position_observer,
             surface_clock: HashMap::new(),
             outer_applied_revision: 0,
             diagnostic_generation: 1,
@@ -632,6 +697,8 @@ impl OuterBridge {
         self.full_frames.clear();
         self.keyframes.clear();
         self.playback.clear();
+        self.positions.clear();
+        self.position_observer = PositionObserver::new(&self.session)?;
         self.terminal_error = None;
         self.display_changed = true;
         self.diagnostic_generation = self.diagnostic_generation.saturating_add(1);
@@ -730,10 +797,8 @@ impl OuterBridge {
                     .map(|track| track.surface_key)
                     .ok_or_else(|| invalid_data("playback track is missing"))?;
                 if paused_surfaces.insert(surface) {
-                    // PAUSE updates the whole surface clock, but Vivido only stops the physical
-                    // audio output when the named object is the audio track. The source snapshot
-                    // comes from a hash map, so using the first falling edge made pause latency
-                    // depend on whether video or audio happened to be visited first.
+                    // Name the selected audio master consistently; PAUSE controls its entire
+                    // owner-scoped surface group at the physical presenter.
                     let clock = preferred_surface_clock(&previous_sources, surface, source.key);
                     let track = self
                         .tracks
@@ -840,6 +905,7 @@ impl OuterBridge {
         self.playback.push((
             key,
             PlaybackSnapshot {
+                decoder_reset_serial: self.tracks[&key].decoder_reset_serial,
                 state: 2,
                 eos_state: 0,
             },
@@ -909,9 +975,8 @@ impl OuterBridge {
         if !outer.iter().all(|track| track.activated) {
             return None;
         }
-        // Name the video track. Vivido applies PLAY to every active timed slot on the surface, so
-        // this positions linked audio too, while leaving the physical audio output - which follows
-        // only a PLAY naming the audio track - stopped, as a paused surface requires.
+        // Name video to preserve its requested seek target. PLAY positions every active timed
+        // slot, including physical audio; the immediately following PAUSE freezes the group.
         let clock = members
             .iter()
             .position(|source| matches!(source.kind, BridgeSourceKind::Video { .. }))
@@ -1232,7 +1297,6 @@ impl OuterBridge {
     pub fn take_media_completions(&mut self) -> Vec<(u64, bool, u64, u64)> {
         self.completions
             .extend(self.writer_completions_rx.try_iter());
-        let mut completed_eos = Vec::new();
         for completion in &mut self.completions {
             let current = self
                 .tracks
@@ -1250,20 +1314,14 @@ impl OuterBridge {
                 track.media_inflight = track.media_inflight.saturating_sub(1);
                 track.media_completed = track.media_completed.saturating_add(1);
             }
-            if completion.eos && completion.delivered {
-                completed_eos.push(completion.source);
-            }
             if completion.needs_full_frame {
                 self.full_frames.insert(completion.source);
             } else if !completion.delivered {
                 self.losses.insert(completion.source);
             }
         }
-        for key in completed_eos {
-            if let Some(track) = self.tracks.get(&key) {
-                let _ = self.session.drain(&track.track);
-            }
-        }
+        // EOS admission is not playback completion. The bounded position observer publishes
+        // completion later; synchronously draining here deadlocks the bridge when audio is paused.
         self.completions
             .drain(..)
             .filter(|value| !value.eos)
@@ -1362,6 +1420,15 @@ impl OuterBridge {
     pub fn take_playback_states(&mut self) -> Vec<(BridgeSourceKey, PlaybackSnapshot)> {
         self.poll_playback_progress();
         std::mem::take(&mut self.playback)
+    }
+
+    pub fn take_positions(
+        &mut self,
+    ) -> Vec<(
+        BridgeSourceKey,
+        vivid_sdk::presenter::BridgePositionSnapshot,
+    )> {
+        std::mem::take(&mut self.positions)
     }
 
     pub fn take_capability_changes(&mut self) -> Vec<CapabilityChange> {
@@ -1917,43 +1984,90 @@ impl OuterBridge {
     }
 
     fn poll_playback_progress(&mut self) {
-        let candidates = self
+        let Some(observer) = self.position_observer.as_mut() else {
+            return;
+        };
+        if let Ok((job, result)) = observer.output.try_recv() {
+            observer.busy = false;
+            if let Ok(status) = result
+                && let Some(track) = self.tracks.get_mut(&job.key)
+                && let Some(source) = self.active_sources.get(&job.key)
+                && track.writer_id == job.writer_id
+                && status.channel_generation == track.track.channel_generation()
+                && source.decoder_reset_serial == job.decoder_reset_serial
+                && source.playing == job.playing
+                && source.play_request.start_pts_us == job.start_pts_us
+            {
+                let field = |key| {
+                    status
+                        .playback_state
+                        .as_ref()
+                        .and_then(|map| map.iter().find(|(k, _)| *k == key).map(|(_, value)| value))
+                };
+                let position = vivid_sdk::presenter::BridgePositionSnapshot {
+                    decoder_reset_serial: job.decoder_reset_serial,
+                    playing: job.playing,
+                    start_pts_us: job.start_pts_us,
+                    state: field(3).and_then(Value::as_u64).unwrap_or(0),
+                    clock_pts_us: field(4).and_then(Value::as_i64),
+                    decoded_pts_us: status.last_decoded_pts_us,
+                    presented_pts_us: status.last_presented_pts_us,
+                    presentation_id: status.last_presentation_id,
+                };
+                // One latest observation per track, bounded by the session track reservation.
+                self.positions.retain(|(key, _)| *key != job.key);
+                self.positions.push((job.key, position));
+                let eos = if status.milestones & vivid_sdk::MILESTONE_BUFFERED_ENDED != 0 {
+                    2
+                } else if status.milestones & vivid_sdk::MILESTONE_EOS_ACCEPTED != 0 {
+                    1
+                } else {
+                    0
+                };
+                if eos > track.reported_eos_state {
+                    track.reported_eos_state = eos;
+                    self.playback.push((
+                        job.key,
+                        PlaybackSnapshot {
+                            decoder_reset_serial: job.decoder_reset_serial,
+                            state: if job.playing { 2 } else { 1 },
+                            eos_state: eos,
+                        },
+                    ));
+                }
+            }
+        }
+        if observer.busy || Instant::now() < self.position_poll_at {
+            return;
+        }
+        self.position_poll_at = Instant::now() + Duration::from_millis(50);
+        let mut keys: Vec<_> = self
             .tracks
             .iter()
-            .filter(|(_, track)| track.eos)
-            .map(|(key, track)| {
-                (
-                    *key,
-                    track.track.clone(),
-                    track.playing,
-                    track.reported_eos_state,
-                )
-            })
-            .collect::<Vec<_>>();
-        for (key, track, playing, previous_eos) in candidates {
-            let Ok(status) = self.session.query_track(&track) else {
-                continue;
-            };
-            let eos_state = if status.milestones & vivid_sdk::MILESTONE_BUFFERED_ENDED != 0 {
-                2
-            } else if status.milestones & vivid_sdk::MILESTONE_EOS_ACCEPTED != 0 {
-                1
-            } else {
-                0
-            };
-            if eos_state <= previous_eos {
-                continue;
-            }
-            if let Some(current) = self.tracks.get_mut(&key) {
-                current.reported_eos_state = eos_state;
-            }
-            self.playback.push((
+            .filter(|(_, t)| t.mode == TrackMode::Timed && t.activated)
+            .map(|(key, _)| *key)
+            .collect();
+        keys.sort_by_key(|key| (key.producer, key.context, key.surface, key.track));
+        if keys.is_empty() {
+            return;
+        }
+        self.position_cursor %= keys.len();
+        let key = keys[self.position_cursor];
+        self.position_cursor += 1;
+        let track = &self.tracks[&key];
+        if let Some(source) = self.active_sources.get(&key) {
+            let job = PositionJob {
                 key,
-                PlaybackSnapshot {
-                    state: if playing { 2 } else { 1 },
-                    eos_state,
-                },
-            ));
+                writer_id: track.writer_id,
+                track: track.track.clone(),
+                decoder_reset_serial: source.decoder_reset_serial,
+                playing: source.playing,
+                start_pts_us: source.play_request.start_pts_us,
+            };
+            observer.busy = observer
+                .input
+                .as_ref()
+                .is_some_and(|input| input.try_send(job).is_ok());
         }
     }
 }
@@ -2119,6 +2233,8 @@ fn run_outer_media_writer(
 
 impl Drop for OuterBridge {
     fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.position_observer.take();
         for track in self.tracks.values() {
             let _ = track.channel.close();
         }

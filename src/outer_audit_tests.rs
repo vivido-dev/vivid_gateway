@@ -345,6 +345,7 @@ fn replacement_cancels_old_session_and_retires_notifications() {
         bridge.playback.push((
             source.key,
             PlaybackSnapshot {
+                decoder_reset_serial: source.decoder_reset_serial,
                 state: 1,
                 eos_state: 1,
             },
