@@ -4,6 +4,7 @@ version = "1.5.7"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/vivido-dev/vivid_gateway"
 description = "Vivid 1.5 re-origination gateway over the vivid_sdk presenter"
 
