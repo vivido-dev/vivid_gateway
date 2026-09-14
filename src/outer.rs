@@ -2563,6 +2563,11 @@ fn track_configuration(
             KindConfiguration::Audio(_) => SLOT_AUDIO,
             KindConfiguration::Raster(_) => SLOT_RASTER,
             KindConfiguration::EncodedImage(_) => SLOT_POSTER,
+            KindConfiguration::VectorScene(_) => {
+                return Err(invalid_data(
+                    "gateway does not support vector overlay tracks",
+                ));
+            }
         },
         mode,
         lane,
