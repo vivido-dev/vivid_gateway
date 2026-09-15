@@ -389,3 +389,37 @@ fn polling_retains_resize_for_service_consumer() {
     assert_eq!(bridge.service_session_events().unwrap().unwrap().rows, 30);
     assert!(bridge.service_session_events().unwrap().is_none());
 }
+
+#[test]
+fn outer_sessions_never_negotiate_overlay_profiles() {
+    // A terminating gateway has no vector renderer and no pane input router. The overlay
+    // specification requires such a gateway to reject the profiles when they are required and to
+    // omit them when they are optional, so the outer session must never ask for one.
+    for target in [registry::TERMINAL_SURFACE, registry::DESKTOP_SURFACE] {
+        let config = producer_config(
+            Some("tcp:127.0.0.1:1".into()),
+            None,
+            None,
+            &Secret32::new([3; 32]),
+            target,
+        )
+        .expect("gateway outer configuration");
+        for profile in [
+            registry::VECTOR_SCENE,
+            registry::TERMINAL_OVERLAY,
+            registry::OVERLAY_INPUT,
+            registry::OVERLAY_TEXT,
+            registry::OVERLAY_TEXT_LAYOUT,
+            registry::OVERLAY_TYPOGRAPHY,
+        ] {
+            assert!(
+                !config.required_profiles.iter().any(|p| p == profile),
+                "{target} must not require {profile}"
+            );
+            assert!(
+                !config.optional_profiles.iter().any(|p| p == profile),
+                "{target} must not offer {profile}"
+            );
+        }
+    }
+}

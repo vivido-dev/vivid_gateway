@@ -2563,6 +2563,9 @@ fn track_configuration(
             KindConfiguration::Audio(_) => SLOT_AUDIO,
             KindConfiguration::Raster(_) => SLOT_RASTER,
             KindConfiguration::EncodedImage(_) => SLOT_POSTER,
+            // Unreachable while `BridgeSourceKind` has no vector variant: the outer session never
+            // negotiates the overlay profiles, so no inner producer can publish a vector track.
+            // Kept as a refusal rather than a panic in case a future source kind maps to slot 5.
             KindConfiguration::VectorScene(_) => {
                 return Err(invalid_data(
                     "gateway does not support vector overlay tracks",
