@@ -3182,7 +3182,7 @@ mod tests {
             }
             Err(error) => panic!("pause/resume listener failed: {error}"),
         };
-        let presenter = crate::presenter::VirtualVivid::start(
+        let presenter = crate::presenter::VirtualVivid::start_eventless(
             listener,
             crate::presenter::MediaConfig::default(),
         )
@@ -3404,7 +3404,7 @@ mod tests {
                 }
                 Err(error) => panic!("{name} listener failed: {error}"),
             };
-            let presenter = crate::presenter::VirtualVivid::start(
+            let presenter = crate::presenter::VirtualVivid::start_eventless(
                 listener,
                 crate::presenter::MediaConfig::default(),
             )
@@ -3712,7 +3712,7 @@ mod tests {
             }
             Err(error) => panic!("live browser listener failed: {error}"),
         };
-        let presenter = crate::presenter::VirtualVivid::start(
+        let presenter = crate::presenter::VirtualVivid::start_eventless(
             listener,
             crate::presenter::MediaConfig::default(),
         )
@@ -3939,7 +3939,7 @@ mod tests {
             }
             Err(error) => panic!("pre-roll listener failed: {error}"),
         };
-        let presenter = crate::presenter::VirtualVivid::start(
+        let presenter = crate::presenter::VirtualVivid::start_eventless(
             listener,
             crate::presenter::MediaConfig::default(),
         )
