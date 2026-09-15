@@ -415,6 +415,7 @@ fn outer_sessions_never_negotiate_overlay_profiles() {
             registry::OVERLAY_POINTER,
             registry::OVERLAY_CLIPBOARD,
             registry::OVERLAY_ENV,
+            registry::OVERLAY_A11Y,
         ] {
             assert!(
                 !config.required_profiles.iter().any(|p| p == profile),
