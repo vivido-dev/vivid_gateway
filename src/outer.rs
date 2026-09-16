@@ -1,8 +1,8 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,6 @@ use vivid_sdk::{
 };
 use zeroize::Zeroizing;
 
-#[cfg(test)]
 use crate::presenter::BridgeOverlayWindow;
 use crate::presenter::{
     BridgeKeyframeRequest, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceKey,
@@ -40,6 +39,14 @@ const SLOT_AUDIO: u64 = 2;
 const SLOT_RASTER: u64 = 3;
 const SLOT_POSTER: u64 = 4;
 const SLOT_VECTOR: u64 = 5;
+type OverlayJob = Box<dyn FnOnce() -> io::Result<Vec<u8>> + Send>;
+type OverlayRevisions = Arc<Mutex<HashMap<BridgeSurfaceKey, VecDeque<(u64, u64)>>>>;
+#[derive(Default)]
+struct OverlayLayouts {
+    live: HashSet<BridgeSurfaceKey>,
+    ids: HashMap<(BridgeSurfaceKey, u64), u64>,
+    published: HashSet<(BridgeSurfaceKey, u64)>,
+}
 pub use vivid_sdk::presenter::{
     KEYFRAME_REASON_DECODER_ERROR, KEYFRAME_REASON_INITIAL, KEYFRAME_REASON_TRANSPORT_LOSS,
 };
@@ -65,9 +72,12 @@ const OUTER_TIMED_PREROLL_RECORDS: usize = 32;
 
 /// Revision bookkeeping for one surface's relayed overlay window.
 struct OverlayWindowState {
+    offset_x: i64,
+    offset_y: i64,
+    inner_generation: u64,
     /// The inner window's own revision last successfully relayed, so an unchanged snapshot does
     /// not re-send the same geometry every reconciliation pass.
-    inner_revision: u64,
+    projected: BridgeOverlayWindow,
     /// The outer window's own revision, returned by the last accepted `SET_OVERLAY_WINDOW`, and
     /// required as the next update's `expected_revision`.
     outer_revision: u64,
@@ -183,6 +193,8 @@ struct OuterTrack {
 }
 
 struct OuterMediaWriter {
+    overlay_revisions: OverlayRevisions,
+    overlay_layouts: Arc<Mutex<OverlayLayouts>>,
     writer_id: u64,
     key: BridgeSourceKey,
     object_id: u64,
@@ -278,6 +290,13 @@ impl BridgeCancel {
 /// Every object allocated here belongs exclusively to the outer session. Inner IDs are lookup
 /// keys only and never become outer Vivid IDs, revisions, generations, epochs, or media IDs.
 pub struct OuterBridge {
+    overlay_jobs: Vec<(u64, thread::JoinHandle<io::Result<Vec<u8>>>)>,
+    overlay_results: Vec<(u64, io::Result<Vec<u8>>)>,
+    overlay_input: Option<Arc<vivid_sdk::OverlayInputLane>>,
+    overlay_environment: Option<Vec<u8>>,
+    overlay_renewed: Instant,
+    overlay_revisions: OverlayRevisions,
+    overlay_layouts: Arc<Mutex<OverlayLayouts>>,
     cancellation: BridgeCancel,
     microphones: crate::microphone::Microphones,
     session: vivid_sdk::Session,
@@ -326,6 +345,334 @@ pub struct OuterBridge {
 }
 
 impl OuterBridge {
+    /// Drain native overlay input, preserving physical keys, text/IME and pointer precision.
+    pub fn take_overlay_input(&mut self) -> io::Result<Vec<(BridgeSurfaceKey, Vec<u8>)>> {
+        let Some(input) = &self.overlay_input else {
+            return Ok(Vec::new());
+        };
+        if self.overlay_renewed.elapsed() >= Duration::from_millis(500) {
+            input.renew(2_000_000, Duration::from_secs(1))?;
+            self.overlay_renewed = Instant::now();
+        }
+        let mut events = Vec::new();
+        for _ in 0..64 {
+            let Some(event) = input.wait_event(Duration::ZERO)? else {
+                break;
+            };
+            let mut event = match event {
+                vivid_sdk::OverlayLaneEvent::Input(event) => event,
+                vivid_sdk::OverlayLaneEvent::Environment(environment) => {
+                    self.overlay_environment =
+                        Some(messages::Envelope::new(0, environment.payload()?).encode()?);
+                    continue;
+                }
+                vivid_sdk::OverlayLaneEvent::Accessibility {
+                    address,
+                    scene_revision,
+                    node,
+                    action,
+                } => vivid_protocol::overlay::wire::InputEvent {
+                    address,
+                    scene_revision,
+                    event: vivid_protocol::overlay::Event::Accessibility { node, action },
+                },
+                vivid_sdk::OverlayLaneEvent::ConnectionLost { .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "outer overlay input lane closed",
+                    ));
+                }
+                _ => continue,
+            };
+            let Some((key, _)) = self.surfaces.iter().find(|(_, surface)| {
+                surface.id() == event.address.surface_id
+                    && surface.context_id() == event.address.context_id
+                    && surface.generation().get() == event.address.generation
+            }) else {
+                continue;
+            };
+            let Some(window) = self.overlay_windows.get(key) else {
+                continue;
+            };
+            let revisions = self
+                .overlay_revisions
+                .lock()
+                .map_err(|_| io::Error::other("overlay revisions poisoned"))?;
+            let revision = if event.scene_revision == 0 {
+                0
+            } else {
+                let Some(revision) = revisions
+                    .get(key)
+                    .and_then(|revisions| {
+                        revisions
+                            .iter()
+                            .find(|(outer, _)| *outer == event.scene_revision)
+                    })
+                    .map(|(_, inner)| *inner)
+                else {
+                    continue;
+                };
+                revision
+            };
+            event.address = WindowAddress {
+                context_id: key.context,
+                surface_id: key.surface,
+                generation: window.inner_generation,
+            };
+            event.scene_revision = revision;
+            if let vivid_protocol::overlay::Event::Geometry { bounds, .. } = &mut event.event {
+                *bounds = Rect::new(
+                    bounds.origin.x.get() - window.offset_x as f64,
+                    bounds.origin.y.get() - window.offset_y as f64,
+                    bounds.width.get(),
+                    bounds.height.get(),
+                )
+                .map_err(io::Error::other)?;
+            }
+            events.push((*key, messages::Envelope::new(0, event.payload()?).encode()?));
+        }
+        Ok(events)
+    }
+
+    pub fn take_overlay_environment(&mut self) -> Option<Vec<u8>> {
+        self.overlay_environment.take()
+    }
+
+    pub fn overlay_host_profiles(&self) -> Vec<String> {
+        self.session
+            .info()
+            .accepted_profiles
+            .iter()
+            .filter(|profile| profile.starts_with("overlay-"))
+            .cloned()
+            .collect()
+    }
+
+    /// Service one bounded text request in the outer window's namespace.
+    pub fn overlay_host_request(
+        &self,
+        request: &vivid_sdk::presenter::OverlayHostRequest,
+    ) -> io::Result<Vec<u8>> {
+        self.prepare_overlay_host_request(request.clone())?()
+    }
+
+    pub fn can_service_overlay_host_request(
+        &self,
+        request: &vivid_sdk::presenter::OverlayHostRequest,
+    ) -> bool {
+        self.overlay_jobs.len() < 16
+            && (request.record_type == messages::MEASURE_OVERLAY_TEXT_BATCH
+                || self
+                    .tracks
+                    .iter()
+                    .filter(|(key, _)| {
+                        key.producer == request.surface.producer
+                            && key.context == request.surface.context
+                            && key.surface == request.surface.surface
+                    })
+                    .all(|(_, track)| track.media_inflight == 0))
+    }
+
+    pub fn start_overlay_host_request(
+        &mut self,
+        request: vivid_sdk::presenter::OverlayHostRequest,
+    ) -> io::Result<()> {
+        if !self.can_service_overlay_host_request(&request) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "overlay host worker is busy",
+            ));
+        }
+        let id = request.id;
+        let job = self.prepare_overlay_host_request(request)?;
+        let worker = thread::Builder::new()
+            .name("vivid-overlay-host".into())
+            .spawn(job)?;
+        self.overlay_jobs.push((id, worker));
+        Ok(())
+    }
+
+    pub fn take_overlay_host_replies(&mut self) -> Vec<(u64, io::Result<Vec<u8>>)> {
+        let mut index = 0;
+        while index < self.overlay_jobs.len() {
+            if self.overlay_jobs[index].1.is_finished() {
+                let (id, worker) = self.overlay_jobs.swap_remove(index);
+                self.overlay_results.push((
+                    id,
+                    worker
+                        .join()
+                        .unwrap_or_else(|_| Err(io::Error::other("overlay host worker panicked"))),
+                ));
+            } else {
+                index += 1;
+            }
+        }
+        std::mem::take(&mut self.overlay_results)
+    }
+
+    fn retire_overlay_jobs(&mut self) {
+        for (id, worker) in self.overlay_jobs.drain(..) {
+            let _ = worker.join();
+            self.overlay_results.push((
+                id,
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "outer overlay session was replaced",
+                )),
+            ));
+        }
+    }
+
+    fn prepare_overlay_host_request(
+        &self,
+        request: vivid_sdk::presenter::OverlayHostRequest,
+    ) -> io::Result<OverlayJob> {
+        use vivid_protocol::overlay::wire::text::styled::{
+            BatchMeasured, MeasureBatch, ReleaseLayouts,
+        };
+        let outer = self
+            .surfaces
+            .get(&request.surface)
+            .ok_or_else(|| invalid_data("outer overlay surface is absent"))?;
+        let address = WindowAddress {
+            context_id: outer.context_id(),
+            surface_id: outer.id(),
+            generation: outer.generation().get(),
+        };
+        let host = self
+            .session
+            .overlay_host_handle()
+            .ok_or_else(|| invalid_data("outer overlay host is offline"))?;
+        let overlay_layouts = self.overlay_layouts.clone();
+        let overlay_revisions = self.overlay_revisions.clone();
+        let input = self.overlay_input.clone();
+        Ok(Box::new(move || {
+            let envelope = messages::decode_control(&request.body)?;
+            let value = Value::Map(envelope.payload);
+            let payload = match request.record_type {
+                messages::OVERLAY_INPUT_CAPTURE => {
+                    let mut query = vivid_protocol::overlay::wire::Capture::decode(
+                        request.surface.surface,
+                        &value,
+                    )?;
+                    query.address = address;
+                    query.scene_revision = overlay_revisions
+                        .lock()
+                        .map_err(|_| io::Error::other("overlay revisions poisoned"))?
+                        .get(&request.surface)
+                        .and_then(|values| {
+                            values
+                                .iter()
+                                .rev()
+                                .find(|(_, inner)| *inner == query.scene_revision)
+                        })
+                        .map(|(outer, _)| *outer)
+                        .ok_or_else(|| invalid_data("outer capture scene is unavailable"))?;
+                    input
+                        .as_ref()
+                        .ok_or_else(|| invalid_data("outer overlay input lane is absent"))?
+                        .capture(query, Duration::from_secs(1))?;
+                    Vec::new()
+                }
+                messages::MEASURE_OVERLAY_TEXT_BATCH => {
+                    let mut query = MeasureBatch::decode(request.surface.surface, &value)
+                        .map_err(io::Error::other)?;
+                    let inner = query.address;
+                    query.address = address;
+                    let fields = host(
+                        messages::MEASURE_OVERLAY_TEXT_BATCH,
+                        address.surface_id,
+                        query.payload()?,
+                    )?;
+                    let mut answer = BatchMeasured::decode(address, &Value::Map(fields))?;
+                    if query.retain {
+                        if request.layout_ids.len() != answer.layouts.len() {
+                            return Err(invalid_data("overlay layout identity count mismatch"));
+                        }
+                        let mut layouts = overlay_layouts
+                            .lock()
+                            .map_err(|_| io::Error::other("overlay layouts poisoned"))?;
+                        if !layouts.live.contains(&request.surface) {
+                            return Err(invalid_data(
+                                "overlay surface disappeared during measurement",
+                            ));
+                        }
+                        for ((outer_id, _), inner_id) in
+                            answer.layouts.iter_mut().zip(&request.layout_ids)
+                        {
+                            layouts.ids.insert((request.surface, *inner_id), *outer_id);
+                            *outer_id = *inner_id;
+                        }
+                    }
+                    answer.address = inner;
+                    answer.payload().map_err(io::Error::other)?
+                }
+                messages::RELEASE_OVERLAY_TEXT_LAYOUTS => {
+                    let mut query = ReleaseLayouts::decode(request.surface.surface, &value)
+                        .map_err(io::Error::other)?;
+                    query.address = address;
+                    {
+                        let layouts = overlay_layouts
+                            .lock()
+                            .map_err(|_| io::Error::other("overlay layouts poisoned"))?;
+                        for id in &mut query.ids {
+                            *id = *layouts
+                                .ids
+                                .get(&(request.surface, *id))
+                                .ok_or_else(|| invalid_data("missing outer layout"))?;
+                        }
+                    }
+                    // The inner snapshot retains released layouts while its displayed frame uses
+                    // them. Retire the physical layout when it leaves that authoritative snapshot.
+                    Vec::new()
+                }
+                messages::SET_OVERLAY_CLIPBOARD => {
+                    let mut query = vivid_protocol::overlay::wire::Clipboard::decode(
+                        request.surface.surface,
+                        &value,
+                    )?;
+                    query.address = address;
+                    host(request.record_type, address.surface_id, query.payload()?)?
+                }
+                messages::SET_OVERLAY_EDITOR | messages::SET_OVERLAY_SEMANTICS => {
+                    let map_revision = |inner| -> io::Result<u64> {
+                        overlay_revisions
+                            .lock()
+                            .map_err(|_| io::Error::other("overlay revisions poisoned"))?
+                            .get(&request.surface)
+                            .and_then(|values| {
+                                values.iter().rev().find(|(_, revision)| *revision == inner)
+                            })
+                            .map(|(outer, _)| *outer)
+                            .ok_or_else(|| invalid_data("outer scene revision is unavailable"))
+                    };
+                    let payload = if request.record_type == messages::SET_OVERLAY_EDITOR {
+                        let mut query =
+                            vivid_protocol::overlay::wire::text::EditorGeometry::decode(
+                                request.surface.surface,
+                                &value,
+                            )?;
+                        query.address = address;
+                        query.scene_revision = map_revision(query.scene_revision)?;
+                        query.payload()?
+                    } else {
+                        let mut query = vivid_protocol::overlay::wire::SetSemantics::decode(
+                            request.surface.surface,
+                            &value,
+                        )?;
+                        query.address = address;
+                        query.semantics.scene_revision =
+                            map_revision(query.semantics.scene_revision)?;
+                        query.payload()?
+                    };
+                    host(request.record_type, address.surface_id, payload)?
+                }
+                _ => return Err(invalid_data("unsupported overlay host request")),
+            };
+            Ok(messages::Envelope::new(envelope.request_id, payload).encode()?)
+        }))
+    }
+
     pub fn cancel_handle(&self) -> BridgeCancel {
         self.cancellation.clone()
     }
@@ -476,6 +823,13 @@ impl OuterBridge {
             display,
             surfaces: HashMap::new(),
             overlay_windows: HashMap::new(),
+            overlay_input: None,
+            overlay_jobs: Vec::new(),
+            overlay_results: Vec::new(),
+            overlay_environment: None,
+            overlay_renewed: Instant::now(),
+            overlay_layouts: Default::default(),
+            overlay_revisions: Default::default(),
             tracks: HashMap::new(),
             unfinished_tracks: HashMap::new(),
             surface_refresh: HashSet::new(),
@@ -698,10 +1052,22 @@ impl OuterBridge {
         let replaced = std::mem::replace(&mut self.session, session);
         // Drop cancels the retired SDK transport without waiting for GOODBYE.
         drop(replaced);
+        self.retire_overlay_jobs();
         let microphone_requests = self.microphones.requests();
         self.microphones = crate::microphone::Microphones::default();
         self.display = display;
         self.surfaces.clear();
+        self.overlay_input.take();
+        self.overlay_revisions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.overlay_windows.clear();
+        *self
+            .overlay_layouts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = OverlayLayouts::default();
+        self.overlay_environment = None;
         for track in self.tracks.values() {
             let _ = track.channel.close();
         }
@@ -1209,17 +1575,22 @@ impl OuterBridge {
                 .get(&key)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "outer track is missing"))?;
             let expected = match track.kind {
-                BridgeSourceKind::Raster { .. } => messages::RASTER_FRAME,
-                BridgeSourceKind::Image { .. } => messages::IMAGE_DATA,
-                BridgeSourceKind::Video { .. } => messages::VIDEO_PACKET,
-                BridgeSourceKind::Audio { .. } => messages::AUDIO_PACKET,
-                BridgeSourceKind::VectorScene { .. } => messages::VECTOR_FRAME,
+                BridgeSourceKind::Raster { .. } => record_type == messages::RASTER_FRAME,
+                BridgeSourceKind::Image { .. } => record_type == messages::IMAGE_DATA,
+                BridgeSourceKind::Video { .. } => record_type == messages::VIDEO_PACKET,
+                BridgeSourceKind::Audio { .. } => record_type == messages::AUDIO_PACKET,
+                BridgeSourceKind::VectorScene { .. } => matches!(
+                    record_type,
+                    messages::VECTOR_FRAME
+                        | messages::VECTOR_ASSET
+                        | messages::VECTOR_ASSET_RELEASE
+                ),
             };
             let end = (offset as usize)
                 .checked_add(bytes.len())
                 .ok_or_else(|| invalid_data("media chunk length overflow"))?;
             if track.eos
-                || record_type != expected
+                || !expected
                 || total == 0
                 || total > MAX_PENDING_BYTES
                 || total > track.track.configuration()?.maximum_record_body as usize
@@ -1497,6 +1868,8 @@ impl OuterBridge {
             let (media_sender, media_receiver) = mpsc::sync_channel(OUTER_MEDIA_WRITER_QUEUE);
             let slot_activated = Arc::new(AtomicBool::new(false));
             let writer = OuterMediaWriter {
+                overlay_revisions: self.overlay_revisions.clone(),
+                overlay_layouts: self.overlay_layouts.clone(),
                 writer_id,
                 key: source.key,
                 object_id: track.id(),
@@ -1609,7 +1982,22 @@ impl OuterBridge {
                     .create_surface(definition, &RequestMetadata::default())?;
                 self.surfaces.insert(surface.key, outer);
             }
+        }
+        let mut remaining = desired.iter().collect::<Vec<_>>();
+        let mut established = HashSet::new();
+        while !remaining.is_empty() {
+            let Some(index) = remaining.iter().position(|surface| {
+                surface
+                    .overlay_window
+                    .and_then(|window| window.parent)
+                    .is_none_or(|parent| established.contains(&parent))
+            }) else {
+                return Err(invalid_data("overlay parent is missing or cyclic"));
+            };
+            let surface = remaining.remove(index);
             self.sync_overlay_window(surface)?;
+            self.sync_overlay_layouts(surface)?;
+            established.insert(surface.key);
         }
         Ok(())
     }
@@ -1619,15 +2007,93 @@ impl OuterBridge {
     /// next update names the correct `expected_revision`; an outer presenter that never negotiated
     /// the overlay bundle simply returns an error here, which the caller surfaces like any other
     /// unsupported relayed configuration.
+    fn sync_overlay_layouts(&mut self, surface: &BridgeSurface) -> io::Result<()> {
+        if surface.overlay_window.is_none() {
+            return Ok(());
+        }
+        self.overlay_layouts
+            .lock()
+            .map_err(|_| io::Error::other("overlay layouts poisoned"))?
+            .live
+            .insert(surface.key);
+        for layout in &surface.overlay_layouts {
+            if self
+                .overlay_layouts
+                .lock()
+                .map_err(|_| io::Error::other("overlay layouts poisoned"))?
+                .ids
+                .contains_key(&(surface.key, layout.id))
+            {
+                continue;
+            }
+            self.overlay_host_request(&vivid_sdk::presenter::OverlayHostRequest {
+                id: 0,
+                surface: surface.key,
+                record_type: messages::MEASURE_OVERLAY_TEXT_BATCH,
+                body: layout.body.clone(),
+                layout_ids: vec![layout.id],
+            })?;
+        }
+        let desired: HashSet<_> = surface
+            .overlay_layouts
+            .iter()
+            .map(|layout| (surface.key, layout.id))
+            .collect();
+        let layouts = self
+            .overlay_layouts
+            .lock()
+            .map_err(|_| io::Error::other("overlay layouts poisoned"))?;
+        let removed: Vec<_> = layouts
+            .published
+            .iter()
+            .filter(|key| key.0 == surface.key && !desired.contains(key))
+            .copied()
+            .collect();
+        let ids = removed
+            .iter()
+            .filter_map(|key| layouts.ids.get(key).copied())
+            .collect::<Vec<_>>();
+        drop(layouts);
+        if !ids.is_empty() {
+            let outer = &self.surfaces[&surface.key];
+            self.session.release_overlay_layouts(
+                &vivid_protocol::overlay::wire::text::styled::ReleaseLayouts {
+                    address: WindowAddress {
+                        context_id: outer.context_id(),
+                        surface_id: outer.id(),
+                        generation: outer.generation().get(),
+                    },
+                    ids,
+                },
+            )?;
+        }
+        let mut layouts = self
+            .overlay_layouts
+            .lock()
+            .map_err(|_| io::Error::other("overlay layouts poisoned"))?;
+        for key in removed {
+            layouts.ids.remove(&key);
+            layouts.published.remove(&key);
+        }
+        layouts.published.extend(desired);
+        Ok(())
+    }
+
     fn sync_overlay_window(&mut self, surface: &BridgeSurface) -> io::Result<()> {
         let Some(window) = surface.overlay_window else {
             self.overlay_windows.remove(&surface.key);
             return Ok(());
         };
+        if self.overlay_input.is_none() {
+            let input = self.session.open_overlay_input_lane(1)?;
+            input.renew(2_000_000, Duration::from_secs(1))?;
+            self.overlay_input = Some(Arc::new(input));
+            self.overlay_renewed = Instant::now();
+        }
         if self
             .overlay_windows
             .get(&surface.key)
-            .is_some_and(|state| state.inner_revision == window.revision)
+            .is_some_and(|state| state.projected == window)
         {
             return Ok(());
         }
@@ -1635,10 +2101,20 @@ impl OuterBridge {
             .surfaces
             .get(&surface.key)
             .ok_or_else(|| invalid_data("outer surface was not created"))?;
-        let expected_revision = self
+        let mut expected_revision = self
             .overlay_windows
             .get(&surface.key)
             .map_or(0, |state| state.outer_revision);
+        if expected_revision != 0 {
+            expected_revision = self
+                .session
+                .query_overlay_window(vivid_protocol::overlay::wire::Query {
+                    context_id: outer.context_id(),
+                    surface_id: outer.id(),
+                })?
+                .window
+                .expected_revision;
+        }
         let request = SetWindow {
             address: WindowAddress {
                 context_id: outer.context_id(),
@@ -1656,16 +2132,42 @@ impl OuterBridge {
                 .map_err(io::Error::other)?,
                 mode: window_mode_from_wire(window.mode)?,
                 visible: window.visible,
-                parent: None,
-                min_width: Scalar::ONE,
-                min_height: Scalar::ONE,
+                parent: window
+                    .parent
+                    .map(|parent| {
+                        if parent.producer != surface.key.producer
+                            || parent.context != surface.key.context
+                        {
+                            return Err(invalid_data(
+                                "overlay parent belongs to another owner or context",
+                            ));
+                        }
+                        let parent = self
+                            .surfaces
+                            .get(&parent)
+                            .ok_or_else(|| invalid_data("overlay parent is absent"))?;
+                        vivid_protocol::identity::SessionIdentity {
+                            presenter: vivid_protocol::identity::PresenterInstanceId([0; 16]),
+                            session_id: self.session.info().session_id,
+                        }
+                        .context(parent.context_id())
+                        .and_then(|context| context.surface(parent.id()))
+                        .map_err(io::Error::other)
+                    })
+                    .transpose()?,
+                min_width: Scalar::new(window.min_width.max(1) as f64).map_err(io::Error::other)?,
+                min_height: Scalar::new(window.min_height.max(1) as f64)
+                    .map_err(io::Error::other)?,
             },
         };
         let accepted = self.session.set_overlay_window(&request)?;
         self.overlay_windows.insert(
             surface.key,
             OverlayWindowState {
-                inner_revision: window.revision,
+                offset_x: window.offset_x,
+                offset_y: window.offset_y,
+                inner_generation: window.generation,
+                projected: window,
                 outer_revision: accepted.expected_revision,
             },
         );
@@ -1686,6 +2188,19 @@ impl OuterBridge {
         for key in removed {
             self.surface_clock.remove(&key);
             self.overlay_windows.remove(&key);
+            self.overlay_revisions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+            {
+                let mut layouts = self
+                    .overlay_layouts
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                layouts.live.remove(&key);
+                layouts.ids.retain(|(surface, _), _| *surface != key);
+                layouts.published.retain(|(surface, _)| *surface != key);
+            }
             if let Some(surface) = self.surfaces.get(&key).cloned() {
                 self.session
                     .destroy_surface(&surface, &RequestMetadata::default())?;
@@ -2155,6 +2670,66 @@ impl OuterBridge {
 impl OuterMediaWriter {
     fn forward_media(&mut self, record_type: u16, body: &[u8]) -> io::Result<u64> {
         match record_type {
+            messages::VECTOR_ASSET => {
+                let asset = vivid_protocol::vector::ImageAsset::decode(body)
+                    .map_err(|error| invalid_data(error.0))?;
+                // Each outer track is dedicated to this complete inner source identity, so its
+                // freshly established asset namespace can use the validated ascending IDs.
+                self.channel.send_vector_asset(&asset)
+            }
+            messages::VECTOR_ASSET_RELEASE => {
+                let release = vivid_protocol::vector::AssetRelease::decode(body)
+                    .map_err(|error| invalid_data(error.0))?;
+                self.channel.release_vector_asset(release.id)
+            }
+            messages::VECTOR_FRAME => {
+                let mut frame = vivid_protocol::vector::Frame::decode(body)
+                    .map_err(|error| invalid_data(error.0))?;
+                let mut canvas = vivid_protocol::vector::Canvas::new();
+                let key = BridgeSurfaceKey {
+                    producer: self.key.producer,
+                    context: self.key.context,
+                    surface: self.key.surface,
+                };
+                {
+                    let layouts = self
+                        .overlay_layouts
+                        .lock()
+                        .map_err(|_| io::Error::other("overlay layouts poisoned"))?;
+                    for command in frame.canvas.commands() {
+                        let mut command = command.clone();
+                        if let vivid_protocol::vector::Command::TextLayout { layout, .. } =
+                            &mut command
+                        {
+                            *layout = *layouts
+                                .ids
+                                .get(&(key, *layout))
+                                .ok_or_else(|| invalid_data("missing outer text layout"))?;
+                        }
+                        canvas
+                            .push(command)
+                            .map_err(|error| invalid_data(error.0))?;
+                    }
+                }
+                frame.canvas = canvas;
+                let (epoch, revision) = next_outer_identity(self, frame.epoch)?;
+                frame.epoch = epoch;
+                frame.revision = revision;
+                let inner_revision = vivid_protocol::vector::Frame::decode(body)
+                    .map_err(|error| invalid_data(error.0))?
+                    .revision;
+                let mut mappings = self
+                    .overlay_revisions
+                    .lock()
+                    .map_err(|_| io::Error::other("overlay revisions poisoned"))?;
+                let revisions = mappings.entry(key).or_default();
+                if revisions.len() == 64 {
+                    revisions.pop_front();
+                }
+                revisions.push_back((revision, inner_revision));
+                drop(mappings);
+                self.channel.send_vector(&frame)
+            }
             messages::IMAGE_DATA => self.channel.send_image(body),
             messages::VIDEO_PACKET => {
                 let packet = media::parse_video_packet(body)?;
@@ -2314,6 +2889,7 @@ fn run_outer_media_writer(
 impl Drop for OuterBridge {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        self.retire_overlay_jobs();
         self.position_observer.take();
         for track in self.tracks.values() {
             let _ = track.channel.close();
@@ -2349,6 +2925,12 @@ fn producer_config(
                 registry::OVERLAY_INPUT.into(),
                 registry::OVERLAY_PAINT.into(),
                 registry::OVERLAY_POINTER.into(),
+                registry::OVERLAY_TEXT.into(),
+                registry::OVERLAY_TEXT_LAYOUT.into(),
+                registry::OVERLAY_ENV.into(),
+                registry::OVERLAY_CLIPBOARD.into(),
+                registry::OVERLAY_A11Y.into(),
+                registry::OVERLAY_TYPOGRAPHY.into(),
             ],
             ..ProducerConfig::default()
         },
@@ -2654,7 +3236,8 @@ fn track_configuration(
                 // only the canvas bytes.
                 let body = maximum_scene_bytes
                     .checked_add(12)
-                    .ok_or_else(|| invalid_data("vector scene record body overflow"))?;
+                    .ok_or_else(|| invalid_data("vector scene record body overflow"))?
+                    .max((vivid_protocol::vector::MAX_ASSET_BYTES + 16) as u32);
                 (
                     KindConfiguration::VectorScene(VectorConfiguration {
                         width: *width,
@@ -3065,6 +3648,7 @@ mod tests {
         .unwrap();
         let surface = |producer| BridgeSurface {
             overlay_window: None,
+            overlay_layouts: Vec::new(),
             key: BridgeSurfaceKey {
                 producer,
                 context: 7,
@@ -3331,6 +3915,7 @@ mod tests {
         };
         let surface = BridgeSurface {
             overlay_window: None,
+            overlay_layouts: Vec::new(),
             key: BridgeSurfaceKey {
                 producer: audio_key.producer,
                 context: audio_key.context,
@@ -3553,6 +4138,7 @@ mod tests {
             };
             let surface = BridgeSurface {
                 overlay_window: None,
+                overlay_layouts: Vec::new(),
                 key: BridgeSurfaceKey {
                     producer: key.producer,
                     context: key.context,
@@ -3867,6 +4453,7 @@ mod tests {
         };
         let surface = BridgeSurface {
             overlay_window: None,
+            overlay_layouts: Vec::new(),
             key: BridgeSurfaceKey {
                 producer: raster_key.producer,
                 context: raster_key.context,
@@ -4091,6 +4678,7 @@ mod tests {
         };
         let surface = BridgeSurface {
             overlay_window: None,
+            overlay_layouts: Vec::new(),
             key: BridgeSurfaceKey {
                 producer: video_key.producer,
                 context: video_key.context,
@@ -4286,6 +4874,8 @@ mod tests {
             .unwrap();
         let channel = Arc::new(session.open_track_channel(&track).unwrap());
         let writer = OuterMediaWriter {
+            overlay_layouts: Default::default(),
+            overlay_revisions: Default::default(),
             writer_id: 1,
             key: BridgeSourceKey {
                 producer: 1,
@@ -4480,6 +5070,8 @@ mod tests {
             .unwrap();
         let channel = Arc::new(session.open_track_channel(&track).unwrap());
         let writer = OuterMediaWriter {
+            overlay_layouts: Default::default(),
+            overlay_revisions: Default::default(),
             writer_id: 1,
             key: source.key,
             object_id: track.id(),

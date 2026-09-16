@@ -112,6 +112,7 @@ fn failed_node_delete_retains_retry_identity() {
     let surface = BridgeSurface {
         key,
         overlay_window: None,
+            overlay_layouts: Vec::new(),
         logical_width: 16,
         logical_height: 16,
         capture_policy: 0,
@@ -170,6 +171,11 @@ fn overlay_window_relays_create_update_and_teardown() {
         track: 1,
     };
     let window = |revision, x, y, width, height| BridgeOverlayWindow {
+        parent: None,
+        min_width: 1,
+        min_height: 1,
+        offset_x: 0,
+        offset_y: 0,
         generation: 1,
         revision,
         x,
@@ -182,6 +188,7 @@ fn overlay_window_relays_create_update_and_teardown() {
     let surface = BridgeSurface {
         key: surface_key,
         overlay_window: Some(window(1, 10, 10, 200, 100)),
+        overlay_layouts: Vec::new(),
         logical_width: 200,
         logical_height: 100,
         capture_policy: 0,
@@ -253,7 +260,7 @@ fn overlay_window_relays_create_update_and_teardown() {
         .overlay_windows
         .get(&surface_key)
         .expect("tracked window state");
-    assert_eq!(tracked.inner_revision, 2, "the relayed inner revision advances");
+    assert_eq!(tracked.projected.revision, 2, "the relayed inner revision advances");
     assert!(
         tracked.outer_revision > 0,
         "the outer presenter's own revision was recorded"
@@ -304,6 +311,7 @@ fn audit_projection(producer: u64) -> (BridgeSurface, BridgeSource) {
     let surface = BridgeSurface {
         key,
         overlay_window: None,
+            overlay_layouts: Vec::new(),
         logical_width: 16,
         logical_height: 16,
         capture_policy: 0,
@@ -524,8 +532,8 @@ fn outer_sessions_never_require_overlay_profiles_and_offer_only_the_relayed_subs
     // The gateway relays a nested producer's overlay window to the outer presenter rather than
     // rendering it itself, so an outer presenter with no vector renderer must keep working exactly
     // as it does today: none of these profiles may ever be required. `terminal-surface-v1` may
-    // optionally offer the subset the gateway actually relays (window/scene/input); the rest
-    // (text, clipboard, host environment, accessibility) are not relayed yet and must stay absent.
+    // optionally offer window/scene/input and physical host services. Each remains optional;
+    // the inner presenter only advertises clipboard/a11y/typography when the host accepted them.
     // `desktop-surface-v1` cannot offer any of them: `terminal-overlay-v1`'s prerequisite excludes it.
     let relayed_under_terminal = [
         registry::VECTOR_SCENE,
@@ -533,13 +541,11 @@ fn outer_sessions_never_require_overlay_profiles_and_offer_only_the_relayed_subs
         registry::OVERLAY_INPUT,
         registry::OVERLAY_PAINT,
         registry::OVERLAY_POINTER,
-    ];
-    let never_offered = [
         registry::OVERLAY_TEXT,
         registry::OVERLAY_TEXT_LAYOUT,
+        registry::OVERLAY_ENV,
         registry::OVERLAY_TYPOGRAPHY,
         registry::OVERLAY_CLIPBOARD,
-        registry::OVERLAY_ENV,
         registry::OVERLAY_A11Y,
     ];
     for target in [registry::TERMINAL_SURFACE, registry::DESKTOP_SURFACE] {
@@ -551,16 +557,10 @@ fn outer_sessions_never_require_overlay_profiles_and_offer_only_the_relayed_subs
             target,
         )
         .expect("gateway outer configuration");
-        for profile in relayed_under_terminal.iter().chain(&never_offered) {
+        for profile in &relayed_under_terminal {
             assert!(
                 !config.required_profiles.iter().any(|p| p == profile),
                 "{target} must not require {profile}"
-            );
-        }
-        for profile in never_offered {
-            assert!(
-                !config.optional_profiles.iter().any(|p| p == profile),
-                "{target} must not offer {profile}"
             );
         }
         for profile in relayed_under_terminal {

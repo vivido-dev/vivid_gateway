@@ -39,10 +39,9 @@ const ROWS: u16 = 24;
 fn overlay_presenter() -> io::Result<(VirtualVivid, String)> {
     let listener = TcpPresenterListener::bind()?;
     let endpoint = listener.endpoint();
-    let presenter = VirtualVivid::start_configured(
+    let presenter = VirtualVivid::start_configured_eventless(
         listener,
         PresenterConfig::terminal_with_overlay(MediaConfig::default()),
-        None,
     )?;
     Ok((presenter, endpoint))
 }
@@ -71,6 +70,389 @@ fn scene(colour: u32) -> Canvas {
         )
         .unwrap();
     canvas
+}
+
+#[test]
+fn overlay_display_lists_cross_both_sockets_and_return_credit_after_delivery() -> io::Result<()> {
+    fn relaying_presenter() -> io::Result<(VirtualVivid, String)> {
+        let listener = TcpPresenterListener::bind()?;
+        let endpoint = listener.endpoint();
+        Ok((
+            VirtualVivid::start_configured(
+                listener,
+                PresenterConfig::terminal_with_overlay(MediaConfig::default()),
+                None,
+            )?,
+            endpoint,
+        ))
+    }
+    let (inner, endpoint) = relaying_presenter()?;
+    let secret = pane(&inner, 1)?;
+    let producer = overlay_producer(&endpoint, &secret, "drawing-relay")?;
+    let window = window_of(&producer, 0., 0.)?;
+    let (outer, endpoint) = relaying_presenter()?;
+    let secret = pane(&outer, 9)?;
+    let mut relay = bridge(&endpoint, &secret)?;
+    for colour in [0xff0000ff, 0x00ff00ff, 0x0000ffff, 0xffffffff] {
+        let mut canvas = scene(colour);
+        canvas
+            .push(vivid_sdk::overlay::Command::Hit {
+                id: 7,
+                path: Path::rectangle(Rect::new(0., 0., 120., 60.).unwrap()).unwrap(),
+                role: vivid_sdk::overlay::HitRole::Input,
+                cursor: None,
+            })
+            .unwrap();
+        window.present(canvas.clone())?;
+        let event = inner
+            .wait_media_event(Duration::from_secs(5))?
+            .expect("accepted scene must become an actual bridge delivery");
+        assert!(inner.bridge_delivery_is_pending(event.delivery_id, event.source));
+        let projection = snapshot(&inner, &[1]).bridge_projection();
+        relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
+        relay.media_chunk(
+            event.delivery_id,
+            event.source,
+            event.record_type,
+            0,
+            event.body.len() as u32,
+            true,
+            event.body,
+        )?;
+        let painted = outer
+            .wait_media_event(Duration::from_secs(5))?
+            .expect("outer presenter must receive drawing commands");
+        let frame = vivid_protocol::vector::Frame::decode(&painted.body).unwrap();
+        assert_eq!(frame.canvas, canvas);
+        outer.complete_bridge_delivery(painted.delivery_id, true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let completions = relay.take_media_completions();
+            if let Some((id, delivered, _, _)) = completions.first() {
+                assert_eq!(*id, event.delivery_id);
+                assert!(*delivered);
+                inner.complete_bridge_delivery(*id, *delivered);
+                break;
+            }
+            assert!(Instant::now() < deadline, "outer write never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(outer.overlay_pointer(9, 20., 20., Some((1, true)), 0)?);
+    assert!(outer.overlay_key(9, 0x2b, true, 0));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut pointer = false;
+    let mut keyboard = false;
+    while !pointer || !keyboard {
+        for (surface, body) in relay.take_overlay_input()? {
+            assert!(inner.relay_overlay_input(surface, &body)?);
+        }
+        while let Some(event) = producer.wait_event(Duration::ZERO)? {
+            if let vivid_sdk::OverlayLaneEvent::Input(event) = event {
+                match event.event {
+                    vivid_sdk::overlay::Event::Pointer {
+                        button: Some((1, true)),
+                        ..
+                    } => pointer = true,
+                    vivid_sdk::overlay::Event::Key {
+                        physical: 0x2b,
+                        down: true,
+                        ..
+                    } => keyboard = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native overlay input never reached the inner producer"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[test]
+fn measured_layouts_and_image_assets_survive_a_replaced_outer_session() -> io::Result<()> {
+    use vivid_sdk::overlay::{Point, StyledText, TextStyle};
+    let listener = TcpPresenterListener::bind()?;
+    let endpoint = listener.endpoint();
+    let inner = VirtualVivid::start_configured(
+        listener,
+        PresenterConfig::terminal_with_overlay(MediaConfig::default()),
+        None,
+    )?;
+    inner.enable_overlay_host_relay();
+    let secret = pane(&inner, 1)?;
+    let producer = overlay_producer(&endpoint, &secret, "retained-overlay")?;
+    let window = window_of(&producer, 0., 0.)?;
+    let (outer, endpoint) = overlay_presenter()?;
+    let secret = pane(&outer, 9)?;
+    // Occupy one outer layout ID so accidental identity passthrough cannot pass this test.
+    let decoy = overlay_producer(&endpoint, &secret, "different-owner")?;
+    let decoy_window = window_of(&decoy, 300., 0.)?;
+    let _decoy_layout =
+        decoy_window.layout_text(&StyledText::new("other", TextStyle::default()))?;
+    let mut relay = bridge(&endpoint, &secret)?;
+    let layout = std::thread::scope(|scope| -> io::Result<_> {
+        let job = scope.spawn(|| {
+            window.layout_text(&StyledText::new(
+                "host-shaped paragraph",
+                TextStyle::default(),
+            ))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.is_finished() {
+            for request in inner.take_overlay_host_requests() {
+                let projection = snapshot(&inner, &[1]).bridge_projection();
+                relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
+                inner.complete_overlay_host_request(
+                    request.id,
+                    relay
+                        .overlay_host_request(&request)
+                        .map_err(|error| error.to_string()),
+                );
+            }
+            assert!(Instant::now() < deadline, "text request did not complete");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        job.join().unwrap()
+    })?;
+    let image = window.upload_rgba(1, 1, &[255, 0, 0, 255])?;
+    let asset = inner
+        .wait_media_event(Duration::from_secs(5))?
+        .expect("asset delivery");
+    let projection = snapshot(&inner, &[1]).bridge_projection();
+    relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
+    relay.media_chunk(
+        asset.delivery_id,
+        asset.source,
+        asset.record_type,
+        0,
+        asset.body.len() as u32,
+        true,
+        asset.body,
+    )?;
+    finish_delivery(&inner, &mut relay, asset.delivery_id)?;
+    let mut canvas = Canvas::new();
+    window.draw_text_layout(&mut canvas, &layout, Point::new(5., 5.).unwrap())?;
+    window.draw_image(
+        &mut canvas,
+        &image,
+        Rect::new(0., 0., 10., 10.).unwrap(),
+        u16::MAX,
+    )?;
+    window.present(canvas)?;
+    let frame = inner
+        .wait_media_event(Duration::from_secs(5))?
+        .expect("scene delivery");
+    let projection = snapshot(&inner, &[1]).bridge_projection();
+    relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
+    relay.media_chunk(
+        frame.delivery_id,
+        frame.source,
+        frame.record_type,
+        0,
+        frame.body.len() as u32,
+        true,
+        frame.body,
+    )?;
+    finish_delivery(&inner, &mut relay, frame.delivery_id)?;
+    let drawn = snapshot(&outer, &[9])
+        .sources
+        .into_iter()
+        .find_map(|source| source.retained)
+        .expect("outer scene");
+    let first = vivid_protocol::vector::Frame::decode(&drawn).unwrap();
+    let outer_layout = match first.canvas.commands()[0] {
+        vivid_sdk::overlay::Command::TextLayout { layout, .. } => layout,
+        _ => panic!("missing text layout"),
+    };
+    assert_ne!(
+        outer_layout,
+        layout.id(),
+        "layout namespace must be re-originated"
+    );
+    relay.replace_session(&projection.surfaces, &projection.sources, &projection.nodes)?;
+    let retained = snapshot(&inner, &[1]).sources.remove(0);
+    for (kind, body) in retained.retained_vector {
+        relay.media_chunk(
+            0,
+            retained.key,
+            kind,
+            0,
+            body.len() as u32,
+            true,
+            body.to_vec(),
+        )?;
+        finish_delivery(&inner, &mut relay, 0)?;
+    }
+    let drawn = snapshot(&outer, &[9])
+        .sources
+        .into_iter()
+        .find_map(|source| source.retained)
+        .expect("restored outer scene");
+    let restored = vivid_protocol::vector::Frame::decode(&drawn).unwrap();
+    assert_eq!(restored.canvas.commands().len(), 2);
+    assert_ne!(
+        restored.canvas.commands()[0],
+        first.canvas.commands()[0],
+        "replacement must shape and remap the retained layout again"
+    );
+    Ok(())
+}
+
+fn finish_delivery(inner: &VirtualVivid, relay: &mut OuterBridge, expected: u64) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some((id, delivered, _, _)) = relay.take_media_completions().into_iter().next() {
+            assert_eq!(id, expected);
+            assert!(delivered, "outer delivery failed");
+            inner.complete_bridge_delivery(id, delivered);
+            return Ok(());
+        }
+        assert!(Instant::now() < deadline, "outer delivery did not complete");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn vector_credit_blocks_only_its_owner_until_delivery_is_acknowledged() -> io::Result<()> {
+    let listener = TcpPresenterListener::bind()?;
+    let endpoint = listener.endpoint();
+    let inner = VirtualVivid::start_configured(
+        listener,
+        PresenterConfig::terminal_with_overlay(MediaConfig::default()),
+        None,
+    )?;
+    let first = overlay_producer(&endpoint, &pane(&inner, 1)?, "credit-one")?;
+    let second = overlay_producer(&endpoint, &pane(&inner, 2)?, "credit-two")?;
+    let a = window_of(&first, 0., 0.)?;
+    let b = window_of(&second, 0., 0.)?;
+    a.present(scene(1))?;
+    let held = inner.wait_media_event(Duration::from_secs(5))?.unwrap();
+    std::thread::scope(|scope| -> io::Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let a = &a;
+        let job = scope.spawn(move || {
+            let result = a.present(scene(2));
+            tx.send(()).unwrap();
+            result
+        });
+        let blocked = rx.recv_timeout(Duration::from_millis(100)).is_err();
+        // Clean up the grant even if the assertion fails, so a broken test cannot hang joining.
+        if !blocked {
+            inner.complete_bridge_delivery(held.delivery_id, true);
+        }
+        assert!(
+            blocked,
+            "second frame escaped before the outer-write acknowledgement"
+        );
+        b.present(scene(3))?;
+        let unrelated = inner.wait_media_event(Duration::from_secs(5))?.unwrap();
+        assert_eq!(held.source.track, unrelated.source.track);
+        assert_eq!(held.source.surface, unrelated.source.surface);
+        assert_ne!(held.source.producer, unrelated.source.producer);
+        inner.complete_bridge_delivery(unrelated.delivery_id, true);
+        inner.complete_bridge_delivery(held.delivery_id, true);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        job.join().unwrap()?;
+        let resumed = inner.wait_media_event(Duration::from_secs(5))?.unwrap();
+        assert_eq!(resumed.source, held.source);
+        inner.complete_bridge_delivery(resumed.delivery_id, true);
+        Ok(())
+    })
+}
+
+#[test]
+fn child_modal_and_pointer_capture_cross_the_gateway() -> io::Result<()> {
+    let (inner, endpoint) = overlay_presenter()?;
+    inner.enable_overlay_host_relay();
+    let producer = overlay_producer(&endpoint, &pane(&inner, 1)?, "modal-capture")?;
+    let parent = window_of(&producer, 0., 0.)?;
+    parent.present(scene(1))?;
+    let child = producer.create_child(
+        &parent,
+        OverlayWindowOptions::new(Rect::new(30., 30., 100., 80.).unwrap(), WindowMode::Modal),
+    )?;
+    child.present(scene(2))?;
+    let (outer, endpoint) = overlay_presenter()?;
+    let mut relay = bridge(&endpoint, &pane(&outer, 9)?)?;
+    let projection = snapshot(&inner, &[1]).bridge_projection();
+    relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
+    for source in snapshot(&inner, &[1]).sources {
+        for (kind, body) in source.retained_vector {
+            relay.media_chunk(
+                0,
+                source.key,
+                kind,
+                0,
+                body.len() as u32,
+                true,
+                body.to_vec(),
+            )?;
+            finish_delivery(&inner, &mut relay, 0)?;
+        }
+    }
+    let windows = overlay_windows(&snapshot(&outer, &[9]));
+    assert_eq!(windows.len(), 2);
+    let modal = windows
+        .iter()
+        .find(|(_, window)| window.parent.is_some())
+        .unwrap();
+    assert!(
+        snapshot(&outer, &[9])
+            .bridge_projection()
+            .surfaces
+            .iter()
+            .any(|surface| Some(surface.key) == modal.1.parent)
+    );
+    assert!(outer.overlay_pointer(9, 45., 45., Some((1, true)), 0)?);
+    for (surface, body) in relay.take_overlay_input()? {
+        inner.relay_overlay_input(surface, &body)?;
+    }
+    std::thread::scope(|scope| -> io::Result<()> {
+        let capture = scope.spawn(|| producer.capture_pointer(&child, true));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !capture.is_finished() {
+            for request in inner.take_overlay_host_requests() {
+                inner.complete_overlay_host_request(
+                    request.id,
+                    relay
+                        .overlay_host_request(&request)
+                        .map_err(|error| error.to_string()),
+                );
+            }
+            assert!(Instant::now() < deadline, "capture never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        capture.join().unwrap()
+    })?;
+    // Outside both windows: only a capture reaching the physical host can receive this release.
+    assert!(outer.overlay_pointer(9, 600., 300., Some((1, false)), 0)?);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        for (surface, body) in relay.take_overlay_input()? {
+            inner.relay_overlay_input(surface, &body)?;
+        }
+        if let Some(vivid_sdk::OverlayLaneEvent::Input(event)) =
+            producer.wait_event(Duration::from_millis(10))?
+            && matches!(
+                event.event,
+                vivid_sdk::overlay::Event::Pointer {
+                    button: Some((1, false)),
+                    ..
+                }
+            )
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "captured release never reached producer"
+        );
+    }
+    Ok(())
 }
 
 /// An ordinary raster producer, so a pane running one can be shown to keep going while a pane
@@ -436,8 +818,24 @@ fn one_overlay_producer_closing_leaves_the_other_reusing_the_same_ids_intact() -
     let second = overlay_producer(&inner_endpoint, &second_secret, "owner-two")?;
     let first_window = window_of(&first, 12., 20.)?;
     let second_window = window_of(&second, 12., 20.)?;
-    first_window.present(scene(0xff0000ff))?;
-    second_window.present(scene(0x0000ffff))?;
+    let first_image = first_window.upload_rgba(1, 1, &[255, 0, 0, 255])?;
+    let second_image = second_window.upload_rgba(1, 1, &[0, 0, 255, 255])?;
+    let mut first_scene = scene(0xff0000ff);
+    first_window.draw_image(
+        &mut first_scene,
+        &first_image,
+        Rect::new(0., 0., 10., 10.).unwrap(),
+        u16::MAX,
+    )?;
+    let mut second_scene = scene(0x0000ffff);
+    second_window.draw_image(
+        &mut second_scene,
+        &second_image,
+        Rect::new(0., 0., 10., 10.).unwrap(),
+        u16::MAX,
+    )?;
+    first_window.present(first_scene)?;
+    second_window.present(second_scene.clone())?;
 
     let (outer, outer_endpoint) = overlay_presenter()?;
     let outer_secret = pane(&outer, OUTER_PANE)?;
@@ -476,6 +874,31 @@ fn one_overlay_producer_closing_leaves_the_other_reusing_the_same_ids_intact() -
             .expect("each producer has a projected surface")
     };
     let casualty_key = key_of(producer_of(FIRST_PANE));
+    let mut asset_ids = Vec::new();
+    for source in snapshot(&inner, &panes).sources {
+        asset_ids.push(
+            vivid_protocol::vector::ImageAsset::decode(&source.retained_vector[0].1)
+                .unwrap()
+                .id,
+        );
+        for (kind, body) in source.retained_vector {
+            relay.media_chunk(
+                0,
+                source.key,
+                kind,
+                0,
+                body.len() as u32,
+                true,
+                body.to_vec(),
+            )?;
+            finish_delivery(&inner, &mut relay, 0)?;
+        }
+    }
+    assert_eq!(asset_ids.len(), 2);
+    assert_eq!(
+        asset_ids[0], asset_ids[1],
+        "both producers reuse the same local asset ID"
+    );
     let survivor_key = key_of(producer_of(SECOND_PANE));
     let survivor_outer = relay
         .outer_surface_id(survivor_key)
@@ -531,10 +954,33 @@ fn one_overlay_producer_closing_leaves_the_other_reusing_the_same_ids_intact() -
     );
 
     // And it can still commit further work: a new display list and a window move both land.
-    survivor_window.present(scene(0x00ff00ff))?;
+    survivor_window.present(second_scene.clone())?;
     survivor_window.set_bounds(Rect::new(30., 40., 240., 120.).map_err(io::Error::other)?)?;
     let after = snapshot(&inner, &panes).bridge_projection();
     relay.rebuild(&after.surfaces, &after.sources, &after.nodes)?;
+    let retained = snapshot(&inner, &panes).sources.remove(0);
+    let frame = retained.retained.unwrap();
+    relay.media_chunk(
+        0,
+        survivor_source,
+        vivid_protocol::messages::VECTOR_FRAME,
+        0,
+        frame.len() as u32,
+        true,
+        frame.to_vec(),
+    )?;
+    finish_delivery(&inner, &mut relay, 0)?;
+    let painted = snapshot(&outer, &[OUTER_PANE])
+        .sources
+        .remove(0)
+        .retained
+        .unwrap();
+    assert_eq!(
+        vivid_protocol::vector::Frame::decode(&painted)
+            .unwrap()
+            .canvas,
+        second_scene
+    );
     let moved = hosted_window(&outer, &[OUTER_PANE]);
     assert_eq!((moved.x, moved.y), (30, 40));
     assert!(moved.revision > held.revision);

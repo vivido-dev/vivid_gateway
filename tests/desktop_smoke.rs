@@ -522,6 +522,7 @@ fn desktop_surface_crosses_both_terminating_hops() -> io::Result<()> {
         &[BridgeSurface {
             key: bridge_surface,
             overlay_window: None,
+            overlay_layouts: Vec::new(),
             logical_width: projected.logical_width,
             logical_height: projected.logical_height,
             capture_policy: projected.capture_policy,
