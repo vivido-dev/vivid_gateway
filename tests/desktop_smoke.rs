@@ -1,11 +1,8 @@
 use std::io;
-use std::net::{Shutdown, TcpListener};
-use std::sync::Arc;
 
 use vivid_gateway::{
     BridgeClipRect, BridgeNode, BridgeSourceDescriptor, BridgeSurface, BridgeSurfaceKey,
-    ConnectionCancel, DisplayMetrics, MediaConfig, OuterBridge, PresenterConfig, PresenterListener,
-    Transport, VirtualVivid,
+    DisplayMetrics, MediaConfig, OuterBridge, PresenterConfig, VirtualVivid,
 };
 use vivid_protocol::auth::{
     Secret32, channel_tag, derive_session_keys, extract_handshake_prk, verify_tag,
@@ -24,40 +21,9 @@ use vivid_sdk::{
 };
 use zeroize::Zeroizing;
 
-struct TcpPresenterListener {
-    listener: TcpListener,
-    endpoint: String,
-}
+mod common;
 
-impl TcpPresenterListener {
-    fn bind() -> io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let endpoint = format!("tcp:{}", listener.local_addr()?);
-        Ok(Self { listener, endpoint })
-    }
-}
-
-impl PresenterListener for TcpPresenterListener {
-    fn endpoint(&self) -> String {
-        self.endpoint.clone()
-    }
-
-    fn accept(&self) -> io::Result<Transport> {
-        let (stream, _) = self.listener.accept()?;
-        stream.set_nodelay(true)?;
-        let reader = stream.try_clone()?;
-        let timeout_stream = stream.try_clone()?;
-        let cancel_stream = stream.try_clone()?;
-        Ok(Transport::new(
-            Box::new(reader),
-            Box::new(stream),
-            ConnectionCancel::new(move || {
-                let _ = cancel_stream.shutdown(Shutdown::Both);
-            }),
-            Arc::new(move |timeout| timeout_stream.set_read_timeout(timeout)),
-        ))
-    }
-}
+use common::{TcpPresenterListener, pin_endpoints};
 
 fn desktop_target(width: u32, height: u32) -> DesktopTarget {
     DesktopTarget {
@@ -79,13 +45,6 @@ fn desktop_target(width: u32, height: u32) -> DesktopTarget {
         settled: true,
         topology_revision: 1,
     }
-}
-
-fn pin_endpoints(producer: &mut ProducerConfig, endpoint: String) {
-    producer.endpoint_control = Some(endpoint.clone());
-    producer.endpoint_interactive = Some(endpoint.clone());
-    producer.endpoint_realtime = Some(endpoint.clone());
-    producer.endpoint_bulk = Some(endpoint);
 }
 
 #[test]
@@ -562,6 +521,7 @@ fn desktop_surface_crosses_both_terminating_hops() -> io::Result<()> {
     bridge.rebuild(
         &[BridgeSurface {
             key: bridge_surface,
+            overlay_window: None,
             logical_width: projected.logical_width,
             logical_height: projected.logical_height,
             capture_policy: projected.capture_policy,

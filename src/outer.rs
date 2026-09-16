@@ -10,12 +10,15 @@ use vivid_protocol::auth::Secret32;
 use vivid_protocol::cbor::Value;
 use vivid_protocol::media::{self, AudioPacket, RasterDeltaOperation, VideoPacket};
 use vivid_protocol::messages::{self, LaneClass};
+use vivid_protocol::overlay::wire::{SetWindow, WindowAddress};
+use vivid_protocol::overlay::{WindowMode, WindowOptions};
 use vivid_protocol::registry;
 use vivid_protocol::surface::POLICY_KNOWN_MASK;
 use vivid_protocol::track::{
     AudioConfiguration, AudioGain, ImageConfiguration, KindConfiguration, RasterConfiguration,
-    TrackConfiguration, TrackMode, VideoConfiguration,
+    TrackConfiguration, TrackMode, VectorConfiguration, VideoConfiguration,
 };
+use vivid_protocol::vector::{Rect, Scalar};
 use vivid_sdk::{
     ChannelEvent, CoordinateModel, Fit, ProducerAuthentication, ProducerConfig, RequestMetadata,
     SceneNode, SessionEvent, SlotBinding, Surface, SurfaceDefinition, SurfaceDescriptor,
@@ -23,6 +26,8 @@ use vivid_sdk::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use crate::presenter::BridgeOverlayWindow;
 use crate::presenter::{
     BridgeKeyframeRequest, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceKey,
     BridgeSourceKind, BridgeSurface, BridgeSurfaceKey, DisplayMetrics,
@@ -34,6 +39,7 @@ const SLOT_VIDEO: u64 = 1;
 const SLOT_AUDIO: u64 = 2;
 const SLOT_RASTER: u64 = 3;
 const SLOT_POSTER: u64 = 4;
+const SLOT_VECTOR: u64 = 5;
 pub use vivid_sdk::presenter::{
     KEYFRAME_REASON_DECODER_ERROR, KEYFRAME_REASON_INITIAL, KEYFRAME_REASON_TRANSPORT_LOSS,
 };
@@ -56,6 +62,16 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 /// round budget above the advertised reorder depth while testing readiness between rounds whose
 /// ingress capacity has actually been returned by the presenter.
 const OUTER_TIMED_PREROLL_RECORDS: usize = 32;
+
+/// Revision bookkeeping for one surface's relayed overlay window.
+struct OverlayWindowState {
+    /// The inner window's own revision last successfully relayed, so an unchanged snapshot does
+    /// not re-send the same geometry every reconciliation pass.
+    inner_revision: u64,
+    /// The outer window's own revision, returned by the last accepted `SET_OVERLAY_WINDOW`, and
+    /// required as the next update's `expected_revision`.
+    outer_revision: u64,
+}
 
 struct PositionJob {
     key: BridgeSourceKey,
@@ -274,6 +290,8 @@ pub struct OuterBridge {
     enforced_surface_policy: u64,
     display: DisplayMetrics,
     surfaces: HashMap<BridgeSurfaceKey, Surface>,
+    /// One outer `SET_OVERLAY_WINDOW` handshake state per surface that hosts an overlay window.
+    overlay_windows: HashMap<BridgeSurfaceKey, OverlayWindowState>,
     tracks: HashMap<BridgeSourceKey, OuterTrack>,
     unfinished_tracks: HashMap<BridgeSourceKey, Track>,
     surface_refresh: HashSet<BridgeSurfaceKey>,
@@ -457,6 +475,7 @@ impl OuterBridge {
             enforced_surface_policy: 0,
             display,
             surfaces: HashMap::new(),
+            overlay_windows: HashMap::new(),
             tracks: HashMap::new(),
             unfinished_tracks: HashMap::new(),
             surface_refresh: HashSet::new(),
@@ -1194,6 +1213,7 @@ impl OuterBridge {
                 BridgeSourceKind::Image { .. } => messages::IMAGE_DATA,
                 BridgeSourceKind::Video { .. } => messages::VIDEO_PACKET,
                 BridgeSourceKind::Audio { .. } => messages::AUDIO_PACKET,
+                BridgeSourceKind::VectorScene { .. } => messages::VECTOR_FRAME,
             };
             let end = (offset as usize)
                 .checked_add(bytes.len())
@@ -1589,7 +1609,66 @@ impl OuterBridge {
                     .create_surface(definition, &RequestMetadata::default())?;
                 self.surfaces.insert(surface.key, outer);
             }
+            self.sync_overlay_window(surface)?;
         }
+        Ok(())
+    }
+
+    /// Relay one surface's overlay window to the outer session, if it has one and its geometry
+    /// changed since the last relay. The outer presenter's own window revision is tracked so the
+    /// next update names the correct `expected_revision`; an outer presenter that never negotiated
+    /// the overlay bundle simply returns an error here, which the caller surfaces like any other
+    /// unsupported relayed configuration.
+    fn sync_overlay_window(&mut self, surface: &BridgeSurface) -> io::Result<()> {
+        let Some(window) = surface.overlay_window else {
+            self.overlay_windows.remove(&surface.key);
+            return Ok(());
+        };
+        if self
+            .overlay_windows
+            .get(&surface.key)
+            .is_some_and(|state| state.inner_revision == window.revision)
+        {
+            return Ok(());
+        }
+        let outer = self
+            .surfaces
+            .get(&surface.key)
+            .ok_or_else(|| invalid_data("outer surface was not created"))?;
+        let expected_revision = self
+            .overlay_windows
+            .get(&surface.key)
+            .map_or(0, |state| state.outer_revision);
+        let request = SetWindow {
+            address: WindowAddress {
+                context_id: outer.context_id(),
+                surface_id: outer.id(),
+                generation: outer.generation().get(),
+            },
+            expected_revision,
+            options: WindowOptions {
+                bounds: Rect::new(
+                    window.x as f64,
+                    window.y as f64,
+                    window.width as f64,
+                    window.height as f64,
+                )
+                .map_err(io::Error::other)?,
+                mode: window_mode_from_wire(window.mode)?,
+                visible: window.visible,
+                parent: None,
+                min_width: Scalar::ONE,
+                min_height: Scalar::ONE,
+            },
+        };
+        let accepted = self.session.set_overlay_window(&request)?;
+        self.overlay_windows.insert(
+            surface.key,
+            OverlayWindowState {
+                inner_revision: window.revision,
+                outer_revision: accepted.expected_revision,
+            },
+        );
         Ok(())
     }
 
@@ -1606,6 +1685,7 @@ impl OuterBridge {
             .collect::<Vec<_>>();
         for key in removed {
             self.surface_clock.remove(&key);
+            self.overlay_windows.remove(&key);
             if let Some(surface) = self.surfaces.get(&key).cloned() {
                 self.session
                     .destroy_surface(&surface, &RequestMetadata::default())?;
@@ -2259,7 +2339,17 @@ fn producer_config(
                 vivid_sdk::TIMED_MEDIA.into(),
                 vivid_sdk::CORE_CONTROL.into(),
             ],
-            optional_profiles: vec![registry::AUDIO_INPUT.into()],
+            // Optional: an outer presenter that cannot host overlay windows must keep working
+            // exactly as it does today, so none of these are required. Requested only under
+            // terminal-surface-v1 — `terminal-overlay-v1`'s prerequisite excludes desktop-surface-v1.
+            optional_profiles: vec![
+                registry::AUDIO_INPUT.into(),
+                registry::TERMINAL_OVERLAY.into(),
+                registry::VECTOR_SCENE.into(),
+                registry::OVERLAY_INPUT.into(),
+                registry::OVERLAY_PAINT.into(),
+                registry::OVERLAY_POINTER.into(),
+            ],
             ..ProducerConfig::default()
         },
         registry::DESKTOP_SURFACE => ProducerConfig::desktop(),
@@ -2270,6 +2360,8 @@ fn producer_config(
             ));
         }
     };
+    config.optional_profiles.sort();
+    config.optional_profiles.dedup();
     // These endpoints have already been resolved by the gateway's caller. Pin every native lane
     // so an ambient producer-discovery environment cannot redirect one part of this independently
     // authenticated outer session to another presenter. The protocol fallbacks are interactive to
@@ -2552,6 +2644,37 @@ fn track_configuration(
                     0,
                 )
             }
+            BridgeSourceKind::VectorScene {
+                width,
+                height,
+                maximum_scene_bytes,
+            } => {
+                // The wire frame carries the canvas plus a fixed 12-byte epoch/revision header
+                // (see `Frame::encode`); the record body limit must admit that whole frame, not
+                // only the canvas bytes.
+                let body = maximum_scene_bytes
+                    .checked_add(12)
+                    .ok_or_else(|| invalid_data("vector scene record body overflow"))?;
+                (
+                    KindConfiguration::VectorScene(VectorConfiguration {
+                        width: *width,
+                        height: *height,
+                        maximum_scene_bytes: *maximum_scene_bytes,
+                    }),
+                    // A display list is neither live-paced nor media-timed: it has no PTS and no
+                    // preplay/PLAY handshake, only a monotonic revision. Timed mode's pacing
+                    // fields (target/maximum latency) are meaningless for it, matched below like
+                    // Raster/Image.
+                    TrackMode::Live,
+                    LaneClass::Bulk,
+                    body,
+                    60_000,
+                    u64::from(body).saturating_mul(8).saturating_mul(60),
+                    60,
+                    u64::from(body).saturating_mul(2),
+                    u64::from(*width).saturating_mul(u64::from(*height)),
+                )
+            }
         };
     Ok(TrackConfiguration {
         direction: Default::default(),
@@ -2563,14 +2686,7 @@ fn track_configuration(
             KindConfiguration::Audio(_) => SLOT_AUDIO,
             KindConfiguration::Raster(_) => SLOT_RASTER,
             KindConfiguration::EncodedImage(_) => SLOT_POSTER,
-            // Unreachable while `BridgeSourceKind` has no vector variant: the outer session never
-            // negotiates the overlay profiles, so no inner producer can publish a vector track.
-            // Kept as a refusal rather than a panic in case a future source kind maps to slot 5.
-            KindConfiguration::VectorScene(_) => {
-                return Err(invalid_data(
-                    "gateway does not support vector overlay tracks",
-                ));
-            }
+            KindConfiguration::VectorScene(_) => SLOT_VECTOR,
         },
         mode,
         lane,
@@ -2596,6 +2712,7 @@ fn slot_for_kind(kind: &BridgeSourceKind) -> u64 {
         BridgeSourceKind::Audio { .. } => SLOT_AUDIO,
         BridgeSourceKind::Raster { .. } => SLOT_RASTER,
         BridgeSourceKind::Image { .. } => SLOT_POSTER,
+        BridgeSourceKind::VectorScene { .. } => SLOT_VECTOR,
     }
 }
 
@@ -2798,6 +2915,15 @@ fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn window_mode_from_wire(mode: u64) -> io::Result<WindowMode> {
+    match mode {
+        0 => Ok(WindowMode::Floating),
+        1 => Ok(WindowMode::Popup),
+        2 => Ok(WindowMode::Modal),
+        _ => Err(invalid_data("unknown overlay window mode")),
+    }
+}
+
 fn signed(value: i64) -> Value {
     if value >= 0 {
         Value::Unsigned(value as u64)
@@ -2938,6 +3064,7 @@ mod tests {
         )
         .unwrap();
         let surface = |producer| BridgeSurface {
+            overlay_window: None,
             key: BridgeSurfaceKey {
                 producer,
                 context: 7,
@@ -3203,6 +3330,7 @@ mod tests {
             track: 11,
         };
         let surface = BridgeSurface {
+            overlay_window: None,
             key: BridgeSurfaceKey {
                 producer: audio_key.producer,
                 context: audio_key.context,
@@ -3424,6 +3552,7 @@ mod tests {
                 track: 11,
             };
             let surface = BridgeSurface {
+                overlay_window: None,
                 key: BridgeSurfaceKey {
                     producer: key.producer,
                     context: key.context,
@@ -3737,6 +3866,7 @@ mod tests {
             ..raster_key
         };
         let surface = BridgeSurface {
+            overlay_window: None,
             key: BridgeSurfaceKey {
                 producer: raster_key.producer,
                 context: raster_key.context,
@@ -3960,6 +4090,7 @@ mod tests {
             track: 11,
         };
         let surface = BridgeSurface {
+            overlay_window: None,
             key: BridgeSurfaceKey {
                 producer: video_key.producer,
                 context: video_key.context,

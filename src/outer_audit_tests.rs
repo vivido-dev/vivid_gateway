@@ -111,6 +111,7 @@ fn failed_node_delete_retains_retry_identity() {
     };
     let surface = BridgeSurface {
         key,
+        overlay_window: None,
         logical_width: 16,
         logical_height: 16,
         capture_policy: 0,
@@ -149,6 +150,133 @@ fn failed_node_delete_retains_retry_identity() {
 }
 
 #[test]
+fn overlay_window_relays_create_update_and_teardown() {
+    let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
+    let mut bridge = OuterBridge::connect(
+        presenter.endpoint().into(),
+        Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
+        DisplayMetrics::default(),
+    )
+    .unwrap();
+    let surface_key = BridgeSurfaceKey {
+        producer: 1,
+        context: 1,
+        surface: 1,
+    };
+    let source_key = BridgeSourceKey {
+        producer: 1,
+        context: 1,
+        surface: 1,
+        track: 1,
+    };
+    let window = |revision, x, y, width, height| BridgeOverlayWindow {
+        generation: 1,
+        revision,
+        x,
+        y,
+        width,
+        height,
+        mode: 0,
+        visible: true,
+    };
+    let surface = BridgeSurface {
+        key: surface_key,
+        overlay_window: Some(window(1, 10, 10, 200, 100)),
+        logical_width: 200,
+        logical_height: 100,
+        capture_policy: 0,
+        descriptor: crate::BridgeSourceDescriptor {
+            role: 1,
+            title: "overlay".into(),
+            content_revision: 1,
+            semantic_availability: 0,
+            locator: String::new(),
+        },
+    };
+    let source = BridgeSource {
+        key: source_key,
+        kind: BridgeSourceKind::VectorScene {
+            width: 200,
+            height: 100,
+            maximum_scene_bytes: 65536,
+        },
+        decoder_reset_serial: 1,
+        live: true,
+        active: false,
+        audio_gain: None,
+        capture_policy: 0,
+        descriptor: None,
+        playing: false,
+        play_request: default_play_request(),
+        eos_epoch: None,
+        causation_id: None,
+    };
+
+    bridge
+        .rebuild(
+            std::slice::from_ref(&surface),
+            std::slice::from_ref(&source),
+            &[],
+        )
+        .unwrap();
+    let count_windows = |presenter: &vivid_sdk::testing::TestPresenter| {
+        presenter
+            .observed()
+            .into_iter()
+            .filter(|record| record.record_type == messages::SET_OVERLAY_WINDOW)
+            .count()
+    };
+    assert_eq!(
+        count_windows(&presenter),
+        1,
+        "the outer session receives one SET_OVERLAY_WINDOW on create"
+    );
+    assert_eq!(bridge.overlay_windows.len(), 1);
+
+    let moved = BridgeSurface {
+        overlay_window: Some(window(2, 50, 60, 220, 120)),
+        ..surface.clone()
+    };
+    bridge
+        .rebuild(
+            std::slice::from_ref(&moved),
+            std::slice::from_ref(&source),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        count_windows(&presenter),
+        2,
+        "moved bounds relay a second SET_OVERLAY_WINDOW"
+    );
+    let tracked = bridge
+        .overlay_windows
+        .get(&surface_key)
+        .expect("tracked window state");
+    assert_eq!(tracked.inner_revision, 2, "the relayed inner revision advances");
+    assert!(
+        tracked.outer_revision > 0,
+        "the outer presenter's own revision was recorded"
+    );
+
+    // An unchanged inner revision must not re-send the same geometry.
+    bridge
+        .rebuild(std::slice::from_ref(&moved), std::slice::from_ref(&source), &[])
+        .unwrap();
+    assert_eq!(
+        count_windows(&presenter),
+        2,
+        "an unchanged revision does not re-send the window"
+    );
+
+    bridge.rebuild(&[], &[], &[]).unwrap();
+    assert!(
+        bridge.overlay_windows.is_empty(),
+        "removing the surface clears its tracked window state"
+    );
+}
+
+#[test]
 fn poll_preserves_terminal_connection_event() {
     let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
     let mut bridge = OuterBridge::connect(
@@ -175,6 +303,7 @@ fn audit_projection(producer: u64) -> (BridgeSurface, BridgeSource) {
     };
     let surface = BridgeSurface {
         key,
+        overlay_window: None,
         logical_width: 16,
         logical_height: 16,
         capture_policy: 0,
@@ -391,10 +520,28 @@ fn polling_retains_resize_for_service_consumer() {
 }
 
 #[test]
-fn outer_sessions_never_negotiate_overlay_profiles() {
-    // A terminating gateway has no vector renderer and no pane input router. The overlay
-    // specification requires such a gateway to reject the profiles when they are required and to
-    // omit them when they are optional, so the outer session must never ask for one.
+fn outer_sessions_never_require_overlay_profiles_and_offer_only_the_relayed_subset() {
+    // The gateway relays a nested producer's overlay window to the outer presenter rather than
+    // rendering it itself, so an outer presenter with no vector renderer must keep working exactly
+    // as it does today: none of these profiles may ever be required. `terminal-surface-v1` may
+    // optionally offer the subset the gateway actually relays (window/scene/input); the rest
+    // (text, clipboard, host environment, accessibility) are not relayed yet and must stay absent.
+    // `desktop-surface-v1` cannot offer any of them: `terminal-overlay-v1`'s prerequisite excludes it.
+    let relayed_under_terminal = [
+        registry::VECTOR_SCENE,
+        registry::TERMINAL_OVERLAY,
+        registry::OVERLAY_INPUT,
+        registry::OVERLAY_PAINT,
+        registry::OVERLAY_POINTER,
+    ];
+    let never_offered = [
+        registry::OVERLAY_TEXT,
+        registry::OVERLAY_TEXT_LAYOUT,
+        registry::OVERLAY_TYPOGRAPHY,
+        registry::OVERLAY_CLIPBOARD,
+        registry::OVERLAY_ENV,
+        registry::OVERLAY_A11Y,
+    ];
     for target in [registry::TERMINAL_SURFACE, registry::DESKTOP_SURFACE] {
         let config = producer_config(
             Some("tcp:127.0.0.1:1".into()),
@@ -404,26 +551,24 @@ fn outer_sessions_never_negotiate_overlay_profiles() {
             target,
         )
         .expect("gateway outer configuration");
-        for profile in [
-            registry::VECTOR_SCENE,
-            registry::TERMINAL_OVERLAY,
-            registry::OVERLAY_INPUT,
-            registry::OVERLAY_TEXT,
-            registry::OVERLAY_TEXT_LAYOUT,
-            registry::OVERLAY_TYPOGRAPHY,
-            registry::OVERLAY_PAINT,
-            registry::OVERLAY_POINTER,
-            registry::OVERLAY_CLIPBOARD,
-            registry::OVERLAY_ENV,
-            registry::OVERLAY_A11Y,
-        ] {
+        for profile in relayed_under_terminal.iter().chain(&never_offered) {
             assert!(
                 !config.required_profiles.iter().any(|p| p == profile),
                 "{target} must not require {profile}"
             );
+        }
+        for profile in never_offered {
             assert!(
                 !config.optional_profiles.iter().any(|p| p == profile),
                 "{target} must not offer {profile}"
+            );
+        }
+        for profile in relayed_under_terminal {
+            let offered = config.optional_profiles.iter().any(|p| p == profile);
+            assert_eq!(
+                offered,
+                target == registry::TERMINAL_SURFACE,
+                "{target} offering {profile} should match whether it can host an overlay window"
             );
         }
     }
