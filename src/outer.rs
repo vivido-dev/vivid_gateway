@@ -91,6 +91,12 @@ struct PositionJob {
     playing: bool,
     start_pts_us: i64,
 }
+
+struct RetiringSurface {
+    clock: PositionJob,
+    tracks: Vec<OuterTrack>,
+    result: Option<mpsc::Receiver<io::Result<vivid_sdk::TrackStatus>>>,
+}
 struct PositionObserver {
     input: Option<mpsc::SyncSender<PositionJob>>,
     output: mpsc::Receiver<(PositionJob, io::Result<vivid_sdk::TrackStatus>)>,
@@ -190,6 +196,7 @@ struct OuterTrack {
     eos_requested: bool,
     eos: bool,
     reported_eos_state: u64,
+    target_picture_ready: bool,
 }
 
 struct OuterMediaWriter {
@@ -316,6 +323,8 @@ pub struct OuterBridge {
     surface_refresh: HashSet<BridgeSurfaceKey>,
     active_sources: HashMap<BridgeSourceKey, BridgeSource>,
     nodes: HashMap<(u64, u64, u8), (u64, SceneNode)>,
+    desired_nodes: Vec<BridgeNode>,
+    desired_surfaces: Vec<BridgeSurface>,
     pending: HashMap<BridgeSourceKey, PendingBody>,
     completions: Vec<MediaCompletion>,
     writer_completions_tx: mpsc::Sender<MediaCompletion>,
@@ -332,6 +341,11 @@ pub struct OuterBridge {
     position_poll_at: Instant,
     position_cursor: usize,
     position_observer: Option<PositionObserver>,
+    retiring_surfaces: HashMap<BridgeSurfaceKey, RetiringSurface>,
+    hold_updates: HashMap<BridgeSourceKey, vivid_sdk::presenter::BridgeHoldSnapshot>,
+    hold_serials: HashMap<BridgeSurfaceKey, u64>,
+    incompatible_sources: HashMap<BridgeSourceKey, u64>,
+    source_errors: Vec<(BridgeSourceKey, u64)>,
     /// The last position this bridge published for each outer surface clock.
     ///
     /// Its presence is the evidence that the nested producer has positioned that surface at all,
@@ -835,6 +849,8 @@ impl OuterBridge {
             surface_refresh: HashSet::new(),
             active_sources: HashMap::new(),
             nodes: HashMap::new(),
+            desired_nodes: Vec::new(),
+            desired_surfaces: Vec::new(),
             pending: HashMap::new(),
             completions: Vec::new(),
             writer_completions_tx,
@@ -848,6 +864,11 @@ impl OuterBridge {
             position_poll_at: Instant::now(),
             position_cursor: 0,
             position_observer,
+            retiring_surfaces: HashMap::new(),
+            hold_updates: HashMap::new(),
+            hold_serials: HashMap::new(),
+            incompatible_sources: HashMap::new(),
+            source_errors: Vec::new(),
             surface_clock: HashMap::new(),
             outer_applied_revision: 0,
             diagnostic_generation: 1,
@@ -954,6 +975,7 @@ impl OuterBridge {
         recovering: &HashSet<BridgeSourceKey>,
     ) -> io::Result<HashSet<BridgeSourceKey>> {
         validate_snapshot(surfaces, sources, nodes)?;
+        self.desired_surfaces = surfaces.to_vec();
         let unfinished = self.unfinished_tracks.keys().copied().collect::<Vec<_>>();
         for key in unfinished {
             let track = &self.unfinished_tracks[&key];
@@ -993,6 +1015,72 @@ impl OuterBridge {
                 .then_some(*key)
             })
             .collect::<Vec<_>>();
+        let mut frozen_surfaces = HashSet::new();
+        for key in &removed {
+            let track = &self.tracks[key];
+            if !current.contains(key) && track.mode == TrackMode::Timed && track.activated {
+                frozen_surfaces.insert(track.surface_key);
+            }
+        }
+        for surface in frozen_surfaces {
+            let Some(fallback) = removed
+                .iter()
+                .find(|key| {
+                    self.tracks
+                        .get(key)
+                        .is_some_and(|track| track.surface_key == surface)
+                })
+                .copied()
+            else {
+                continue;
+            };
+            let clock = preferred_surface_clock(&self.active_sources, surface, fallback);
+            let Some(track) = self.tracks.get(&clock) else {
+                continue;
+            };
+            let Some(source) = self.active_sources.get(&clock) else {
+                continue;
+            };
+            let clock = PositionJob {
+                key: clock,
+                writer_id: track.writer_id,
+                track: track.track.clone(),
+                decoder_reset_serial: source.decoder_reset_serial,
+                playing: source.playing,
+                start_pts_us: source.play_request.start_pts_us,
+            };
+            // Leave the old outer slots alive only until PAUSE + QUERY completes. Replacement
+            // slots may prime independently, but activation is gated on this completion.
+            let keys = removed
+                .iter()
+                .filter(|key| {
+                    self.tracks
+                        .get(key)
+                        .is_some_and(|track| track.surface_key == surface)
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            let tracks = keys
+                .into_iter()
+                .filter_map(|key| {
+                    self.pending.remove(&key);
+                    self.tracks.remove(&key)
+                })
+                .collect();
+            if let Some(existing) = self.retiring_surfaces.get_mut(&surface) {
+                existing.tracks.extend(tracks);
+            } else {
+                self.retiring_surfaces.insert(
+                    surface,
+                    RetiringSurface {
+                        clock,
+                        tracks,
+                        result: None,
+                    },
+                );
+            }
+        }
+        self.poll_retiring_surfaces()?;
         for key in removed {
             self.remove_track(key)?;
         }
@@ -1072,7 +1160,14 @@ impl OuterBridge {
             let _ = track.channel.close();
         }
         self.tracks.clear();
+        self.retiring_surfaces.clear();
+        self.hold_updates.clear();
+        self.hold_serials.clear();
+        self.incompatible_sources.clear();
+        self.source_errors.clear();
         self.nodes.clear();
+        self.desired_nodes.clear();
+        self.desired_surfaces.clear();
         self.pending.clear();
         self.active_sources.clear();
         self.surface_clock.clear();
@@ -1096,6 +1191,26 @@ impl OuterBridge {
         previous: &[BridgeSource],
         current: &[BridgeSource],
     ) -> io::Result<()> {
+        self.incompatible_sources
+            .retain(|key, _| current.iter().any(|source| source.key == *key));
+        if !self.session.supports(registry::TIMED_MEDIA_SYNC) {
+            for source in current
+                .iter()
+                .filter(|source| !source.live && source.play_request.start_policy == 2)
+            {
+                if self
+                    .incompatible_sources
+                    .insert(source.key, source.decoder_reset_serial)
+                    != Some(source.decoder_reset_serial)
+                {
+                    self.source_errors
+                        .push((source.key, source.decoder_reset_serial));
+                    if let Some(track) = self.tracks.get(&source.key) {
+                        let _ = track.channel.close();
+                    }
+                }
+            }
+        }
         let previous_sources = previous
             .iter()
             .cloned()
@@ -1134,6 +1249,9 @@ impl OuterBridge {
             }
         }
         for source in current {
+            if self.incompatible_sources.contains_key(&source.key) {
+                continue;
+            }
             let previous_gain = previous
                 .iter()
                 .find(|candidate| candidate.key == source.key)
@@ -1157,6 +1275,9 @@ impl OuterBridge {
         let mut rebased_surfaces = HashSet::new();
         let mut paused_surfaces = HashSet::new();
         for source in current {
+            if self.incompatible_sources.contains_key(&source.key) {
+                continue;
+            }
             let old = previous
                 .iter()
                 .find(|candidate| candidate.key == source.key);
@@ -1265,12 +1386,8 @@ impl OuterBridge {
             .ok_or_else(|| invalid_data("outer playback clock is missing"))?
             .track
             .clone();
-        self.session.play(
-            &clock_track,
-            request.start_pts_us,
-            request.minimum_buffer_us.max(1),
-            request.maximum_latency_us.max(1),
-        )?;
+        self.session
+            .play_with(&clock_track, bridge_play_options(request))?;
         let playing_members = self
             .active_sources
             .values()
@@ -1291,7 +1408,7 @@ impl OuterBridge {
             key,
             PlaybackSnapshot {
                 decoder_reset_serial: self.tracks[&key].decoder_reset_serial,
-                state: 2,
+                state: if request.start_policy == 2 { 1 } else { 2 },
                 eos_state: 0,
             },
         ));
@@ -1326,9 +1443,6 @@ impl OuterBridge {
         &self,
         surface: BridgeSurfaceKey,
     ) -> Option<(BridgeSourceKey, BridgePlayRequest)> {
-        // Without a previously published position, `play_request` is the inner presenter's
-        // baseline rather than anything the producer chose. There is nothing to restore.
-        self.surface_clock.get(&surface)?;
         let mut members = self
             .active_sources
             .values()
@@ -1367,6 +1481,13 @@ impl OuterBridge {
             .position(|source| matches!(source.kind, BridgeSourceKind::Video { .. }))
             .unwrap_or(0);
         let request = members[clock].play_request;
+        // Projection removal destroys the old outer clock. A correlated resume PLAY is
+        // nevertheless an explicit producer position, including when PLAY/PAUSE coalesced
+        // before this bridge observed a playing edge. Only uncorrelated baseline state needs
+        // evidence of a previously published clock.
+        if !self.surface_clock.contains_key(&surface) && request.hold_serial.is_none() {
+            return None;
+        }
         outer
             .iter()
             .any(|track| track.published_play_request != Some(request))
@@ -1386,12 +1507,7 @@ impl OuterBridge {
             .ok_or_else(|| invalid_data("outer paused clock is missing"))?
             .track
             .clone();
-        match self.session.play(
-            &track,
-            request.start_pts_us,
-            request.minimum_buffer_us.max(1),
-            request.maximum_latency_us.max(1),
-        ) {
+        match self.session.play_with(&track, bridge_play_options(request)) {
             Ok(_) => {}
             // The activation this republication reads is the bridge's own mirror of an
             // independently serviced control connection. A refusal means the outer surface has
@@ -1496,6 +1612,11 @@ impl OuterBridge {
     /// the relay waits only on `playing`, the audio writer parks on its first pre-roll record and
     /// never returns the credit that lets the browser's shared raster/audio worker continue.
     pub fn retry_pending_activation(&mut self) -> io::Result<()> {
+        self.poll_retiring_surfaces()?;
+        let surfaces = self.desired_surfaces.clone();
+        self.remove_absent_surfaces(&surfaces)?;
+        let nodes = self.desired_nodes.clone();
+        self.reconcile_nodes(&nodes)?;
         let pending = self
             .tracks
             .iter()
@@ -1773,6 +1894,47 @@ impl OuterBridge {
         }
         while let Some(event) = self.session.take_event()? {
             match event {
+                SessionEvent::PlaybackHold(hold) => {
+                    let Some(surface) = self.surfaces.iter().find_map(|(key, surface)| {
+                        (surface.context_id() == hold.context_id && surface.id() == hold.surface_id)
+                            .then_some(*key)
+                    }) else {
+                        continue;
+                    };
+                    if self
+                        .hold_serials
+                        .get(&surface)
+                        .is_some_and(|serial| *serial >= hold.serial)
+                    {
+                        continue;
+                    }
+                    self.hold_serials.insert(surface, hold.serial);
+                    let Some(source) = self
+                        .active_sources
+                        .values()
+                        .filter(|source| surface_key(source) == surface)
+                        .max_by_key(|source| matches!(source.kind, BridgeSourceKind::Audio { .. }))
+                    else {
+                        continue;
+                    };
+                    let position = hold.position.filter(|position| {
+                        self.tracks.values().any(|track| {
+                            track.surface_key == surface
+                                && track.track.id() == position.track_id
+                                && track.track.channel_generation().get()
+                                    == position.channel_generation
+                        })
+                    });
+                    self.hold_updates.insert(
+                        source.key,
+                        vivid_sdk::presenter::BridgeHoldSnapshot {
+                            decoder_reset_serial: source.decoder_reset_serial,
+                            held: hold.held,
+                            position_pts_us: position.map(|position| position.pts_us),
+                            estimated: position.is_none_or(|position| position.estimated),
+                        },
+                    );
+                }
                 SessionEvent::TargetChanged(payload) => {
                     self.session.apply_target_changed(&payload)?;
                     self.display = display_from_target(&self.session, self.display)?;
@@ -1820,6 +1982,16 @@ impl OuterBridge {
         vivid_sdk::presenter::BridgePositionSnapshot,
     )> {
         std::mem::take(&mut self.positions)
+    }
+
+    pub fn take_playback_holds(
+        &mut self,
+    ) -> Vec<(BridgeSourceKey, vivid_sdk::presenter::BridgeHoldSnapshot)> {
+        self.hold_updates.drain().collect()
+    }
+
+    pub fn take_source_errors(&mut self) -> Vec<(BridgeSourceKey, u64)> {
+        std::mem::take(&mut self.source_errors)
     }
 
     pub fn take_capability_changes(&mut self) -> Vec<CapabilityChange> {
@@ -1933,6 +2105,7 @@ impl OuterBridge {
                 eos_requested: false,
                 eos: false,
                 reported_eos_state: 0,
+                target_picture_ready: false,
             },
         );
         Ok(())
@@ -1954,6 +2127,85 @@ impl OuterBridge {
                 self.session.query_surface(surface)?;
             }
             self.surface_refresh.remove(&surface_key);
+        }
+        Ok(())
+    }
+
+    fn poll_retiring_surfaces(&mut self) -> io::Result<()> {
+        let mut running = self
+            .retiring_surfaces
+            .values()
+            .filter(|retired| retired.result.is_some())
+            .count();
+        let mut finished = Vec::new();
+        for (surface, retired) in &mut self.retiring_surfaces {
+            if retired.result.is_none() && running < 16 {
+                let query = self.session.track_pause_query_handle();
+                let track = retired.clock.track.clone();
+                let (send, receive) = mpsc::sync_channel(1);
+                thread::Builder::new()
+                    .name("vivid-hold-position".into())
+                    .spawn(move || {
+                        let result = query
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::Unsupported,
+                                    "physical hold requires a control connection",
+                                )
+                            })
+                            .and_then(|query| query(&track));
+                        let _ = send.send(result);
+                    })?;
+                retired.result = Some(receive);
+                running += 1;
+            }
+            if let Some(result) = &retired.result {
+                match result.try_recv() {
+                    Ok(status) => finished.push((*surface, status)),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished.push((*surface, Err(io::Error::other("hold observer stopped"))))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+        }
+        for (surface, result) in finished {
+            let retired = self
+                .retiring_surfaces
+                .remove(&surface)
+                .expect("pending retirement");
+            if let Ok(status) = result {
+                let job = retired.clock;
+                if status.channel_generation == job.track.channel_generation() {
+                    let clock_pts_us = status.playback_state.as_ref().and_then(|fields| {
+                        fields
+                            .iter()
+                            .find_map(|(key, value)| (*key == 4).then(|| value.as_i64()).flatten())
+                    });
+                    self.positions.retain(|(key, _)| *key != job.key);
+                    self.positions.push((
+                        job.key,
+                        vivid_sdk::presenter::BridgePositionSnapshot {
+                            decoder_reset_serial: job.decoder_reset_serial,
+                            playing: job.playing,
+                            start_pts_us: job.start_pts_us,
+                            state: 3,
+                            clock_pts_us,
+                            decoded_pts_us: status.last_decoded_pts_us,
+                            presented_pts_us: status.last_presented_pts_us,
+                            presentation_id: status.last_presentation_id,
+                        },
+                    ));
+                }
+            }
+            for track in retired.tracks {
+                let _ = track.channel.close();
+                self.session
+                    .destroy_track(&track.track, &RequestMetadata::default())?;
+            }
+            if let Some(handle) = self.surfaces.get(&surface) {
+                self.session.query_surface(handle)?;
+            }
         }
         Ok(())
     }
@@ -2183,10 +2435,16 @@ impl OuterBridge {
             .surfaces
             .keys()
             .copied()
-            .filter(|key| !desired_keys.contains(key))
+            .filter(|key| !desired_keys.contains(key) && !self.retiring_surfaces.contains_key(key))
             .collect::<Vec<_>>();
         for key in removed {
             self.surface_clock.remove(&key);
+            self.hold_serials.remove(&key);
+            self.hold_updates.retain(|source, _| {
+                source.producer != key.producer
+                    || source.context != key.context
+                    || source.surface != key.surface
+            });
             self.overlay_windows.remove(&key);
             self.overlay_revisions
                 .lock()
@@ -2268,6 +2526,7 @@ impl OuterBridge {
     }
 
     fn reconcile_nodes(&mut self, nodes: &[BridgeNode]) -> io::Result<()> {
+        self.desired_nodes = nodes.to_vec();
         let desired = nodes
             .iter()
             .map(|node| ((node.producer, node.node, node.fragment), node))
@@ -2299,13 +2558,24 @@ impl OuterBridge {
                 .map(|(id, _)| *id)
                 .map(Ok)
                 .unwrap_or_else(|| self.session.allocate_id())?;
-            let replacement = scene_node(
+            let mut replacement = scene_node(
                 self.session.info().root_context_id,
                 node_id,
                 surface,
                 node,
                 &self.target_profile,
             );
+            if self.active_sources.values().any(|source| {
+                surface_key(source) == node.surface
+                    && source.play_request.start_policy == 2
+                    && matches!(source.kind, BridgeSourceKind::Video { .. })
+                    && self
+                        .tracks
+                        .get(&source.key)
+                        .is_none_or(|track| !track.target_picture_ready)
+            }) {
+                replacement.visible = false;
+            }
             match self.nodes.get(&stable) {
                 Some((_, old)) if old == &replacement => {}
                 Some(_) => {
@@ -2322,6 +2592,16 @@ impl OuterBridge {
     }
 
     fn try_activate_surface_slots(&mut self, target_surface: BridgeSurfaceKey) -> io::Result<()> {
+        if self.incompatible_sources.keys().any(|key| {
+            key.producer == target_surface.producer
+                && key.context == target_surface.context
+                && key.surface == target_surface.surface
+        }) {
+            return Ok(());
+        }
+        if self.retiring_surfaces.contains_key(&target_surface) {
+            return Ok(());
+        }
         let active = self
             .active_sources
             .values()
@@ -2388,6 +2668,9 @@ impl OuterBridge {
     }
 
     fn try_start_surface(&mut self, key: BridgeSourceKey) -> io::Result<()> {
+        if self.incompatible_sources.contains_key(&key) {
+            return Ok(());
+        }
         let surface_key = self
             .tracks
             .get(&key)
@@ -2609,6 +2892,10 @@ impl OuterBridge {
                     presented_pts_us: status.last_presented_pts_us,
                     presentation_id: status.last_presentation_id,
                 };
+                track.target_picture_ready = track.published_play_request
+                    == Some(source.play_request)
+                    && status.milestones & vivid_sdk::MILESTONE_OUTPUT_READY != 0
+                    && status.last_decoded_pts_us >= source.play_request.start_pts_us;
                 // One latest observation per track, bounded by the session track reservation.
                 self.positions.retain(|(key, _)| *key != job.key);
                 self.positions.push((job.key, position));
@@ -2894,6 +3181,11 @@ impl Drop for OuterBridge {
         for track in self.tracks.values() {
             let _ = track.channel.close();
         }
+        for retired in self.retiring_surfaces.values() {
+            for track in &retired.tracks {
+                let _ = track.channel.close();
+            }
+        }
     }
 }
 
@@ -2942,6 +3234,13 @@ fn producer_config(
             ));
         }
     };
+    config.optional_profiles.extend([
+        registry::TIMED_MEDIA.into(),
+        registry::TIMED_MEDIA_SYNC.into(),
+    ]);
+    config
+        .optional_profiles
+        .retain(|profile| !config.required_profiles.contains(profile));
     config.optional_profiles.sort();
     config.optional_profiles.dedup();
     // These endpoints have already been resolved by the gateway's caller. Pin every native lane
@@ -3515,6 +3814,21 @@ fn signed(value: i64) -> Value {
     }
 }
 
+fn bridge_play_options(request: crate::presenter::BridgePlayRequest) -> vivid_sdk::PlayOptions {
+    vivid_sdk::PlayOptions {
+        start_pts_us: request.start_pts_us,
+        minimum_buffer_us: request.minimum_buffer_us.max(1),
+        maximum_latency_us: request.maximum_latency_us.max(1),
+        start_policy: if request.start_policy == 2 {
+            vivid_sdk::StartPolicy::Synchronized
+        } else {
+            vivid_sdk::StartPolicy::AfterMinimumBuffer
+        },
+        // A terminating gateway owns a distinct surface and hold serial domain.
+        hold_serial: None,
+    }
+}
+
 #[cfg(test)]
 fn default_play_request() -> crate::presenter::BridgePlayRequest {
     crate::presenter::BridgePlayRequest {
@@ -3525,6 +3839,7 @@ fn default_play_request() -> crate::presenter::BridgePlayRequest {
         late_policy: 1,
         loop_count: 0,
         start_policy: 1,
+        hold_serial: None,
     }
 }
 
@@ -3808,6 +4123,7 @@ mod tests {
             late_policy: 1,
             loop_count: 0,
             start_policy: 1,
+            hold_serial: None,
         };
         let video = BridgeSource {
             decoder_reset_serial: 1,
@@ -3940,6 +4256,7 @@ mod tests {
             late_policy: 1,
             loop_count: 0,
             start_policy: 1,
+            hold_serial: None,
         };
         let paused = BridgeSource {
             decoder_reset_serial: 1,
@@ -4184,6 +4501,7 @@ mod tests {
                     late_policy: 1,
                     loop_count: 0,
                     start_policy: 1,
+                    hold_serial: None,
                 },
                 eos_epoch: None,
                 causation_id: None,
@@ -4264,6 +4582,146 @@ mod tests {
                 .expect("the outer presenter lost the relayed track");
             (source.play_request.start_pts_us, source.playing)
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quitting_a_paused_owner_does_not_block_its_next_launch() {
+        paused_owner_replacement(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn correlated_paused_recovery_restores_a_clock_without_outer_history() {
+        paused_owner_replacement(true);
+    }
+
+    #[cfg(unix)]
+    fn paused_owner_replacement(paused_recovery: bool) {
+        let Some(mut fixture) = PausedSurfaceFixture::start("pause-quit-restart.sock") else {
+            return;
+        };
+        let mut other_surface = fixture.surface.clone();
+        other_surface.key.producer += 1;
+        let mut other = fixture.source.clone();
+        other.key.producer += 1;
+        let node = |surface: BridgeSurfaceKey| BridgeNode {
+            producer: surface.producer,
+            node: 9,
+            fragment: 0,
+            surface,
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            z_index: 0,
+            visible: true,
+            clip: crate::presenter::BridgeClipRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+            },
+        };
+        let other_node = node(other_surface.key);
+        fixture
+            .bridge
+            .rebuild(
+                &[fixture.surface.clone(), other_surface.clone()],
+                &[fixture.source.clone(), other.clone()],
+                &[node(fixture.surface.key), other_node.clone()],
+            )
+            .unwrap();
+        fixture.settle_activation(0);
+        let survivor = fixture
+            .bridge
+            .session
+            .query_surface(&fixture.bridge.surfaces[&other_surface.key])
+            .unwrap();
+        let survivor_track = fixture.bridge.outer_track_id(other.key).unwrap();
+        let survivor_node = fixture.bridge.nodes[&(other.key.producer, 9, 0)].clone();
+
+        // Quit while PAUSE is authoritative, then launch a new owner using the same local IDs.
+        fixture
+            .bridge
+            .rebuild(
+                std::slice::from_ref(&other_surface),
+                std::slice::from_ref(&other),
+                std::slice::from_ref(&other_node),
+            )
+            .unwrap();
+        let retired = fixture.surface.key;
+        fixture.surface.key.producer += 2;
+        fixture.source.key.producer += 2;
+        fixture.source.playing = !paused_recovery;
+        if paused_recovery {
+            fixture.source.play_request.start_pts_us = 2_000_000;
+            fixture.source.play_request.start_policy = 2;
+            fixture.source.play_request.hold_serial = Some(7);
+        }
+        fixture.packet_id = 0;
+        fixture
+            .bridge
+            .rebuild(
+                &[fixture.surface.clone(), other_surface.clone()],
+                &[fixture.source.clone(), other.clone()],
+                &[node(fixture.surface.key), other_node.clone()],
+            )
+            .unwrap();
+        fixture.settle_activation(fixture.source.play_request.start_pts_us);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fixture.bridge.retiring_surfaces.contains_key(&retired)
+            || if paused_recovery {
+                fixture.bridge.tracks[&fixture.key()].published_play_request
+                    != Some(fixture.source.play_request)
+            } else {
+                !fixture.bridge.tracks[&fixture.key()].playing
+            }
+        {
+            fixture.project();
+            fixture.bridge.take_media_completions();
+            fixture.bridge.retry_pending_activation().unwrap();
+            fixture.bridge.retry_pending_playback().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "paused quit stranded the new playback owner"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        if paused_recovery {
+            assert_eq!(fixture.outer_playback(), (2_000_000, false));
+        }
+        assert_eq!(
+            fixture.bridge.outer_track_id(other.key),
+            Some(survivor_track)
+        );
+        assert_eq!(
+            fixture.bridge.nodes[&(other.key.producer, 9, 0)],
+            survivor_node
+        );
+        assert_eq!(
+            fixture
+                .bridge
+                .session
+                .query_surface(&fixture.bridge.surfaces[&other_surface.key])
+                .unwrap()
+                .revision,
+            survivor.revision
+        );
+        let mut moved = other_node;
+        moved.x = 1;
+        fixture
+            .bridge
+            .update_nodes(&[node(fixture.surface.key), moved])
+            .unwrap();
+        assert_eq!(
+            fixture.bridge.nodes[&(other.key.producer, 9, 0)].0,
+            survivor_node.0
+        );
+        assert_ne!(
+            fixture.bridge.nodes[&(other.key.producer, 9, 0)].1,
+            survivor_node.1
+        );
     }
 
     /// Seeking while paused replaces the timed tracks and never publishes a `playing` edge the
@@ -4385,6 +4843,23 @@ mod tests {
             fixture.bridge.can_accept_media(key),
             "an exhausted pre-roll window walled off an activated paused source"
         );
+
+        // Exercise the socket writers and acknowledgements, rather than only the admission
+        // predicate: an activated generation must carry more than the old 32-record ceiling.
+        for _ in 0..64 {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !fixture.bridge.can_accept_media(key) {
+                let _ = fixture.bridge.take_media_completions();
+                assert!(
+                    Instant::now() < deadline,
+                    "activated pre-roll stopped making progress"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(fixture.submit_packet(0));
+            let _ = fixture.bridge.take_media_completions();
+        }
+        assert!(fixture.bridge.tracks[&key].media_submitted > 32);
 
         let track = fixture.bridge.tracks.get_mut(&key).unwrap();
         track.activated = false;
@@ -5062,6 +5537,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let configuration = track_configuration(&session, &surface, &source).unwrap();
