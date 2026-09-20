@@ -66,8 +66,8 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounded linked pre-roll forwarded before outer PLAY.
 ///
 /// One H.264 access unit may not produce output until reordered frames arrive. Keep the bounded
-/// round budget above the advertised reorder depth while testing readiness between rounds whose
-/// ingress capacity has actually been returned by the presenter.
+/// packet budget above the advertised reorder depth. Readiness is observed independently;
+/// waiting for a remote credit/query round trip per access unit multiplies decoder startup delay.
 const OUTER_TIMED_PREROLL_RECORDS: usize = 32;
 
 /// Revision bookkeeping for one surface's relayed overlay window.
@@ -173,11 +173,11 @@ struct OuterTrack {
     mode: TrackMode,
     /// Control-side mirror of [`OuterTrack::slot_activated`], read without atomic ordering.
     activated: bool,
+    /// Current-generation readiness observed independently of media forwarding.
+    output_ready: bool,
     media_inflight: usize,
     media_submitted: usize,
     media_completed: usize,
-    preplay_queried: usize,
-    preplay_limit: usize,
     preplay_ceiling: usize,
     /// Submission count at the last PAUSE, cleared by the following PLAY.
     ///
@@ -946,6 +946,7 @@ impl OuterBridge {
             return Err(invalid_data("outer decoder reset serial moved backward"));
         }
         track.decoder_reset_serial = decoder_reset_serial;
+        track.output_ready = false;
         if let Some(source) = self.active_sources.get_mut(&key) {
             source.decoder_reset_serial = decoder_reset_serial;
         }
@@ -1325,8 +1326,6 @@ impl OuterBridge {
                         track.resume_after_submission =
                             matches!(track.kind, BridgeSourceKind::Audio { .. })
                                 .then_some(track.media_submitted);
-                        track.preplay_queried = track.media_completed;
-                        track.preplay_limit = track.media_submitted.saturating_add(1);
                         track.preplay_ceiling = track
                             .media_submitted
                             .saturating_add(OUTER_TIMED_PREROLL_RECORDS);
@@ -1612,6 +1611,7 @@ impl OuterBridge {
     /// the relay waits only on `playing`, the audio writer parks on its first pre-roll record and
     /// never returns the credit that lets the browser's shared raster/audio worker continue.
     pub fn retry_pending_activation(&mut self) -> io::Result<()> {
+        self.poll_playback_progress();
         self.poll_retiring_surfaces()?;
         let surfaces = self.desired_surfaces.clone();
         self.remove_absent_surfaces(&surfaces)?;
@@ -1643,8 +1643,8 @@ impl OuterBridge {
     ///
     /// Timed tracks forward one bounded pre-roll window before outer PLAY. This avoids filling the
     /// video socket while still supplying enough reordered video and linked audio to become
-    /// output-ready. A pre-roll round completes only after the outer presenter returns its ingress
-    /// capacity; after PLAY, the per-track writer bound is the source-scoped boundary.
+    /// output-ready. Completed socket writes replenish the handoff; the authenticated channel
+    /// still enforces the presenter's byte/record credit without a per-packet ACK barrier.
     ///
     /// The window sizes that handshake and nothing more. Once the outer slot holds this track
     /// there is no readiness check left for media to run ahead of, the writer has already stopped
@@ -1652,7 +1652,7 @@ impl OuterBridge {
     /// that belongs there. Keeping the cumulative wall past activation is what strands a seek
     /// taken while paused: bringing a replacement generation up to the target its producer
     /// published takes a whole key-frame interval of decoder references, nothing raises
-    /// `preplay_limit` for an activated track, and the pane holds the wrong picture until the
+    /// pre-roll ceiling for an activated track, and the pane holds the wrong picture until the
     /// producer resumes.
     ///
     /// This does not admit the tail of a stream that merely stopped. Whether a paused producer's
@@ -1672,7 +1672,7 @@ impl OuterBridge {
         track.mode == TrackMode::Live
             || track.playing
             || track.activated
-            || (track.media_inflight == 0 && track.media_submitted < track.preplay_limit)
+            || (track.media_inflight == 0 && track.media_submitted < track.preplay_ceiling)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2093,11 +2093,10 @@ impl OuterBridge {
                 decoder_reset_serial: source.decoder_reset_serial,
                 mode,
                 activated: false,
+                output_ready: false,
                 media_inflight: 0,
                 media_submitted: 0,
                 media_completed: 0,
-                preplay_queried: 0,
-                preplay_limit: 1,
                 preplay_ceiling: OUTER_TIMED_PREROLL_RECORDS,
                 resume_after_submission: None,
                 published_play_request: None,
@@ -2617,24 +2616,16 @@ impl OuterBridge {
                 .tracks
                 .get(key)
                 .ok_or_else(|| invalid_data("active outer track is missing"))?;
-            let status = self.session.query_track(&track.track)?;
-            if status.milestones & vivid_sdk::MILESTONE_OUTPUT_READY == 0 {
-                // Slot activation needs decoded output, and a decoder routinely wants several
-                // access units before it emits its first picture. The bounded pre-roll allowance
-                // is what feeds it, and a blocked attempt is stable evidence that the records
-                // already forwarded were not enough - so admit one more, up to the ceiling this
-                // track declared. Without this the allowance and the readiness it is waiting for
-                // each wait on the other: the producer's atomic activation never lands, its flow
-                // is never returned, and the pane stops responding.
-                let track = self
-                    .tracks
-                    .get_mut(key)
-                    .ok_or_else(|| invalid_data("active outer track is missing"))?;
-                let next = track
-                    .media_submitted
-                    .saturating_add(1)
-                    .min(track.preplay_ceiling);
-                track.preplay_limit = track.preplay_limit.max(next);
+            let output_ready = if self.position_observer.is_some() {
+                track.output_ready
+            } else {
+                self.session.query_track(&track.track)?.milestones
+                    & vivid_sdk::MILESTONE_OUTPUT_READY
+                    != 0
+            };
+            if !output_ready {
+                // The observer must not put a remote round trip between media chunks or
+                // pre-roll packets. The bounded writer continues feeding the decoder meanwhile.
                 return Ok(());
             }
             bindings.push(SlotBinding {
@@ -2648,8 +2639,22 @@ impl OuterBridge {
             .surfaces
             .get(&target_surface)
             .ok_or_else(|| invalid_data("outer activation surface is missing"))?;
-        self.session
-            .activate_tracks(surface, &bindings, &RequestMetadata::default())?;
+        match self
+            .session
+            .activate_tracks(surface, &bindings, &RequestMetadata::default())
+        {
+            Ok(_) => {}
+            Err(error) if presenter_code(&error) == Some(messages::ERROR_BAD_STATE) => {
+                for key in &active {
+                    self.tracks
+                        .get_mut(key)
+                        .expect("active track exists")
+                        .output_ready = false;
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         let active = active.into_iter().collect::<HashSet<_>>();
         for (key, track) in self
             .tracks
@@ -2658,10 +2663,8 @@ impl OuterBridge {
         {
             let activated = active.contains(key);
             track.activated = activated;
-            // Before activation the writer paces one record at a time so readiness checks cannot
-            // overtake media. Afterwards per-track flow and the bridge's timed pre-roll limit are
-            // the source-scoped bounds; retaining stop-and-wait here deadlocks live audio and
-            // needlessly serializes raster updates.
+            // Static retained deliveries keep their ingress barrier until activation. Timed
+            // pre-roll uses channel flow and its packet ceiling independently of these queries.
             track.slot_activated.store(activated, Ordering::Release);
         }
         Ok(())
@@ -2750,20 +2753,12 @@ impl OuterBridge {
             // Every member needs at least one submitted pre-roll record before atomic activation.
             return Ok(());
         }
-        let completed_members = members
-            .iter()
-            .filter_map(|(member, _, _)| {
-                let track = &self.tracks[member];
-                (track.media_completed > track.preplay_queried).then_some(*member)
-            })
-            .collect::<HashSet<_>>();
-        let completed_progress = !completed_members.is_empty();
-        let output_may_have_advanced = members
-            .iter()
-            .any(|(member, _, _)| self.tracks[member].media_inflight != 0);
-        if !completed_progress && !output_may_have_advanced {
-            // A completed round, or an in-flight record that may already have decoded output, is
-            // the only new evidence on which another activation attempt can succeed.
+        self.poll_playback_progress();
+        if self.position_observer.is_some()
+            && members
+                .iter()
+                .any(|(member, _, _)| !self.tracks[member].output_ready)
+        {
             return Ok(());
         }
         let mut bindings = Vec::new();
@@ -2774,10 +2769,6 @@ impl OuterBridge {
                 expected_channel_generation: outer_track.channel_generation(),
                 required_milestone: vivid_sdk::MILESTONE_OUTPUT_READY,
             });
-        }
-        for (member, _, _) in &members {
-            let track = self.tracks.get_mut(member).expect("member still exists");
-            track.preplay_queried = track.media_completed;
         }
         let already_playing = self.tracks.get(&clock).is_some_and(|track| track.playing);
         if already_playing {
@@ -2794,30 +2785,13 @@ impl OuterBridge {
         {
             Ok(_) => {}
             Err(error) if presenter_code(&error) == Some(messages::ERROR_BAD_STATE) => {
-                // Media and control use independent connections. If the presenter has not
-                // observed enough pre-roll, a completed round may admit one more record per
-                // member. Do not expand on an in-flight-only retry: that record may already have
-                // produced OUTPUT_READY and be blocked waiting for this PLAY, and repeatedly
-                // enlarging the window would fill the writer queue behind it.
-                if completed_progress {
-                    for (member, outer_track, _) in &members {
-                        let status = self.session.query_track(outer_track)?;
-                        if !completed_members.contains(member)
-                            || status.milestones & vivid_sdk::MILESTONE_OUTPUT_READY != 0
-                        {
-                            continue;
-                        }
-                        // Expand only the member still missing output. Expanding an already-ready
-                        // video along with linked audio feeds it a subsequent decoded frame, which
-                        // Vivido intentionally holds until PLAY and recreates the activation wait
-                        // this loop is trying to resolve.
-                        let track = self.tracks.get_mut(member).expect("member still exists");
-                        let next = track
-                            .media_submitted
-                            .saturating_add(1)
-                            .min(track.preplay_ceiling);
-                        track.preplay_limit = track.preplay_limit.max(next);
-                    }
+                // Readiness can be invalidated by recovery between observation and activation.
+                // Re-observe without blocking media or widening its bounded pre-roll window.
+                for (member, _, _) in &members {
+                    self.tracks
+                        .get_mut(member)
+                        .expect("member still exists")
+                        .output_ready = false;
                 }
                 return Ok(());
             }
@@ -2876,46 +2850,48 @@ impl OuterBridge {
                 && source.playing == job.playing
                 && source.play_request.start_pts_us == job.start_pts_us
             {
-                let field = |key| {
-                    status
-                        .playback_state
-                        .as_ref()
-                        .and_then(|map| map.iter().find(|(k, _)| *k == key).map(|(_, value)| value))
-                };
-                let position = vivid_sdk::presenter::BridgePositionSnapshot {
-                    decoder_reset_serial: job.decoder_reset_serial,
-                    playing: job.playing,
-                    start_pts_us: job.start_pts_us,
-                    state: field(3).and_then(Value::as_u64).unwrap_or(0),
-                    clock_pts_us: field(4).and_then(Value::as_i64),
-                    decoded_pts_us: status.last_decoded_pts_us,
-                    presented_pts_us: status.last_presented_pts_us,
-                    presentation_id: status.last_presentation_id,
-                };
-                track.target_picture_ready = track.published_play_request
-                    == Some(source.play_request)
-                    && status.milestones & vivid_sdk::MILESTONE_OUTPUT_READY != 0
-                    && status.last_decoded_pts_us >= source.play_request.start_pts_us;
-                // One latest observation per track, bounded by the session track reservation.
-                self.positions.retain(|(key, _)| *key != job.key);
-                self.positions.push((job.key, position));
-                let eos = if status.milestones & vivid_sdk::MILESTONE_BUFFERED_ENDED != 0 {
-                    2
-                } else if status.milestones & vivid_sdk::MILESTONE_EOS_ACCEPTED != 0 {
-                    1
-                } else {
-                    0
-                };
-                if eos > track.reported_eos_state {
-                    track.reported_eos_state = eos;
-                    self.playback.push((
-                        job.key,
-                        PlaybackSnapshot {
-                            decoder_reset_serial: job.decoder_reset_serial,
-                            state: if job.playing { 2 } else { 1 },
-                            eos_state: eos,
-                        },
-                    ));
+                track.output_ready = status.milestones & vivid_sdk::MILESTONE_OUTPUT_READY != 0;
+                if track.mode == TrackMode::Timed {
+                    let field = |key| {
+                        status.playback_state.as_ref().and_then(|map| {
+                            map.iter().find(|(k, _)| *k == key).map(|(_, value)| value)
+                        })
+                    };
+                    let position = vivid_sdk::presenter::BridgePositionSnapshot {
+                        decoder_reset_serial: job.decoder_reset_serial,
+                        playing: job.playing,
+                        start_pts_us: job.start_pts_us,
+                        state: field(3).and_then(Value::as_u64).unwrap_or(0),
+                        clock_pts_us: field(4).and_then(Value::as_i64),
+                        decoded_pts_us: status.last_decoded_pts_us,
+                        presented_pts_us: status.last_presented_pts_us,
+                        presentation_id: status.last_presentation_id,
+                    };
+                    track.target_picture_ready = track.published_play_request
+                        == Some(source.play_request)
+                        && status.milestones & vivid_sdk::MILESTONE_OUTPUT_READY != 0
+                        && status.last_decoded_pts_us >= source.play_request.start_pts_us;
+                    // One latest observation per track, bounded by the session track reservation.
+                    self.positions.retain(|(key, _)| *key != job.key);
+                    self.positions.push((job.key, position));
+                    let eos = if status.milestones & vivid_sdk::MILESTONE_BUFFERED_ENDED != 0 {
+                        2
+                    } else if status.milestones & vivid_sdk::MILESTONE_EOS_ACCEPTED != 0 {
+                        1
+                    } else {
+                        0
+                    };
+                    if eos > track.reported_eos_state {
+                        track.reported_eos_state = eos;
+                        self.playback.push((
+                            job.key,
+                            PlaybackSnapshot {
+                                decoder_reset_serial: job.decoder_reset_serial,
+                                state: if job.playing { 2 } else { 1 },
+                                eos_state: eos,
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -2926,7 +2902,9 @@ impl OuterBridge {
         let mut keys: Vec<_> = self
             .tracks
             .iter()
-            .filter(|(_, t)| t.mode == TrackMode::Timed && t.activated)
+            .filter(|(_, t)| {
+                (t.mode == TrackMode::Timed && t.activated) || (!t.activated && !t.output_ready)
+            })
             .map(|(key, _)| *key)
             .collect();
         keys.sort_by_key(|key| (key.producer, key.context, key.surface, key.track));
@@ -3143,7 +3121,11 @@ fn run_outer_media_writer(
                 let result = writer
                     .forward_media(record_type, &body)
                     .and_then(|sequence| {
-                        if !writer.slot_activated.load(Ordering::Acquire) {
+                        if !matches!(
+                            writer.kind,
+                            BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
+                        ) && !writer.slot_activated.load(Ordering::Acquire)
+                        {
                             writer.channel.wait_for_reusable_media_capacity()?;
                         }
                         Ok(sequence)
@@ -4837,7 +4819,6 @@ mod tests {
 
         let track = fixture.bridge.tracks.get_mut(&key).unwrap();
         assert!(!track.playing, "the fixture source is not paused");
-        track.preplay_limit = track.media_submitted;
         track.preplay_ceiling = track.media_submitted;
         assert!(
             fixture.bridge.can_accept_media(key),
@@ -4887,7 +4868,7 @@ mod tests {
 
     /// Vrowser uses one live raster track and one live PCM track on the same surface. It activates
     /// both slots without PLAY and sends both kinds from one worker. Treating the audio as timed
-    /// leaves `preplay_limit` exhausted after its first packet; the next audio write then blocks
+    /// leaves the pre-roll allowance exhausted; the next audio write then blocks
     /// that worker before it can send another browser frame.
     #[test]
     #[cfg(unix)]
@@ -5113,34 +5094,14 @@ mod tests {
         assert_eq!(completed, HashSet::from([1, 2, 3, 4]));
     }
 
-    /// A decoder routinely wants several access units before it emits its first picture, and slot
-    /// activation waits on that picture. The bounded pre-roll allowance is the only thing that
-    /// feeds it, so if a blocked attempt is not itself the evidence that admits one more record,
-    /// the allowance and the readiness wait on each other: the nested producer's atomic activation
-    /// never lands, its flow is never returned, and its pane stops responding.
+    /// Decoder pre-roll must use granted credit without a control or returned-credit round trip
+    /// per packet, but it must still stop at the finite bootstrap ceiling before activation.
     #[test]
-    #[cfg(unix)]
-    fn a_blocked_slot_activation_admits_one_more_bounded_pre_roll_record() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("preroll.sock");
-        let listener = match TestSocketListener::bind(socket.clone()) {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                eprintln!("skipping pre-roll allowance socket test: {error}");
-                return;
-            }
-            Err(error) => panic!("pre-roll listener failed: {error}"),
-        };
-        let presenter = crate::presenter::VirtualVivid::start_eventless(
-            listener,
-            crate::presenter::MediaConfig::default(),
-        )
-        .unwrap();
-        presenter.update_metrics(7, 80, 24, (8, 16));
-        let secret = presenter.issue_pane_capability(7).unwrap();
+    fn decoder_pre_roll_uses_a_bounded_window_without_readiness_round_trips() {
+        let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
         let mut bridge = OuterBridge::connect(
-            format!("unix:{}", socket.display()),
-            Zeroizing::new(secret),
+            presenter.endpoint().into(),
+            Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
             DisplayMetrics::default(),
         )
         .unwrap();
@@ -5222,14 +5183,8 @@ mod tests {
         };
         bridge.rebuild(&[surface], &[video], &[node]).unwrap();
 
-        // Model a decoder that has not produced a picture yet: ask the outer presenter for a
-        // recovery unit above the epoch this pre-roll carries, so it consumes the record without
-        // reaching `MILESTONE_OUTPUT_READY`.
-        let outer_source = presenter.projection_snapshot(&HashSet::from([7])).sources[0].key;
-        assert_eq!(
-            presenter.request_keyframe(outer_source, Some(9), 5),
-            crate::KeyframeRequestOutcome::Forwarded
-        );
+        // The scripted peer never returns credit. Its initial grant is enough for this window;
+        // neither returned capacity nor a readiness query should gate the next packet.
 
         let body = media::video_packet_body(media::VideoPacket {
             epoch: 1,
@@ -5264,22 +5219,50 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert!(
-            !bridge.can_accept_media(video_key),
-            "the initial pre-roll grant is one record"
+            bridge.can_accept_media(video_key),
+            "pre-roll must not wait for a readiness query"
         );
-
-        bridge.retry_pending_activation().unwrap();
+        for packet_id in 2..=OUTER_TIMED_PREROLL_RECORDS as u64 {
+            assert!(bridge.can_accept_media(video_key));
+            let body = media::video_packet_body(media::VideoPacket {
+                epoch: 1,
+                packet_id,
+                pts_us: packet_id as i64 * 40_000,
+                dts_us: packet_id as i64 * 40_000,
+                duration_us: 40_000,
+                key: true,
+                data: &[0, 0, 0, 1, 0x65, 0x88],
+            })
+            .unwrap();
+            assert!(
+                bridge
+                    .media_chunk(
+                        packet_id,
+                        video_key,
+                        messages::VIDEO_PACKET,
+                        0,
+                        body.len() as u32,
+                        true,
+                        body
+                    )
+                    .unwrap()
+            );
+            while bridge.tracks[&video_key].media_inflight != 0 {
+                let _ = bridge.take_media_completions();
+                assert!(
+                    Instant::now() < deadline,
+                    "pre-roll stalled awaiting readiness"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
         assert!(
             !bridge.tracks[&video_key].activated,
-            "the outer track has no decoded output to activate on"
+            "no readiness observation has authorized activation"
         );
         assert!(
-            bridge.can_accept_media(video_key),
-            "a blocked activation must admit one more bounded pre-roll record, or the allowance and the readiness it feeds wait on each other"
-        );
-        assert!(
-            bridge.tracks[&video_key].preplay_limit <= bridge.tracks[&video_key].preplay_ceiling,
-            "the pre-roll allowance must stay inside the ceiling this track declared"
+            !bridge.can_accept_media(video_key),
+            "pre-roll must stop at its finite ceiling"
         );
     }
 

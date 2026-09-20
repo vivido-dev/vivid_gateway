@@ -352,6 +352,53 @@ fn audit_projection(producer: u64) -> (BridgeSurface, BridgeSource) {
 }
 
 #[test]
+fn slow_readiness_does_not_block_fragmented_media_for_other_owners() {
+    use vivid_sdk::testing::{Script, TargetKind, TestPresenter};
+
+    let script = Script::new();
+    let presenter = TestPresenter::start_with(
+        TargetKind::Terminal { columns: 80, rows: 24 }, script.clone(),
+    ).unwrap();
+    let mut bridge = OuterBridge::connect(
+        presenter.endpoint().into(),
+        Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
+        DisplayMetrics::default(),
+    ).unwrap();
+    let (a, mut x) = audit_projection(1);
+    let (b, mut y) = audit_projection(2);
+    bridge.rebuild(&[a, b], &[x.clone(), y.clone()], &[]).unwrap();
+    let previous = [x.clone(), y.clone()];
+    x.active = true;
+    y.active = true;
+    // This scripted presenter answers unsupported queries with OK. Hold that reply so the
+    // background request remains outstanding while both owners submit their fragmented media.
+    script.delay(messages::OK, Duration::from_millis(500));
+
+    let started = Instant::now();
+    bridge.update_playback(&previous, &[x.clone(), y.clone()]).unwrap();
+    bridge.retry_pending_activation().unwrap();
+    let body = media::raster_frame_body(1, 1, 16, 16, &[0x7f; 16 * 16 * 4]).unwrap();
+    for (index, chunk) in body.chunks(64).enumerate() {
+        let offset = index * 64;
+        for key in [x.key, y.key] {
+            bridge.media_chunk(1, key, messages::RASTER_FRAME,
+                offset as u32, body.len() as u32, offset + chunk.len() == body.len(), chunk.to_vec(),
+            ).unwrap();
+        }
+        bridge.retry_pending_activation().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250),
+            "readiness waited for a remote reply while the media was being assembled");
+    }
+    assert!(!bridge.pending.contains_key(&x.key));
+    assert_eq!(bridge.tracks[&x.key].media_submitted, 1);
+    assert!(!bridge.tracks[&x.key].activated, "activation must await authoritative readiness");
+
+    assert_eq!(bridge.tracks[&y.key].media_submitted, 1);
+    assert!(!bridge.tracks[&y.key].activated);
+    assert!(bridge.position_observer.as_ref().unwrap().busy);
+}
+
+#[test]
 fn assembly_checks_bounds_delivery_and_isolates_owners() {
     let mut bridge = audit_bridge();
     let (a, x) = audit_projection(1);

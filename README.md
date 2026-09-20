@@ -44,8 +44,15 @@ cargo clippy --all-targets -- -D warnings
 ## Playback position feedback
 
 The outer bridge has one bounded background TRACK_STATUS observer with one outstanding query,
-round-robin across active timed tracks at up to 20 queries per second. Control reconciliation and
-media forwarding do not wait on that observer. Results are checked against the source owner,
+round-robin across tracks awaiting activation and active timed tracks at up to 20 queries per
+second. Control reconciliation and media forwarding do not wait on that observer. In particular,
+assembling a fragmented image does not issue a synchronous query per chunk. Timed decoder pre-roll
+uses its existing 32-record bootstrap ceiling and authenticated per-channel credit; it does not
+wait for returned credit or a readiness round trip after every access unit. One pending writer
+handoff per inactive timed track and the existing bounded queues isolate backpressure. Static
+retained deliveries keep their ingress-capacity barrier until activation.
+
+Results are checked against the source owner,
 writer identity, channel generation, decoder-reset serial and current playback request before
 being forwarded as private `BridgePositionSnapshot` metadata. Session replacement and shutdown
 cancel outstanding observations and join the observer. Playback-ended observations share this
