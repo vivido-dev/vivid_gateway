@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,7 +40,119 @@ const SLOT_RASTER: u64 = 3;
 const SLOT_POSTER: u64 = 4;
 const SLOT_VECTOR: u64 = 5;
 type OverlayJob = Box<dyn FnOnce() -> io::Result<Vec<u8>> + Send>;
-type OverlayRevisions = Arc<Mutex<HashMap<BridgeSurfaceKey, VecDeque<(u64, u64)>>>>;
+type OverlayRevisions = Arc<RelayedScenes>;
+/// How long a scene-bound request waits for the outer presenter to put its scene on screen.
+///
+/// The inner presenter reports a scene presented once it holds it, which is before the outer one
+/// has composed the relayed copy; one outer frame is the usual wait.
+const OUTER_PRESENTATION_WAIT: Duration = Duration::from_secs(1);
+
+/// Which inner scene each relayed outer scene carries, and which one the outer presenter shows.
+#[derive(Default)]
+struct RelayedScenes {
+    windows: Mutex<HashMap<BridgeSurfaceKey, WindowScenes>>,
+    presented: Condvar,
+}
+
+#[derive(Default)]
+struct WindowScenes {
+    /// `(outer, inner)` revisions of the last 64 scenes relayed, oldest first.
+    revisions: VecDeque<(u64, u64)>,
+    /// The outer revision the outer presenter last reported presented.
+    presented: Option<u64>,
+}
+
+impl RelayedScenes {
+    fn lock(
+        &self,
+    ) -> io::Result<std::sync::MutexGuard<'_, HashMap<BridgeSurfaceKey, WindowScenes>>> {
+        self.windows
+            .lock()
+            .map_err(|_| io::Error::other("overlay revisions poisoned"))
+    }
+
+    fn record_presented(&self, key: BridgeSurfaceKey, outer: u64) -> io::Result<()> {
+        if let Some(window) = self.lock()?.get_mut(&key) {
+            window.presented = Some(outer);
+            self.presented.notify_all();
+        }
+        Ok(())
+    }
+
+    /// Forget one window's scenes, or every window's, releasing anyone waiting on them.
+    fn retire(&self, key: Option<BridgeSurfaceKey>) {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match key {
+            Some(key) => {
+                windows.remove(&key);
+            }
+            None => windows.clear(),
+        }
+        self.presented.notify_all();
+    }
+
+    /// The outer revision relaying `inner`, once the outer presenter has it on screen.
+    ///
+    /// A semantic tree or editor caret names the scene it describes, and the outer host refuses
+    /// one whose scene it is not showing. Forwarding as soon as the inner presenter holds the
+    /// scene would race the outer composition, so this waits for the outer presentation outcome
+    /// and fails at once when a later relayed scene replaced it.
+    fn wait_presented(
+        &self,
+        key: BridgeSurfaceKey,
+        inner: u64,
+        timeout: Duration,
+    ) -> io::Result<u64> {
+        let deadline = Instant::now() + timeout;
+        let mut windows = self.lock()?;
+        loop {
+            // A window this bridge relays nothing for, or stopped relaying, has no scene to wait on.
+            let window = windows
+                .get(&key)
+                .ok_or_else(|| invalid_data("outer scene revision is unavailable"))?;
+            match window
+                .revisions
+                .iter()
+                .rposition(|(_, relayed)| *relayed == inner)
+            {
+                Some(index) => {
+                    let outer = window.revisions[index].0;
+                    if window.presented == Some(outer) {
+                        return Ok(outer);
+                    }
+                    if window
+                        .revisions
+                        .range(index + 1..)
+                        .any(|(later, _)| window.presented == Some(*later))
+                    {
+                        return Err(invalid_data("outer scene was replaced before presentation"));
+                    }
+                }
+                // Inner revisions only advance, so a later one relayed means this one never will be.
+                None if window.revisions.iter().any(|(_, relayed)| *relayed > inner) => {
+                    return Err(invalid_data("outer scene revision is unavailable"));
+                }
+                None => {}
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "outer scene was not presented in time",
+                ));
+            }
+            windows = self
+                .presented
+                .wait_timeout(windows, remaining)
+                .map_err(|_| io::Error::other("overlay revisions poisoned"))?
+                .0;
+        }
+    }
+}
+
 #[derive(Default)]
 struct OverlayLayouts {
     live: HashSet<BridgeSurfaceKey>,
@@ -380,6 +492,16 @@ impl OuterBridge {
                         Some(messages::Envelope::new(0, environment.payload()?).encode()?);
                     continue;
                 }
+                vivid_sdk::OverlayLaneEvent::Outcome(outcome) => {
+                    if outcome.outcome
+                        == vivid_protocol::overlay::wire::PresentationOutcome::Presented
+                        && let Some(key) = self.outer_surface_key(&outcome.submission.address)
+                    {
+                        self.overlay_revisions
+                            .record_presented(key, outcome.submission.revision)?;
+                    }
+                    continue;
+                }
                 vivid_sdk::OverlayLaneEvent::Accessibility {
                     address,
                     scene_revision,
@@ -398,27 +520,22 @@ impl OuterBridge {
                 }
                 _ => continue,
             };
-            let Some((key, _)) = self.surfaces.iter().find(|(_, surface)| {
-                surface.id() == event.address.surface_id
-                    && surface.context_id() == event.address.context_id
-                    && surface.generation().get() == event.address.generation
-            }) else {
+            let Some(key) = self.outer_surface_key(&event.address) else {
                 continue;
             };
-            let Some(window) = self.overlay_windows.get(key) else {
+            let Some(window) = self.overlay_windows.get(&key) else {
                 continue;
             };
-            let revisions = self
-                .overlay_revisions
-                .lock()
-                .map_err(|_| io::Error::other("overlay revisions poisoned"))?;
             let revision = if event.scene_revision == 0 {
                 0
             } else {
-                let Some(revision) = revisions
-                    .get(key)
-                    .and_then(|revisions| {
-                        revisions
+                let Some(revision) = self
+                    .overlay_revisions
+                    .lock()?
+                    .get(&key)
+                    .and_then(|window| {
+                        window
+                            .revisions
                             .iter()
                             .find(|(outer, _)| *outer == event.scene_revision)
                     })
@@ -443,9 +560,21 @@ impl OuterBridge {
                 )
                 .map_err(io::Error::other)?;
             }
-            events.push((*key, messages::Envelope::new(0, event.payload()?).encode()?));
+            events.push((key, messages::Envelope::new(0, event.payload()?).encode()?));
         }
         Ok(events)
+    }
+
+    /// The inner surface an outer window address belongs to.
+    fn outer_surface_key(&self, address: &WindowAddress) -> Option<BridgeSurfaceKey> {
+        self.surfaces
+            .iter()
+            .find(|(_, surface)| {
+                surface.id() == address.surface_id
+                    && surface.context_id() == address.context_id
+                    && surface.generation().get() == address.generation
+            })
+            .map(|(key, _)| *key)
     }
 
     pub fn take_overlay_environment(&mut self) -> Option<Vec<u8>> {
@@ -571,11 +700,11 @@ impl OuterBridge {
                     )?;
                     query.address = address;
                     query.scene_revision = overlay_revisions
-                        .lock()
-                        .map_err(|_| io::Error::other("overlay revisions poisoned"))?
+                        .lock()?
                         .get(&request.surface)
-                        .and_then(|values| {
-                            values
+                        .and_then(|window| {
+                            window
+                                .revisions
                                 .iter()
                                 .rev()
                                 .find(|(_, inner)| *inner == query.scene_revision)
@@ -650,12 +779,24 @@ impl OuterBridge {
                 }
                 messages::SET_OVERLAY_EDITOR | messages::SET_OVERLAY_SEMANTICS => {
                     let map_revision = |inner| -> io::Result<u64> {
+                        // Presentation outcomes arrive on the outer input lane. Without one the
+                        // relayed scene can only be named, not waited for.
+                        if input.is_some() {
+                            return overlay_revisions.wait_presented(
+                                request.surface,
+                                inner,
+                                OUTER_PRESENTATION_WAIT,
+                            );
+                        }
                         overlay_revisions
-                            .lock()
-                            .map_err(|_| io::Error::other("overlay revisions poisoned"))?
+                            .lock()?
                             .get(&request.surface)
-                            .and_then(|values| {
-                                values.iter().rev().find(|(_, revision)| *revision == inner)
+                            .and_then(|window| {
+                                window
+                                    .revisions
+                                    .iter()
+                                    .rev()
+                                    .find(|(_, revision)| *revision == inner)
                             })
                             .map(|(outer, _)| *outer)
                             .ok_or_else(|| invalid_data("outer scene revision is unavailable"))
@@ -1141,16 +1282,14 @@ impl OuterBridge {
         let replaced = std::mem::replace(&mut self.session, session);
         // Drop cancels the retired SDK transport without waiting for GOODBYE.
         drop(replaced);
+        // Before joining the request workers: one waiting on a retired scene is released by this.
+        self.overlay_revisions.retire(None);
         self.retire_overlay_jobs();
         let microphone_requests = self.microphones.requests();
         self.microphones = crate::microphone::Microphones::default();
         self.display = display;
         self.surfaces.clear();
         self.overlay_input.take();
-        self.overlay_revisions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
         self.overlay_windows.clear();
         *self
             .overlay_layouts
@@ -2445,10 +2584,7 @@ impl OuterBridge {
                     || source.surface != key.surface
             });
             self.overlay_windows.remove(&key);
-            self.overlay_revisions
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&key);
+            self.overlay_revisions.retire(Some(key));
             {
                 let mut layouts = self
                     .overlay_layouts
@@ -2983,11 +3119,8 @@ impl OuterMediaWriter {
                 let inner_revision = vivid_protocol::vector::Frame::decode(body)
                     .map_err(|error| invalid_data(error.0))?
                     .revision;
-                let mut mappings = self
-                    .overlay_revisions
-                    .lock()
-                    .map_err(|_| io::Error::other("overlay revisions poisoned"))?;
-                let revisions = mappings.entry(key).or_default();
+                let mut mappings = self.overlay_revisions.lock()?;
+                let revisions = &mut mappings.entry(key).or_default().revisions;
                 if revisions.len() == 64 {
                     revisions.pop_front();
                 }
@@ -3865,6 +3998,64 @@ fn source_is_effectively_playing(
 mod tests {
     use super::*;
     use crate::presenter::BridgePlayRequest;
+
+    #[test]
+    fn a_scene_bound_request_waits_for_its_own_owners_presentation() {
+        // Two producers reusing the same local context and surface IDs.
+        let first = BridgeSurfaceKey {
+            producer: 1,
+            context: 1,
+            surface: 1,
+        };
+        let second = BridgeSurfaceKey {
+            producer: 2,
+            ..first
+        };
+        let scenes = RelayedScenes::default();
+        for key in [first, second] {
+            scenes
+                .lock()
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .revisions
+                .extend([(1, 10), (2, 11)]);
+        }
+        let short = Duration::from_millis(20);
+
+        // Another owner's presentation of the same numbers releases nothing.
+        scenes.record_presented(second, 1).unwrap();
+        let waited = scenes.wait_presented(first, 10, short).unwrap_err();
+        assert_eq!(waited.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(scenes.wait_presented(second, 10, short).unwrap(), 1);
+
+        // A waiter is released by its own presentation, not by polling.
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| scenes.wait_presented(first, 11, Duration::from_secs(5)));
+            std::thread::sleep(short);
+            scenes.record_presented(first, 2).unwrap();
+            assert_eq!(waiter.join().unwrap().unwrap(), 2);
+        });
+
+        // Once a later scene is shown, an earlier one never will be, and an inner revision the
+        // relay skipped never will be either.
+        let replaced = scenes.wait_presented(first, 10, Duration::from_secs(5));
+        assert_eq!(replaced.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let skipped = scenes.wait_presented(first, 9, Duration::from_secs(5));
+        assert_eq!(skipped.unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        // Retiring one owner's window releases its waiter and leaves the other owner's intact.
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| scenes.wait_presented(first, 12, Duration::from_secs(5)));
+            std::thread::sleep(short);
+            scenes.retire(Some(first));
+            assert_eq!(
+                waiter.join().unwrap().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        });
+        assert_eq!(scenes.wait_presented(second, 10, short).unwrap(), 1);
+    }
 
     #[test]
     fn native_outer_config_pins_lane_fallbacks_to_its_control_presenter() {

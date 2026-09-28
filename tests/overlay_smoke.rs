@@ -455,6 +455,101 @@ fn child_modal_and_pointer_capture_cross_the_gateway() -> io::Result<()> {
     Ok(())
 }
 
+/// The inner presenter reports a scene presented as soon as it holds it, which is before the outer
+/// presenter has shown the relayed copy. A semantic tree names its scene, and the outer host
+/// refuses one for a scene it is not showing, so the relay must hold the tree until the outer
+/// presenter reports that scene on screen — forwarding at once is what made a described window
+/// inside vvmux fail with "outer overlay host refused request".
+#[test]
+fn semantics_wait_for_the_outer_presenter_to_show_their_scene() -> io::Result<()> {
+    use vivid_sdk::overlay::{SemanticNode, SemanticRole, Semantics};
+
+    let listener = TcpPresenterListener::bind()?;
+    let endpoint = listener.endpoint();
+    let mut config = PresenterConfig::terminal_with_overlay(MediaConfig::default());
+    config
+        .supported_profiles
+        .push(vivid_protocol::registry::OVERLAY_A11Y.into());
+    let outer = VirtualVivid::start_configured_eventless(listener, config)?;
+    let mut relay = bridge(&endpoint, &pane(&outer, 9)?)?;
+    let (inner, endpoint) = overlay_presenter()?;
+    inner.enable_overlay_host_relay();
+    inner.set_overlay_host_profiles(&relay.overlay_host_profiles());
+    let producer = overlay_producer(&endpoint, &pane(&inner, 1)?, "described")?;
+    let window = window_of(&producer, 0., 0.)?;
+    let submission = window.submit(scene(1))?;
+    assert_eq!(
+        submission.wait(Duration::from_secs(5))?,
+        Some(vivid_sdk::overlay::PresentationOutcome::Presented),
+        "the inner presenter reports the scene presented once it holds it"
+    );
+    let projection = snapshot(&inner, &[1]).bridge_projection();
+    relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
+    for source in snapshot(&inner, &[1]).sources {
+        for (kind, body) in source.retained_vector {
+            relay.media_chunk(
+                0,
+                source.key,
+                kind,
+                0,
+                body.len() as u32,
+                true,
+                body.to_vec(),
+            )?;
+            finish_delivery(&inner, &mut relay, 0)?;
+        }
+    }
+    let semantics = Semantics {
+        scene_revision: submission.revision(),
+        nodes: vec![SemanticNode {
+            id: 1,
+            role: SemanticRole::Button,
+            bounds: Rect::new(0., 0., 120., 60.).unwrap(),
+            label: "Increment".into(),
+            numeric: None,
+            level: None,
+            set: None,
+            toggled: None,
+            disabled: false,
+            actions: Vec::new(),
+            children: Vec::new(),
+        }],
+    };
+    std::thread::scope(|scope| -> io::Result<()> {
+        let described = scope.spawn(|| window.set_semantics(&semantics));
+        // Serviced on a worker as the foreground client does, while the outer presenter's
+        // presentation outcome sits undrained on the bridge's lane.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut started = false;
+        while !started {
+            for request in inner.take_overlay_host_requests() {
+                relay.start_overlay_host_request(request)?;
+                started = true;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "semantics never reached the relay"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            relay.take_overlay_host_replies().is_empty(),
+            "semantics were forwarded before the outer presenter reported their scene"
+        );
+        while !described.is_finished() {
+            assert!(relay.take_overlay_input()?.is_empty());
+            for (id, response) in relay.take_overlay_host_replies() {
+                inner
+                    .complete_overlay_host_request(id, response.map_err(|error| error.to_string()));
+            }
+            assert!(Instant::now() < deadline, "semantics never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        described.join().unwrap()
+    })
+}
+
 /// An ordinary raster producer, so a pane running one can be shown to keep going while a pane
 /// running an overlay is withdrawn.
 fn raster_producer(endpoint: &str, secret: &str, name: &str) -> io::Result<Session> {
