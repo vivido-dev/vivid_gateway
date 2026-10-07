@@ -58,6 +58,10 @@ being forwarded as private `BridgePositionSnapshot` metadata. Session replacemen
 cancel outstanding observations and join the observer. Playback-ended observations share this
 worker. No protocol assignments or media wire formats change.
 
+For retained images, EOS waits until the current outer writer has accepted its complete image
+body. A projection snapshot can precede the requested retained replay; an empty foreground queue
+alone does not prove that replay has arrived. This gate is per owner and writer generation.
+
 EOS completion is reported by the background physical-status observer. The foreground bridge
 never synchronously drains a track after EOS; paused audio must leave seek/resume control live.
 
