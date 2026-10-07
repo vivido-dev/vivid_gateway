@@ -1695,6 +1695,12 @@ impl OuterBridge {
             .filter_map(|(key, track)| {
                 (track.eos_requested
                     && !track.eos
+                    // Retained image replay is requested after projection acknowledgement and
+                    // may not have reached the foreground queue yet. An empty queue therefore
+                    // does not prove the image body preceded EOS. This writer generation must
+                    // have accepted its complete IMAGE_DATA before its channel can end.
+                    && (!matches!(track.kind, BridgeSourceKind::Image { .. })
+                        || track.media_submitted != 0)
                     && !blocked.contains(key)
                     && !self.pending.contains_key(key))
                 .then_some(*key)
@@ -5039,6 +5045,135 @@ mod tests {
             !fixture.bridge.can_accept_media(key),
             "pre-PLAY pre-roll stopped being bounded before activation"
         );
+    }
+
+    #[test]
+    fn image_eos_waits_for_delayed_retained_body_without_blocking_another_owner() {
+        let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
+        let mut bridge = OuterBridge::connect(
+            presenter.endpoint().to_owned(),
+            Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.to_owned()),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+        let image = [0_u8; 4];
+        let surface = |producer| BridgeSurface {
+            overlay_window: None,
+            overlay_layouts: Vec::new(),
+            key: BridgeSurfaceKey {
+                producer,
+                context: 1,
+                surface: 1,
+            },
+            logical_width: 1,
+            logical_height: 1,
+            capture_policy: 0,
+            descriptor: crate::presenter::BridgeSourceDescriptor {
+                role: 1,
+                title: String::new(),
+                content_revision: 1,
+                semantic_availability: 0,
+                locator: String::new(),
+            },
+        };
+        let source = |producer| BridgeSource {
+            key: BridgeSourceKey {
+                producer,
+                context: 1,
+                surface: 1,
+                track: 1,
+            },
+            kind: BridgeSourceKind::Image {
+                encoding: 1,
+                width: 1,
+                height: 1,
+                encoded_length: 4,
+                sha256: None,
+            },
+            decoder_reset_serial: 1,
+            live: true,
+            active: false,
+            audio_gain: None,
+            capture_policy: 0,
+            descriptor: None,
+            playing: false,
+            play_request: default_play_request(),
+            eos_epoch: None,
+            causation_id: None,
+        };
+        let sources = vec![source(11), source(12)];
+        bridge
+            .rebuild(&[surface(11), surface(12)], &sources, &[])
+            .unwrap();
+        let mut ended = sources.clone();
+        for source in &mut ended {
+            source.eos_epoch = Some(0);
+        }
+        bridge.update_playback(&sources, &ended).unwrap();
+
+        // Projection/EOS can arrive before the requested retained body enters any client queue.
+        bridge.flush_pending_eos(&HashSet::new());
+        for source in &sources {
+            assert!(
+                bridge.can_accept_media(source.key),
+                "EOS closed an unhydrated image"
+            );
+        }
+        let delayed = sources[0].key;
+        let other = sources[1].key;
+        assert!(
+            bridge
+                .media_chunk(2, other, messages::IMAGE_DATA, 0, 4, true, image.to_vec())
+                .unwrap()
+        );
+        bridge.flush_pending_eos(&HashSet::new());
+        assert!(bridge.can_accept_media(delayed));
+        assert!(bridge.tracks[&other].eos);
+
+        // A partial body is still not evidence that this channel can end.
+        assert!(
+            !bridge
+                .media_chunk(
+                    1,
+                    delayed,
+                    messages::IMAGE_DATA,
+                    0,
+                    4,
+                    false,
+                    image[..2].to_vec()
+                )
+                .unwrap()
+        );
+        bridge.flush_pending_eos(&HashSet::new());
+        assert!(bridge.can_accept_media(delayed));
+        assert!(
+            bridge
+                .media_chunk(
+                    1,
+                    delayed,
+                    messages::IMAGE_DATA,
+                    2,
+                    4,
+                    true,
+                    image[2..].to_vec()
+                )
+                .unwrap()
+        );
+        bridge.flush_pending_eos(&HashSet::new());
+
+        // Observe the actual independent channels, not just the bridge's EOS bookkeeping.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let channels = presenter.channels();
+            if channels.len() == 2 && channels.iter().all(|channel| channel.media_records == 1) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "EOS overtook an owner's IMAGE_DATA: {channels:?}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[test]
