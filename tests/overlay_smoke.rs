@@ -13,8 +13,8 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use vivid_gateway::{
-    BridgeSurface, DisplayMetrics, MediaConfig, OuterBridge, PresenterConfig, PresenterListener,
-    ProjectionSnapshot, VirtualVivid,
+    BridgeSourceKey, BridgeSurface, DisplayMetrics, MediaConfig, OuterBridge, PresenterConfig,
+    PresenterListener, ProjectionSnapshot, VirtualVivid,
 };
 use vivid_protocol::cbor::Value;
 use vivid_sdk::overlay::{Brush, Canvas, Color, Path, Rect, WindowMode};
@@ -258,12 +258,7 @@ fn measured_layouts_and_image_assets_survive_a_replaced_outer_session() -> io::R
         frame.body,
     )?;
     finish_delivery(&inner, &mut relay, frame.delivery_id)?;
-    let drawn = snapshot(&outer, &[9])
-        .sources
-        .into_iter()
-        .find_map(|source| source.retained)
-        .expect("outer scene");
-    let first = vivid_protocol::vector::Frame::decode(&drawn).unwrap();
+    let (first_source, first) = outer_frame(&outer, 9, |_, _| true);
     let outer_layout = match first.canvas.commands()[0] {
         vivid_sdk::overlay::Command::TextLayout { layout, .. } => layout,
         _ => panic!("missing text layout"),
@@ -287,12 +282,8 @@ fn measured_layouts_and_image_assets_survive_a_replaced_outer_session() -> io::R
         )?;
         finish_delivery(&inner, &mut relay, 0)?;
     }
-    let drawn = snapshot(&outer, &[9])
-        .sources
-        .into_iter()
-        .find_map(|source| source.retained)
-        .expect("restored outer scene");
-    let restored = vivid_protocol::vector::Frame::decode(&drawn).unwrap();
+    // The replaced session's scene may linger until the outer presenter tears that session down.
+    let (_, restored) = outer_frame(&outer, 9, |source, _| source != first_source);
     assert_eq!(restored.canvas.commands().len(), 2);
     assert_ne!(
         restored.canvas.commands()[0],
@@ -300,6 +291,36 @@ fn measured_layouts_and_image_assets_survive_a_replaced_outer_session() -> io::R
         "replacement must shape and remap the retained layout again"
     );
     Ok(())
+}
+
+/// The first retained vector frame on the outer presenter that `accept` takes, with its source.
+///
+/// A relayed delivery completes once the outer session has written the record, not once the outer
+/// presenter has applied it, so a snapshot taken straight after [`finish_delivery`] can still show
+/// no scene, or the one before, on a loaded machine.
+fn outer_frame(
+    outer: &VirtualVivid,
+    pane: u64,
+    accept: impl Fn(BridgeSourceKey, &vivid_protocol::vector::Frame) -> bool,
+) -> (BridgeSourceKey, vivid_protocol::vector::Frame) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let found = snapshot(outer, &[pane])
+            .sources
+            .into_iter()
+            .find_map(|source| {
+                let frame = vivid_protocol::vector::Frame::decode(&source.retained?).unwrap();
+                accept(source.key, &frame).then_some((source.key, frame))
+            });
+        if let Some(found) = found {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "outer presenter never retained the expected scene"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn finish_delivery(inner: &VirtualVivid, relay: &mut OuterBridge, expected: u64) -> io::Result<()> {
@@ -1065,17 +1086,8 @@ fn one_overlay_producer_closing_leaves_the_other_reusing_the_same_ids_intact() -
         frame.to_vec(),
     )?;
     finish_delivery(&inner, &mut relay, 0)?;
-    let painted = snapshot(&outer, &[OUTER_PANE])
-        .sources
-        .remove(0)
-        .retained
-        .unwrap();
-    assert_eq!(
-        vivid_protocol::vector::Frame::decode(&painted)
-            .unwrap()
-            .canvas,
-        second_scene
-    );
+    // Waiting for the new display list is the assertion: the first one is retained until it lands.
+    outer_frame(&outer, OUTER_PANE, |_, frame| frame.canvas == second_scene);
     let moved = hosted_window(&outer, &[OUTER_PANE]);
     assert_eq!((moved.x, moved.y), (30, 40));
     assert!(moved.revision > held.revision);
