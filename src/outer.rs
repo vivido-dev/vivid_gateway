@@ -2542,11 +2542,11 @@ impl OuterBridge {
                             .surfaces
                             .get(&parent)
                             .ok_or_else(|| invalid_data("overlay parent is absent"))?;
-                        vivid_protocol::identity::SessionIdentity {
-                            presenter: vivid_protocol::identity::PresenterInstanceId([0; 16]),
-                            session_id: self.session.info().session_id,
-                        }
-                        .context(parent.context_id())
+                        vivid_protocol::identity::SessionIdentity::new(
+                            vivid_protocol::identity::PresenterInstanceId([0; 16]),
+                            self.session.info().session_id,
+                        )
+                        .and_then(|session| session.context(parent.context_id()))
                         .and_then(|context| context.surface(parent.id()))
                         .map_err(io::Error::other)
                     })

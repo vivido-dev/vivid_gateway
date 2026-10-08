@@ -4,13 +4,11 @@ use vivid_gateway::{
     BridgeClipRect, BridgeNode, BridgeSourceDescriptor, BridgeSurface, BridgeSurfaceKey,
     DisplayMetrics, MediaConfig, OuterBridge, PresenterConfig, VirtualVivid,
 };
-use vivid_protocol::auth::{
-    Secret32, channel_tag, derive_session_keys, extract_handshake_prk, verify_tag,
-};
+use vivid_protocol::auth::{Secret32, SessionKeys, derive_session_keys, extract_handshake_prk};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::geometry::Rotation;
 use vivid_protocol::media;
-use vivid_protocol::messages;
+use vivid_protocol::messages::{self, ChannelOpen, TrackKind};
 use vivid_protocol::surface::POLICY_DENY_CAPTURE;
 use vivid_protocol::target::{DesktopTarget, OutputDescriptor};
 use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
@@ -442,12 +440,27 @@ fn terminating_hops_derive_independent_channel_authenticators() -> io::Result<()
     };
     let inner_keys = derive(&inner_root);
     let outer_keys = derive(&outer_root);
-    let inner_tag = channel_tag(inner_keys.channel_key(), 1, 1, 1, 1, 1, 1, 4, &[4; 16]);
-    let outer_tag = channel_tag(outer_keys.channel_key(), 1, 1, 1, 1, 1, 1, 4, &[4; 16]);
-    assert!(verify_tag(&inner_tag, &inner_tag));
-    assert!(verify_tag(&outer_tag, &outer_tag));
-    assert!(!verify_tag(&inner_tag, &outer_tag));
-    assert!(!verify_tag(&outer_tag, &inner_tag));
+    let open = |keys: &SessionKeys| {
+        let mut open = ChannelOpen {
+            session_id: 1,
+            context_id: 1,
+            surface_id: 1,
+            track_id: 1,
+            channel_generation: 1,
+            track_kind: TrackKind::Video,
+            lane: LaneClass::Bulk,
+            client_nonce: [4; 16],
+            authentication_tag: [0; 16],
+        };
+        open.sign(keys.channel_key());
+        open
+    };
+    let inner_open = open(&inner_keys);
+    let outer_open = open(&outer_keys);
+    assert!(inner_open.verify(inner_keys.channel_key()));
+    assert!(outer_open.verify(outer_keys.channel_key()));
+    assert!(!inner_open.verify(outer_keys.channel_key()));
+    assert!(!outer_open.verify(inner_keys.channel_key()));
     Ok(())
 }
 
