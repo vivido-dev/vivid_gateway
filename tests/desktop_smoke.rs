@@ -1,9 +1,11 @@
+//! Desktop targets and microphones crossing the terminating gateway over real sockets.
+//!
+//! Each test drives a real producer through an inner presenter and the gateway's outer session
+//! to a second presenter, checking that both hops stay independently authenticated and owned.
+
 use std::io;
 
-use vivid_gateway::{
-    BridgeClipRect, BridgeNode, BridgeSourceDescriptor, BridgeSurface, BridgeSurfaceKey,
-    DisplayMetrics, MediaConfig, OuterBridge, PresenterConfig, VirtualVivid,
-};
+use vivid_gateway::{MicrophonePacket, OuterBridge};
 use vivid_protocol::auth::{Secret32, SessionKeys, derive_session_keys, extract_handshake_prk};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::geometry::Rotation;
@@ -11,13 +13,16 @@ use vivid_protocol::media;
 use vivid_protocol::messages::{self, ChannelOpen, TrackKind};
 use vivid_protocol::surface::POLICY_DENY_CAPTURE;
 use vivid_protocol::target::{DesktopTarget, OutputDescriptor};
+use vivid_sdk::presenter::{
+    BridgeClipRect, BridgeNode, BridgeSourceDescriptor, BridgeSurface, BridgeSurfaceKey,
+    DisplayMetrics, MediaConfig, PresenterConfig, VirtualVivid,
+};
 use vivid_sdk::testing::{ROOT_SECRET_HEX, TestPresenter};
 use vivid_sdk::{
     CoordinateModel, Fit, KindConfiguration, LaneClass, ProducerAuthentication, ProducerConfig,
     RasterConfiguration, RequestMetadata, SceneNode, Session, SurfaceDefinition, SurfaceDescriptor,
     SurfaceRole, TrackConfiguration, TrackMode,
 };
-use zeroize::Zeroizing;
 
 mod common;
 
@@ -107,13 +112,14 @@ fn microphone_crosses_two_authenticated_sessions_without_crossing_owners() -> io
     assert_ne!(requests[0].source.producer, requests[1].source.producer);
     outer.update_metrics(1, 80, 24, (8, 16));
     let secret = outer.issue_pane_capability(1)?;
-    let mut bridge = OuterBridge::connect_native(
-        outer.endpoint(),
-        Some(outer.endpoint()),
-        Some(outer.endpoint()),
-        Zeroizing::new(secret),
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(&secret).unwrap(),
         DisplayMetrics::default(),
-    )?;
+    )
+    .control_endpoint(outer.endpoint())
+    .realtime_endpoint(outer.endpoint())
+    .bulk_endpoint(outer.endpoint())
+    .build()?;
     bridge.sync_microphones(&requests)?;
     while outer.microphone_requests().len() != 2 {
         assert!(Instant::now() < deadline);
@@ -137,7 +143,12 @@ fn microphone_crosses_two_authenticated_sessions_without_crossing_owners() -> io
             };
             outer.queue_microphone(route.source, route.generation, &packet.encode()?)?;
         }
-        for (source, generation, packet) in bridge.take_microphone_packets()? {
+        for MicrophonePacket {
+            source,
+            generation,
+            packet,
+        } in bridge.take_microphone_packets()?
+        {
             inner.queue_microphone(source, generation, &packet)?;
         }
         for (index, (_, _, channel)) in owners.iter().enumerate() {
@@ -220,7 +231,12 @@ fn microphone_crosses_two_authenticated_sessions_without_crossing_owners() -> io
             replacement.generation,
             &packet.encode()?,
         )?;
-        for (source, generation, packet) in bridge.take_microphone_packets()? {
+        for MicrophonePacket {
+            source,
+            generation,
+            packet,
+        } in bridge.take_microphone_packets()?
+        {
             inner.queue_microphone(source, generation, &packet)?;
         }
         if let Some(packet) = owners[0].2.take_audio_input()? {
@@ -301,7 +317,7 @@ fn present_desktop_scene(session: &mut Session, title: &str) -> io::Result<()> {
         media::rgba8_raw_frame_body_len(1280, 720).map_err(io::Error::other)?;
     session.create_track(
         TrackConfiguration {
-            direction: Default::default(),
+            direction: vivid_protocol::track::TrackDirection::default(),
             context_id: context,
             surface_id: surface.id(),
             track_id: 1,
@@ -346,8 +362,7 @@ fn normalized_scene_records(
         })
         .map(|record| {
             let identity_keys: &[u64] = match record.record_type {
-                messages::CREATE_SURFACE => &[0, 1],
-                messages::BEGIN_TXN => &[0, 1],
+                messages::CREATE_SURFACE | messages::BEGIN_TXN => &[0, 1],
                 messages::CREATE_NODE => &[0, 1, 2, 3],
                 _ => &[],
             };
@@ -392,14 +407,13 @@ fn identical_desktop_script_is_record_neutral_across_the_terminating_gateway() -
         .projection_snapshot(&[principal].into_iter().collect())
         .bridge_projection();
     let browser_presenter = TestPresenter::start_desktop(1280, 720)?;
-    let mut bridge = OuterBridge::connect_native_for_target(
-        browser_presenter.endpoint().into(),
-        None,
-        None,
-        Zeroizing::new(ROOT_SECRET_HEX.to_owned()),
-        vivid_sdk::DESKTOP_SURFACE,
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(ROOT_SECRET_HEX).unwrap(),
         DisplayMetrics::default(),
-    )?;
+    )
+    .control_endpoint(browser_presenter.endpoint())
+    .target_profile(vivid_sdk::DESKTOP_SURFACE)
+    .build()?;
     bridge.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
     let browser_records = normalized_scene_records(&browser_presenter.observed());
 
@@ -515,14 +529,13 @@ fn desktop_surface_crosses_both_terminating_hops() -> io::Result<()> {
     assert_eq!(projected.surface, surface.id());
 
     let outer_presenter = TestPresenter::start_desktop(1280, 720)?;
-    let mut bridge = OuterBridge::connect_native_for_target(
-        outer_presenter.endpoint().into(),
-        None,
-        None,
-        Zeroizing::new(ROOT_SECRET_HEX.to_owned()),
-        vivid_sdk::DESKTOP_SURFACE,
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(ROOT_SECRET_HEX).unwrap(),
         DisplayMetrics::default(),
-    )?;
+    )
+    .control_endpoint(outer_presenter.endpoint())
+    .target_profile(vivid_sdk::DESKTOP_SURFACE)
+    .build()?;
     assert_eq!(bridge.target_profile(), vivid_sdk::DESKTOP_SURFACE);
     bridge.set_enforced_surface_policy(POLICY_DENY_CAPTURE)?;
 
@@ -664,14 +677,13 @@ fn identical_inner_local_ids_map_to_distinct_outer_objects() -> io::Result<()> {
     );
 
     let outer_presenter = TestPresenter::start_desktop(1280, 720)?;
-    let mut bridge = OuterBridge::connect_native_for_target(
-        outer_presenter.endpoint().into(),
-        None,
-        None,
-        Zeroizing::new(ROOT_SECRET_HEX.to_owned()),
-        vivid_sdk::DESKTOP_SURFACE,
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(ROOT_SECRET_HEX).unwrap(),
         DisplayMetrics::default(),
-    )?;
+    )
+    .control_endpoint(outer_presenter.endpoint())
+    .target_profile(vivid_sdk::DESKTOP_SURFACE)
+    .build()?;
     bridge.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
     let first_key = projection.surfaces[0].key;
     let second_key = projection.surfaces[1].key;

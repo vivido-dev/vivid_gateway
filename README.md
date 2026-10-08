@@ -5,12 +5,12 @@ It terminates an authenticated inner producer session as a presenter and
 re-originates validated surfaces, tracks, scene nodes, and media into an independent outer producer
 session.
 
-The terminating half is `vivid_sdk::presenter`, which this crate re-exports so
-`vivid_gateway::VirtualVivid` and its neighbours keep resolving; the re-origination half is
-`vivid_gateway::outer`. Both halves are still reached through this crate.
+The terminating half is `vivid_sdk::presenter`; import its types from there. This crate is the
+re-origination half: `OuterBridge`, configured with `OuterBridge::builder` and connected by
+`build`, either to native outer endpoints or through a `vivid_sdk::ConnectionFactory`.
 
 The two hops never share secrets, protocol identities, revisions, generations, epochs, or media
-IDs. Products provide the inner accepted-connection listener and the outer `ConnectionFactory`.
+IDs. Products provide the inner accepted-connection listener and the outer endpoints or factory.
 The inner target is configurable through `PresentationTarget`; terminal and desktop targets are
 included. Resource contracts, supported profiles, and additional capture restrictions are route
 policy.

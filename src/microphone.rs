@@ -1,11 +1,37 @@
 //! Microphone requests re-originated in the foreground attachment's Vivid session.
-use crate::{BridgeSourceKey, MicrophoneRequest};
 use std::{collections::HashMap, io};
 use vivid_protocol::{audio_input, registry};
+use vivid_sdk::presenter::{BridgeSourceKey, MicrophoneRequest};
 use vivid_sdk::{
     CoordinateModel, RequestMetadata, Session, Surface, SurfaceDefinition, SurfaceDescriptor,
     SurfaceRole, Track, TrackChannel,
 };
+
+/// One captured microphone packet, relayed from the outer presenter to an inner request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MicrophonePacket {
+    /// The inner source that requested the microphone.
+    pub source: BridgeSourceKey,
+    /// The request generation the packet was captured under.
+    pub generation: u64,
+    /// The encoded audio-input packet; empty when the route has ended and will send no more.
+    pub packet: Vec<u8>,
+}
+
+impl std::fmt::Debug for MicrophonePacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MicrophonePacket")
+            .field("source", &self.source)
+            .field("generation", &self.generation)
+            .field("packet", &self.packet.len())
+            .finish()
+    }
+}
+
+/// Microphone routes one bridge may hold; each is an outer surface plus an uplink track.
+const MAX_ROUTES: usize = 64;
+/// Characters of the pane title carried into the outer surface title.
+const MAX_TITLE_CHARS: usize = 60;
 
 struct Route {
     request: MicrophoneRequest,
@@ -44,7 +70,7 @@ impl Microphones {
                 ))
             };
         }
-        if requests.len() > 64 {
+        if requests.len() > MAX_ROUTES {
             return Err(io::Error::other("too many microphone routes"));
         }
         for key in self.unfinished.keys().copied().collect::<Vec<_>>() {
@@ -100,7 +126,11 @@ impl Microphones {
                     rotation: 0,
                     descriptor: SurfaceDescriptor {
                         role: SurfaceRole::ApplicationCanvas,
-                        title: title.chars().filter(|c| !c.is_control()).take(60).collect(),
+                        title: title
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(MAX_TITLE_CHARS)
+                            .collect(),
                         semantic_content_revision: 0,
                         semantic_availability: 0,
                         locator_hint: String::new(),
@@ -159,7 +189,7 @@ impl Microphones {
         Ok(())
     }
 
-    pub fn take(&mut self) -> io::Result<Vec<(BridgeSourceKey, u64, Vec<u8>)>> {
+    pub fn take(&mut self) -> io::Result<Vec<MicrophonePacket>> {
         let mut packets = Vec::new();
         for (key, route) in &mut self.routes {
             if route.ended {
@@ -167,13 +197,21 @@ impl Microphones {
             }
             match route.channel.take_audio_input() {
                 Ok(Some(packet)) => {
-                    packets.push((*key, route.request.generation, packet.encode()?));
+                    packets.push(MicrophonePacket {
+                        source: *key,
+                        generation: route.request.generation,
+                        packet: packet.encode()?,
+                    });
                     route.channel.grant_audio_input()?;
                 }
                 Ok(None) => {}
                 Err(_) => {
                     route.ended = true;
-                    packets.push((*key, route.request.generation, Vec::new()));
+                    packets.push(MicrophonePacket {
+                        source: *key,
+                        generation: route.request.generation,
+                        packet: Vec::new(),
+                    });
                 }
             }
         }

@@ -337,16 +337,11 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "vivid_gateway"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
- "getrandom",
- "log",
- "serde",
- "sha2",
  "tempfile",
  "vivid_protocol",
  "vivid_sdk",
- "zeroize",
 ]
 
 [[package]]

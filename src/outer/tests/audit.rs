@@ -1,11 +1,16 @@
+use super::*;
+use crate::outer::relay::{MAX_PENDING_BYTES, PENDING_TIMEOUT};
+use vivid_sdk::presenter::BridgeOverlayWindow;
+
 fn audit_bridge() -> OuterBridge {
     OuterBridge::from_session(
         vivid_sdk::Session::connect(ProducerConfig::offline()).unwrap(),
         Secret32::new([7; 32]),
-        None,
-        None,
-        None,
-        None,
+        Route::Native {
+            control: String::new(),
+            realtime: None,
+            bulk: None,
+        },
         DisplayMetrics::default(),
     )
     .unwrap()
@@ -21,11 +26,17 @@ fn unknown_sources_cannot_retain_partial_records() {
             surface: 1,
             track: 1,
         };
-        assert!(
-            bridge
-                .media_chunk(1, key, messages::RASTER_FRAME, 0, 1024, false, vec![])
-                .is_err()
-        );
+        bridge
+            .media_chunk(MediaChunk {
+                delivery_id: 1,
+                source: key,
+                record_type: messages::RASTER_FRAME,
+                offset: 0,
+                total: 1024,
+                last: false,
+                bytes: vec![],
+            })
+            .unwrap_err();
     }
     assert!(bridge.pending.is_empty());
     assert!(bridge.tracks.is_empty());
@@ -74,19 +85,15 @@ fn delta_recovery_waits_for_full_frame() {
         false,
     )
     .unwrap();
-    assert!(
-        writer
-            .forward_media(messages::RASTER_FRAME, &skipped)
-            .is_err()
-    );
+    writer
+        .forward_media(messages::RASTER_FRAME, &skipped)
+        .unwrap_err();
     assert!(writer.needs_full_frame);
     writer.needs_full_frame = false; // The worker resets this before each command.
     // Frame 3 depends on omitted frame 2 and must wait for a new full frame.
-    assert!(
-        writer
-            .forward_media(messages::RASTER_FRAME, &delta_body(3, 2))
-            .is_err()
-    );
+    writer
+        .forward_media(messages::RASTER_FRAME, &delta_body(3, 2))
+        .unwrap_err();
     writer
         .forward_media(messages::RASTER_FRAME, &full_frame_body(4))
         .unwrap();
@@ -98,11 +105,12 @@ fn delta_recovery_waits_for_full_frame() {
 #[test]
 fn failed_node_delete_retains_retry_identity() {
     let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
-    let mut bridge = OuterBridge::connect(
-        presenter.endpoint().into(),
-        Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(vivid_sdk::testing::ROOT_SECRET_HEX).unwrap(),
         DisplayMetrics::default(),
     )
+    .control_endpoint(presenter.endpoint())
+    .build()
     .unwrap();
     let key = BridgeSurfaceKey {
         producer: 1,
@@ -112,11 +120,11 @@ fn failed_node_delete_retains_retry_identity() {
     let surface = BridgeSurface {
         key,
         overlay_window: None,
-            overlay_layouts: Vec::new(),
+        overlay_layouts: Vec::new(),
         logical_width: 16,
         logical_height: 16,
         capture_policy: 0,
-        descriptor: crate::BridgeSourceDescriptor {
+        descriptor: vivid_sdk::presenter::BridgeSourceDescriptor {
             role: 1,
             title: "audit".into(),
             content_revision: 1,
@@ -135,7 +143,7 @@ fn failed_node_delete_retains_retry_identity() {
         height: 16,
         z_index: 0,
         visible: true,
-        clip: crate::BridgeClipRect {
+        clip: vivid_sdk::presenter::BridgeClipRect {
             x: 0,
             y: 0,
             width: 16,
@@ -153,11 +161,12 @@ fn failed_node_delete_retains_retry_identity() {
 #[test]
 fn overlay_window_relays_create_update_and_teardown() {
     let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
-    let mut bridge = OuterBridge::connect(
-        presenter.endpoint().into(),
-        Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(vivid_sdk::testing::ROOT_SECRET_HEX).unwrap(),
         DisplayMetrics::default(),
     )
+    .control_endpoint(presenter.endpoint())
+    .build()
     .unwrap();
     let surface_key = BridgeSurfaceKey {
         producer: 1,
@@ -192,7 +201,7 @@ fn overlay_window_relays_create_update_and_teardown() {
         logical_width: 200,
         logical_height: 100,
         capture_policy: 0,
-        descriptor: crate::BridgeSourceDescriptor {
+        descriptor: vivid_sdk::presenter::BridgeSourceDescriptor {
             role: 1,
             title: "overlay".into(),
             content_revision: 1,
@@ -260,7 +269,10 @@ fn overlay_window_relays_create_update_and_teardown() {
         .overlay_windows
         .get(&surface_key)
         .expect("tracked window state");
-    assert_eq!(tracked.projected.revision, 2, "the relayed inner revision advances");
+    assert_eq!(
+        tracked.projected.revision, 2,
+        "the relayed inner revision advances"
+    );
     assert!(
         tracked.outer_revision > 0,
         "the outer presenter's own revision was recorded"
@@ -268,7 +280,11 @@ fn overlay_window_relays_create_update_and_teardown() {
 
     // An unchanged inner revision must not re-send the same geometry.
     bridge
-        .rebuild(std::slice::from_ref(&moved), std::slice::from_ref(&source), &[])
+        .rebuild(
+            std::slice::from_ref(&moved),
+            std::slice::from_ref(&source),
+            &[],
+        )
         .unwrap();
     assert_eq!(
         count_windows(&presenter),
@@ -286,11 +302,12 @@ fn overlay_window_relays_create_update_and_teardown() {
 #[test]
 fn poll_preserves_terminal_connection_event() {
     let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
-    let mut bridge = OuterBridge::connect(
-        presenter.endpoint().into(),
-        Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(vivid_sdk::testing::ROOT_SECRET_HEX).unwrap(),
         DisplayMetrics::default(),
     )
+    .control_endpoint(presenter.endpoint())
+    .build()
     .unwrap();
     drop(presenter);
     // Allow the SDK dispatcher to publish the terminal event; poll consumes it.
@@ -298,8 +315,8 @@ fn poll_preserves_terminal_connection_event() {
         bridge.poll_outer_session();
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(bridge.service_session_events().is_err());
-    assert!(bridge.service_session_events().is_err());
+    bridge.service_session_events().unwrap_err();
+    bridge.service_session_events().unwrap_err();
 }
 
 fn audit_projection(producer: u64) -> (BridgeSurface, BridgeSource) {
@@ -311,11 +328,11 @@ fn audit_projection(producer: u64) -> (BridgeSurface, BridgeSource) {
     let surface = BridgeSurface {
         key,
         overlay_window: None,
-            overlay_layouts: Vec::new(),
+        overlay_layouts: Vec::new(),
         logical_width: 16,
         logical_height: 16,
         capture_policy: 0,
-        descriptor: crate::BridgeSourceDescriptor {
+        descriptor: vivid_sdk::presenter::BridgeSourceDescriptor {
             role: 1,
             title: "audit".into(),
             content_revision: 1,
@@ -357,16 +374,25 @@ fn slow_readiness_does_not_block_fragmented_media_for_other_owners() {
 
     let script = Script::new();
     let presenter = TestPresenter::start_with(
-        TargetKind::Terminal { columns: 80, rows: 24 }, script.clone(),
-    ).unwrap();
-    let mut bridge = OuterBridge::connect(
-        presenter.endpoint().into(),
-        Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
+        TargetKind::Terminal {
+            columns: 80,
+            rows: 24,
+        },
+        script.clone(),
+    )
+    .unwrap();
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(vivid_sdk::testing::ROOT_SECRET_HEX).unwrap(),
         DisplayMetrics::default(),
-    ).unwrap();
+    )
+    .control_endpoint(presenter.endpoint())
+    .build()
+    .unwrap();
     let (a, mut x) = audit_projection(1);
     let (b, mut y) = audit_projection(2);
-    bridge.rebuild(&[a, b], &[x.clone(), y.clone()], &[]).unwrap();
+    bridge
+        .rebuild(&[a, b], &[x.clone(), y.clone()], &[])
+        .unwrap();
     let previous = [x.clone(), y.clone()];
     x.active = true;
     y.active = true;
@@ -375,23 +401,38 @@ fn slow_readiness_does_not_block_fragmented_media_for_other_owners() {
     script.delay(messages::OK, Duration::from_millis(500));
 
     let started = Instant::now();
-    bridge.update_playback(&previous, &[x.clone(), y.clone()]).unwrap();
+    bridge
+        .update_playback(&previous, &[x.clone(), y.clone()])
+        .unwrap();
     bridge.retry_pending_activation().unwrap();
     let body = media::raster_frame_body(1, 1, 16, 16, &[0x7f; 16 * 16 * 4]).unwrap();
     for (index, chunk) in body.chunks(64).enumerate() {
         let offset = index * 64;
         for key in [x.key, y.key] {
-            bridge.media_chunk(1, key, messages::RASTER_FRAME,
-                offset as u32, body.len() as u32, offset + chunk.len() == body.len(), chunk.to_vec(),
-            ).unwrap();
+            bridge
+                .media_chunk(MediaChunk {
+                    delivery_id: 1,
+                    source: key,
+                    record_type: messages::RASTER_FRAME,
+                    offset: u32::try_from(offset).unwrap(),
+                    total: u32::try_from(body.len()).unwrap(),
+                    last: offset + chunk.len() == body.len(),
+                    bytes: chunk.to_vec(),
+                })
+                .unwrap();
         }
         bridge.retry_pending_activation().unwrap();
-        assert!(started.elapsed() < Duration::from_millis(250),
-            "readiness waited for a remote reply while the media was being assembled");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "readiness waited for a remote reply while the media was being assembled"
+        );
     }
     assert!(!bridge.pending.contains_key(&x.key));
     assert_eq!(bridge.tracks[&x.key].media_submitted, 1);
-    assert!(!bridge.tracks[&x.key].activated, "activation must await authoritative readiness");
+    assert!(
+        !bridge.tracks[&x.key].activated,
+        "activation must await authoritative readiness"
+    );
 
     assert_eq!(bridge.tracks[&y.key].media_submitted, 1);
     assert!(!bridge.tracks[&y.key].activated);
@@ -409,49 +450,96 @@ fn assembly_checks_bounds_delivery_and_isolates_owners() {
     for key in [x.key, y.key] {
         assert!(
             !bridge
-                .media_chunk(7, key, messages::RASTER_FRAME, 0, 100, false, vec![0])
+                .media_chunk(MediaChunk {
+                    delivery_id: 7,
+                    source: key,
+                    record_type: messages::RASTER_FRAME,
+                    offset: 0,
+                    total: 100,
+                    last: false,
+                    bytes: vec![0]
+                })
                 .unwrap()
         );
     }
-    assert!(
-        bridge
-            .media_chunk(8, x.key, messages::RASTER_FRAME, 1, 100, false, vec![0])
-            .is_err()
-    );
+    bridge
+        .media_chunk(MediaChunk {
+            delivery_id: 8,
+            source: x.key,
+            record_type: messages::RASTER_FRAME,
+            offset: 1,
+            total: 100,
+            last: false,
+            bytes: vec![0],
+        })
+        .unwrap_err();
     assert!(!bridge.pending.contains_key(&x.key));
     assert_eq!(bridge.pending[&y.key].received, 1);
     for total in [0, u32::MAX, 16 * 16 * 4 + 1000] {
-        assert!(
-            bridge
-                .media_chunk(9, x.key, messages::RASTER_FRAME, 0, total, false, vec![0])
-                .is_err()
-        );
+        bridge
+            .media_chunk(MediaChunk {
+                delivery_id: 9,
+                source: x.key,
+                record_type: messages::RASTER_FRAME,
+                offset: 0,
+                total,
+                last: false,
+                bytes: vec![0],
+            })
+            .unwrap_err();
     }
-    assert!(
-        bridge
-            .media_chunk(9, x.key, messages::VIDEO_PACKET, 0, 100, false, vec![0])
-            .is_err()
-    );
-    assert!(
-        bridge
-            .media_chunk(9, x.key, messages::RASTER_FRAME, 0, 1, false, vec![0])
-            .is_err()
-    );
+    bridge
+        .media_chunk(MediaChunk {
+            delivery_id: 9,
+            source: x.key,
+            record_type: messages::VIDEO_PACKET,
+            offset: 0,
+            total: 100,
+            last: false,
+            bytes: vec![0],
+        })
+        .unwrap_err();
+    bridge
+        .media_chunk(MediaChunk {
+            delivery_id: 9,
+            source: x.key,
+            record_type: messages::RASTER_FRAME,
+            offset: 0,
+            total: 1,
+            last: false,
+            bytes: vec![0],
+        })
+        .unwrap_err();
     assert_eq!(bridge.pending.len(), 1);
-    bridge.pending.get_mut(&y.key).unwrap().started = Instant::now() - PENDING_TIMEOUT;
+    bridge.pending.get_mut(&y.key).unwrap().started =
+        Instant::now().checked_sub(PENDING_TIMEOUT).unwrap();
     assert!(
         !bridge
-            .media_chunk(10, y.key, messages::RASTER_FRAME, 0, 100, false, vec![0])
+            .media_chunk(MediaChunk {
+                delivery_id: 10,
+                source: y.key,
+                record_type: messages::RASTER_FRAME,
+                offset: 0,
+                total: 100,
+                last: false,
+                bytes: vec![0]
+            })
             .unwrap()
     );
     assert_eq!(bridge.pending[&y.key].delivery_id, 10);
     // Charge the existing assembly to the aggregate cap without allocating a large buffer.
     bridge.pending.get_mut(&y.key).unwrap().total = MAX_PENDING_BYTES;
-    assert!(
-        bridge
-            .media_chunk(11, x.key, messages::RASTER_FRAME, 0, 100, false, vec![0])
-            .is_err()
-    );
+    bridge
+        .media_chunk(MediaChunk {
+            delivery_id: 11,
+            source: x.key,
+            record_type: messages::RASTER_FRAME,
+            offset: 0,
+            total: 100,
+            last: false,
+            bytes: vec![0],
+        })
+        .unwrap_err();
     assert_eq!(bridge.pending.len(), 1);
 }
 
@@ -474,24 +562,23 @@ fn failed_channel_setup_destroys_allocated_track_before_retry() {
     let mut bridge = OuterBridge::from_session(
         session,
         authentication,
-        None,
-        None,
-        None,
-        None,
+        Route::Native {
+            control: String::new(),
+            realtime: None,
+            bulk: None,
+        },
         DisplayMetrics::default(),
     )
     .unwrap();
     let (surface, source) = audit_projection(1);
     for count in 1..=3 {
-        assert!(
-            bridge
-                .rebuild(
-                    std::slice::from_ref(&surface),
-                    std::slice::from_ref(&source),
-                    &[]
-                )
-                .is_err()
-        );
+        bridge
+            .rebuild(
+                std::slice::from_ref(&surface),
+                std::slice::from_ref(&source),
+                &[],
+            )
+            .unwrap_err();
         assert!(bridge.tracks.is_empty());
         assert!(bridge.unfinished_tracks.is_empty());
         assert_eq!(presenter.destroys().len(), count);
@@ -502,11 +589,12 @@ fn failed_channel_setup_destroys_allocated_track_before_retry() {
 fn replacement_cancels_old_session_and_retires_notifications() {
     let old = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
     let new = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
-    let mut bridge = OuterBridge::connect(
-        old.endpoint().into(),
-        Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(vivid_sdk::testing::ROOT_SECRET_HEX).unwrap(),
         DisplayMetrics::default(),
     )
+    .control_endpoint(old.endpoint())
+    .build()
     .unwrap();
     let (a, x) = audit_projection(1);
     let (b, y) = audit_projection(2);
@@ -514,9 +602,11 @@ fn replacement_cancels_old_session_and_retires_notifications() {
     let sources = vec![x, y];
     bridge.rebuild(&surfaces, &sources, &[]).unwrap();
     old.script().drop_reply(messages::GOODBYE, 1);
-    bridge.endpoint_control = Some(new.endpoint().into());
-    bridge.endpoint_bulk = Some(new.endpoint().into());
-    bridge.endpoint_realtime = Some(new.endpoint().into());
+    bridge.route = Route::Native {
+        control: new.endpoint().into(),
+        realtime: Some(new.endpoint().into()),
+        bulk: Some(new.endpoint().into()),
+    };
     for producer in [1, 2] {
         let (_, source) = audit_projection(producer);
         bridge.losses.insert(source.key);
@@ -530,8 +620,8 @@ fn replacement_cancels_old_session_and_retires_notifications() {
             source.key,
             PlaybackSnapshot {
                 decoder_reset_serial: source.decoder_reset_serial,
-                state: 1,
-                eos_state: 1,
+                clock: ClockState::Buffering,
+                eos: EosState::Accepted,
             },
         ));
     }
@@ -557,11 +647,12 @@ fn replacement_cancels_old_session_and_retires_notifications() {
 #[test]
 fn polling_retains_resize_for_service_consumer() {
     let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
-    let mut bridge = OuterBridge::connect(
-        presenter.endpoint().into(),
-        Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
+    let mut bridge = OuterBridge::builder(
+        Secret32::from_hex(vivid_sdk::testing::ROOT_SECRET_HEX).unwrap(),
         DisplayMetrics::default(),
     )
+    .control_endpoint(presenter.endpoint())
+    .build()
     .unwrap();
     presenter.resize_terminal(100, 30, true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);

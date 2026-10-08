@@ -7,8 +7,8 @@ use std::io;
 use std::net::{Shutdown, TcpListener};
 use std::sync::Arc;
 
-use vivid_gateway::{ConnectionCancel, PresenterListener, Transport};
 use vivid_sdk::ProducerConfig;
+use vivid_sdk::presenter::{ConnectionCancel, PresenterListener, Transport};
 
 /// A loopback TCP listener a presenter can accept on, chosen over a Unix socket so the suite runs
 /// unchanged where socket files are not permitted.

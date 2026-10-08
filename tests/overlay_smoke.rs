@@ -12,19 +12,20 @@ use std::collections::HashSet;
 use std::io;
 use std::time::{Duration, Instant};
 
-use vivid_gateway::{
-    BridgeSourceKey, BridgeSurface, DisplayMetrics, MediaConfig, OuterBridge, PresenterConfig,
-    PresenterListener, ProjectionSnapshot, VirtualVivid,
-};
+use vivid_gateway::{DeliveryOutcome, MediaChunk, OuterBridge};
+use vivid_protocol::auth::Secret32;
 use vivid_protocol::cbor::Value;
 use vivid_sdk::overlay::{Brush, Canvas, Color, Path, Rect, WindowMode};
+use vivid_sdk::presenter::{
+    BridgeSourceKey, BridgeSurface, DisplayMetrics, MediaConfig, PresenterConfig,
+    PresenterListener, ProjectionSnapshot, VirtualVivid,
+};
 use vivid_sdk::{
     CoordinateModel, Fit, KindConfiguration, LaneClass, OverlaySession, OverlayWindow,
     OverlayWindowOptions, ProducerAuthentication, ProducerConfig, RasterConfiguration,
     RequestMetadata, SceneNode, Session, SurfaceDefinition, SurfaceDescriptor, SurfaceRole,
     TrackConfiguration, TrackMode,
 };
-use zeroize::Zeroizing;
 
 mod common;
 
@@ -93,7 +94,7 @@ fn overlay_display_lists_cross_both_sockets_and_return_credit_after_delivery() -
     let (outer, endpoint) = relaying_presenter()?;
     let secret = pane(&outer, 9)?;
     let mut relay = bridge(&endpoint, &secret)?;
-    for colour in [0xff0000ff, 0x00ff00ff, 0x0000ffff, 0xffffffff] {
+    for colour in [0xff00_00ff, 0x00ff_00ff, 0x0000_ffff, 0xffff_ffff] {
         let mut canvas = scene(colour);
         canvas
             .push(vivid_sdk::overlay::Command::Hit {
@@ -110,15 +111,15 @@ fn overlay_display_lists_cross_both_sockets_and_return_credit_after_delivery() -
         assert!(inner.bridge_delivery_is_pending(event.delivery_id, event.source));
         let projection = snapshot(&inner, &[1]).bridge_projection();
         relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
-        relay.media_chunk(
-            event.delivery_id,
-            event.source,
-            event.record_type,
-            0,
-            event.body.len() as u32,
-            true,
-            event.body,
-        )?;
+        relay.media_chunk(MediaChunk {
+            delivery_id: event.delivery_id,
+            source: event.source,
+            record_type: event.record_type,
+            offset: 0,
+            total: u32::try_from(event.body.len()).unwrap(),
+            last: true,
+            bytes: event.body,
+        })?;
         let painted = outer
             .wait_media_event(Duration::from_secs(5))?
             .expect("outer presenter must receive drawing commands");
@@ -128,7 +129,12 @@ fn overlay_display_lists_cross_both_sockets_and_return_credit_after_delivery() -
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let completions = relay.take_media_completions();
-            if let Some((id, delivered, _, _)) = completions.first() {
+            if let Some(DeliveryOutcome {
+                delivery_id: id,
+                delivered,
+                ..
+            }) = completions.first()
+            {
                 assert_eq!(*id, event.delivery_id);
                 assert!(*delivered);
                 inner.complete_bridge_delivery(*id, *delivered);
@@ -224,15 +230,15 @@ fn measured_layouts_and_image_assets_survive_a_replaced_outer_session() -> io::R
         .expect("asset delivery");
     let projection = snapshot(&inner, &[1]).bridge_projection();
     relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
-    relay.media_chunk(
-        asset.delivery_id,
-        asset.source,
-        asset.record_type,
-        0,
-        asset.body.len() as u32,
-        true,
-        asset.body,
-    )?;
+    relay.media_chunk(MediaChunk {
+        delivery_id: asset.delivery_id,
+        source: asset.source,
+        record_type: asset.record_type,
+        offset: 0,
+        total: u32::try_from(asset.body.len()).unwrap(),
+        last: true,
+        bytes: asset.body,
+    })?;
     finish_delivery(&inner, &mut relay, asset.delivery_id)?;
     let mut canvas = Canvas::new();
     window.draw_text_layout(&mut canvas, &layout, Point::new(5., 5.).unwrap())?;
@@ -248,20 +254,23 @@ fn measured_layouts_and_image_assets_survive_a_replaced_outer_session() -> io::R
         .expect("scene delivery");
     let projection = snapshot(&inner, &[1]).bridge_projection();
     relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
-    relay.media_chunk(
-        frame.delivery_id,
-        frame.source,
-        frame.record_type,
-        0,
-        frame.body.len() as u32,
-        true,
-        frame.body,
-    )?;
+    relay.media_chunk(MediaChunk {
+        delivery_id: frame.delivery_id,
+        source: frame.source,
+        record_type: frame.record_type,
+        offset: 0,
+        total: u32::try_from(frame.body.len()).unwrap(),
+        last: true,
+        bytes: frame.body,
+    })?;
     finish_delivery(&inner, &mut relay, frame.delivery_id)?;
     let (first_source, first) = outer_frame(&outer, 9, |_, _| true);
-    let outer_layout = match first.canvas.commands()[0] {
-        vivid_sdk::overlay::Command::TextLayout { layout, .. } => layout,
-        _ => panic!("missing text layout"),
+    let vivid_sdk::overlay::Command::TextLayout {
+        layout: outer_layout,
+        ..
+    } = first.canvas.commands()[0]
+    else {
+        panic!("missing text layout")
     };
     assert_ne!(
         outer_layout,
@@ -271,15 +280,15 @@ fn measured_layouts_and_image_assets_survive_a_replaced_outer_session() -> io::R
     relay.replace_session(&projection.surfaces, &projection.sources, &projection.nodes)?;
     let retained = snapshot(&inner, &[1]).sources.remove(0);
     for (kind, body) in retained.retained_vector {
-        relay.media_chunk(
-            0,
-            retained.key,
-            kind,
-            0,
-            body.len() as u32,
-            true,
-            body.to_vec(),
-        )?;
+        relay.media_chunk(MediaChunk {
+            delivery_id: 0,
+            source: retained.key,
+            record_type: kind,
+            offset: 0,
+            total: u32::try_from(body.len()).unwrap(),
+            last: true,
+            bytes: body.to_vec(),
+        })?;
         finish_delivery(&inner, &mut relay, 0)?;
     }
     // The replaced session's scene may linger until the outer presenter tears that session down.
@@ -326,7 +335,12 @@ fn outer_frame(
 fn finish_delivery(inner: &VirtualVivid, relay: &mut OuterBridge, expected: u64) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some((id, delivered, _, _)) = relay.take_media_completions().into_iter().next() {
+        if let Some(DeliveryOutcome {
+            delivery_id: id,
+            delivered,
+            ..
+        }) = relay.take_media_completions().into_iter().next()
+        {
             assert_eq!(id, expected);
             assert!(delivered, "outer delivery failed");
             inner.complete_bridge_delivery(id, delivered);
@@ -403,15 +417,15 @@ fn child_modal_and_pointer_capture_cross_the_gateway() -> io::Result<()> {
     relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
     for source in snapshot(&inner, &[1]).sources {
         for (kind, body) in source.retained_vector {
-            relay.media_chunk(
-                0,
-                source.key,
-                kind,
-                0,
-                body.len() as u32,
-                true,
-                body.to_vec(),
-            )?;
+            relay.media_chunk(MediaChunk {
+                delivery_id: 0,
+                source: source.key,
+                record_type: kind,
+                offset: 0,
+                total: u32::try_from(body.len()).unwrap(),
+                last: true,
+                bytes: body.to_vec(),
+            })?;
             finish_delivery(&inner, &mut relay, 0)?;
         }
     }
@@ -508,15 +522,15 @@ fn semantics_wait_for_the_outer_presenter_to_show_their_scene() -> io::Result<()
     relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
     for source in snapshot(&inner, &[1]).sources {
         for (kind, body) in source.retained_vector {
-            relay.media_chunk(
-                0,
-                source.key,
-                kind,
-                0,
-                body.len() as u32,
-                true,
-                body.to_vec(),
-            )?;
+            relay.media_chunk(MediaChunk {
+                delivery_id: 0,
+                source: source.key,
+                record_type: kind,
+                offset: 0,
+                total: u32::try_from(body.len()).unwrap(),
+                last: true,
+                bytes: body.to_vec(),
+            })?;
             finish_delivery(&inner, &mut relay, 0)?;
         }
     }
@@ -633,7 +647,7 @@ fn raster_producer(endpoint: &str, secret: &str, name: &str) -> io::Result<Sessi
         vivid_protocol::media::rgba8_raw_frame_body_len(64, 64).map_err(io::Error::other)?;
     session.create_track(
         TrackConfiguration {
-            direction: Default::default(),
+            direction: vivid_protocol::track::TrackDirection::default(),
             context_id: context,
             surface_id: surface.id(),
             track_id: 1,
@@ -669,7 +683,7 @@ fn snapshot(presenter: &VirtualVivid, panes: &[u64]) -> ProjectionSnapshot {
 /// Every surface in a projection that carries an overlay window, by its owner-qualified key.
 fn overlay_windows(
     snapshot: &ProjectionSnapshot,
-) -> Vec<(u64, vivid_gateway::BridgeOverlayWindow)> {
+) -> Vec<(u64, vivid_sdk::presenter::BridgeOverlayWindow)> {
     snapshot
         .bridge_projection()
         .surfaces
@@ -680,14 +694,13 @@ fn overlay_windows(
 
 /// An outer bridge speaking to an overlay-hosting presenter, as the foreground client does.
 fn bridge(endpoint: &str, secret: &str) -> io::Result<OuterBridge> {
-    OuterBridge::connect_native_for_target(
-        endpoint.to_owned(),
-        None,
-        None,
-        Zeroizing::new(secret.to_owned()),
-        vivid_sdk::TERMINAL_SURFACE,
+    OuterBridge::builder(
+        Secret32::from_hex(secret).unwrap(),
         DisplayMetrics::default(),
     )
+    .control_endpoint(endpoint.to_owned())
+    .target_profile(vivid_sdk::TERMINAL_SURFACE)
+    .build()
 }
 
 /// Move each relayed window by a pane origin, the way a multiplexer places a pane-local window in
@@ -725,7 +738,10 @@ fn await_windows(presenter: &VirtualVivid, panes: &[u64], count: usize) -> Proje
 }
 
 /// The geometry one overlay-hosting presenter is holding for its single window.
-fn hosted_window(presenter: &VirtualVivid, panes: &[u64]) -> vivid_gateway::BridgeOverlayWindow {
+fn hosted_window(
+    presenter: &VirtualVivid,
+    panes: &[u64],
+) -> vivid_sdk::presenter::BridgeOverlayWindow {
     let windows = overlay_windows(&snapshot(presenter, panes));
     assert_eq!(windows.len(), 1, "expected exactly one hosted window");
     windows[0].1
@@ -754,7 +770,7 @@ fn an_overlay_window_crosses_the_terminating_gateway_and_keeps_tracking() -> io:
     let inner_secret = pane(&inner, INNER_PANE)?;
     let overlays = overlay_producer(&inner_endpoint, &inner_secret, "overlay-relay")?;
     let window = window_of(&overlays, 12., 20.)?;
-    window.present(scene(0x203050ff))?;
+    window.present(scene(0x2030_50ff))?;
 
     let (outer, outer_endpoint) = overlay_presenter()?;
     let outer_secret = pane(&outer, OUTER_PANE)?;
@@ -787,7 +803,7 @@ fn an_overlay_window_crosses_the_terminating_gateway_and_keeps_tracking() -> io:
     // channel that never returns its grant accepts the first display list and then blocks forever,
     // which looks exactly like a hung program.
     for frame in 0..6 {
-        window.present(scene(0x203050ff + frame))?;
+        window.present(scene(0x2030_50ff + frame))?;
     }
 
     // The producer moves its window twice before the relay reconciles again, which is the normal
@@ -859,7 +875,7 @@ fn a_hidden_pane_withdraws_its_overlay_window_while_the_visible_pane_keeps_going
     let overlays = overlay_producer(&inner_endpoint, &overlay_secret, "overlay-pane")?;
     let raster = raster_producer(&inner_endpoint, &raster_secret, "raster-pane")?;
     let window = window_of(&overlays, 12., 20.)?;
-    window.present(scene(0x203050ff))?;
+    window.present(scene(0x2030_50ff))?;
 
     let (outer, outer_endpoint) = overlay_presenter()?;
     let outer_secret = pane(&outer, OUTER_PANE)?;
@@ -875,7 +891,7 @@ fn a_hidden_pane_withdraws_its_overlay_window_while_the_visible_pane_keeps_going
         .find(|source| {
             !matches!(
                 source.kind,
-                vivid_gateway::BridgeSourceKind::VectorScene { .. }
+                vivid_sdk::presenter::BridgeSourceKind::VectorScene { .. }
             )
         })
         .map(|source| source.key)
@@ -905,7 +921,7 @@ fn a_hidden_pane_withdraws_its_overlay_window_while_the_visible_pane_keeps_going
     );
 
     // Both visible again: the window returns, and its producer never stopped being able to draw.
-    window.present(scene(0x00ff00ff))?;
+    window.present(scene(0x00ff_00ff))?;
     let restored = snapshot(&inner, &[OVERLAY_PANE, RASTER_PANE]).bridge_projection();
     relay.rebuild(&restored.surfaces, &restored.sources, &restored.nodes)?;
     let returned = hosted_window(&outer, &[OUTER_PANE]);
@@ -936,14 +952,14 @@ fn one_overlay_producer_closing_leaves_the_other_reusing_the_same_ids_intact() -
     let second_window = window_of(&second, 12., 20.)?;
     let first_image = first_window.upload_rgba(1, 1, &[255, 0, 0, 255])?;
     let second_image = second_window.upload_rgba(1, 1, &[0, 0, 255, 255])?;
-    let mut first_scene = scene(0xff0000ff);
+    let mut first_scene = scene(0xff00_00ff);
     first_window.draw_image(
         &mut first_scene,
         &first_image,
         Rect::new(0., 0., 10., 10.).unwrap(),
         u16::MAX,
     )?;
-    let mut second_scene = scene(0x0000ffff);
+    let mut second_scene = scene(0x0000_ffff);
     second_window.draw_image(
         &mut second_scene,
         &second_image,
@@ -998,15 +1014,15 @@ fn one_overlay_producer_closing_leaves_the_other_reusing_the_same_ids_intact() -
                 .id,
         );
         for (kind, body) in source.retained_vector {
-            relay.media_chunk(
-                0,
-                source.key,
-                kind,
-                0,
-                body.len() as u32,
-                true,
-                body.to_vec(),
-            )?;
+            relay.media_chunk(MediaChunk {
+                delivery_id: 0,
+                source: source.key,
+                record_type: kind,
+                offset: 0,
+                total: u32::try_from(body.len()).unwrap(),
+                last: true,
+                bytes: body.to_vec(),
+            })?;
             finish_delivery(&inner, &mut relay, 0)?;
         }
     }
@@ -1076,15 +1092,15 @@ fn one_overlay_producer_closing_leaves_the_other_reusing_the_same_ids_intact() -
     relay.rebuild(&after.surfaces, &after.sources, &after.nodes)?;
     let retained = snapshot(&inner, &panes).sources.remove(0);
     let frame = retained.retained.unwrap();
-    relay.media_chunk(
-        0,
-        survivor_source,
-        vivid_protocol::messages::VECTOR_FRAME,
-        0,
-        frame.len() as u32,
-        true,
-        frame.to_vec(),
-    )?;
+    relay.media_chunk(MediaChunk {
+        delivery_id: 0,
+        source: survivor_source,
+        record_type: vivid_protocol::messages::VECTOR_FRAME,
+        offset: 0,
+        total: u32::try_from(frame.len()).unwrap(),
+        last: true,
+        bytes: frame.to_vec(),
+    })?;
     finish_delivery(&inner, &mut relay, 0)?;
     // Waiting for the new display list is the assertion: the first one is retained until it lands.
     outer_frame(&outer, OUTER_PANE, |_, frame| frame.canvas == second_scene);
