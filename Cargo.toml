@@ -18,7 +18,7 @@ categories = ["network-programming", "multimedia"]
 testing = ["vivid_sdk/testing"]
 
 [dependencies]
-vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
+vivid_protocol = { version = "1.5.12", path = "../vivid_protocol" }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["presenter"] }
 
 [dev-dependencies]

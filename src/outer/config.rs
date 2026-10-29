@@ -490,6 +490,12 @@ pub(super) fn track_configuration(
             KindConfiguration::Raster(_) => SLOT_RASTER,
             KindConfiguration::EncodedImage(_) => SLOT_POSTER,
             KindConfiguration::VectorScene(_) => SLOT_VECTOR,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "track kind has no outer visual slot",
+                ));
+            }
         },
         mode,
         lane,

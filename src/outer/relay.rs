@@ -565,19 +565,19 @@ impl OuterMediaWriter {
         match record_type {
             messages::VECTOR_ASSET => {
                 let asset = vivid_protocol::vector::ImageAsset::decode(body)
-                    .map_err(|error| invalid_data(error.0))?;
+                    .map_err(|error| invalid_data(error.reason()))?;
                 // Each outer track is dedicated to this complete inner source identity, so its
                 // freshly established asset namespace can use the validated ascending IDs.
                 self.channel.send_vector_asset(&asset)
             }
             messages::VECTOR_ASSET_RELEASE => {
                 let release = vivid_protocol::vector::AssetRelease::decode(body)
-                    .map_err(|error| invalid_data(error.0))?;
+                    .map_err(|error| invalid_data(error.reason()))?;
                 self.channel.release_vector_asset(release.id)
             }
             messages::VECTOR_FRAME => {
                 let mut frame = vivid_protocol::vector::Frame::decode(body)
-                    .map_err(|error| invalid_data(error.0))?;
+                    .map_err(|error| invalid_data(error.reason()))?;
                 let mut canvas = vivid_protocol::vector::Canvas::new();
                 let key = BridgeSurfaceKey {
                     producer: self.key.producer,
@@ -601,7 +601,7 @@ impl OuterMediaWriter {
                         }
                         canvas
                             .push(command)
-                            .map_err(|error| invalid_data(error.0))?;
+                            .map_err(|error| invalid_data(error.reason()))?;
                     }
                 }
                 frame.canvas = canvas;
@@ -709,7 +709,7 @@ impl OuterMediaWriter {
                         .operations
                         .iter()
                         .map(parsed_delta_operation)
-                        .collect::<Vec<_>>();
+                        .collect::<io::Result<Vec<_>>>()?;
                     let sequence = self.channel.send_raster_delta_adaptive(
                         epoch,
                         id,
@@ -801,8 +801,8 @@ fn next_outer_identity(track: &mut OuterMediaWriter, inner_epoch: u32) -> io::Re
 
 fn parsed_delta_operation<'a>(
     operation: &'a media::ParsedRasterDeltaOperation<'a>,
-) -> RasterDeltaOperation<'a> {
-    match operation {
+) -> io::Result<RasterDeltaOperation<'a>> {
+    Ok(match operation {
         media::ParsedRasterDeltaOperation::Overwrite {
             x,
             y,
@@ -834,5 +834,7 @@ fn parsed_delta_operation<'a>(
             source_x: *source_x,
             source_y: *source_y,
         },
-    }
+        // An operation this build cannot re-originate is refused, not dropped from the frame.
+        _ => return Err(invalid_data("raster delta operation is not supported")),
+    })
 }
