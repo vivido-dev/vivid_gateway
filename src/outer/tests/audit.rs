@@ -58,30 +58,32 @@ fn delta_recovery_waits_for_full_frame() {
         .unwrap();
     let pixels = [0xaa, 0xbb, 0xcc, 0xff];
     let skipped = media::raster_delta_frame_body(
-        1,
-        2,
-        1,
-        0,
-        0,
-        RASTER_WIDTH,
-        RASTER_HEIGHT,
+        &vivid_protocol::media::RasterDeltaFrame {
+            epoch: 1,
+            frame_id: 2,
+            base_frame_id: 1,
+            pts_us: 0,
+            duration_us: 0,
+            width: RASTER_WIDTH,
+            height: RASTER_HEIGHT,
+            operations: &[
+                RasterDeltaOperation::Overwrite {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    rgba: &pixels,
+                },
+                RasterDeltaOperation::Overwrite {
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    rgba: &pixels,
+                },
+            ],
+        },
         INNER_DELTA_OPERATIONS,
-        &[
-            RasterDeltaOperation::Overwrite {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-                rgba: &pixels,
-            },
-            RasterDeltaOperation::Overwrite {
-                x: 1,
-                y: 0,
-                width: 1,
-                height: 1,
-                rgba: &pixels,
-            },
-        ],
         false,
     )
     .unwrap();
@@ -405,7 +407,14 @@ fn slow_readiness_does_not_block_fragmented_media_for_other_owners() {
         .update_playback(&previous, &[x.clone(), y.clone()])
         .unwrap();
     bridge.retry_pending_activation().unwrap();
-    let body = media::raster_frame_body(1, 1, 16, 16, &[0x7f; 16 * 16 * 4]).unwrap();
+    let body = media::raster_frame_body(&vivid_protocol::media::RasterFrame {
+        epoch: 1,
+        frame_id: 1,
+        width: 16,
+        height: 16,
+        rgba: &[0x7f; 16 * 16 * 4],
+    })
+    .unwrap();
     for (index, chunk) in body.chunks(64).enumerate() {
         let offset = index * 64;
         for key in [x.key, y.key] {

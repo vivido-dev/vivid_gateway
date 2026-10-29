@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
-use vivid_protocol::registry;
+use vivid_protocol::messages;
 use vivid_sdk::presenter::{BridgeNode, BridgeSourceKind, BridgeSurface};
 use vivid_sdk::{RequestMetadata, SceneNode};
 
@@ -144,7 +144,7 @@ impl OuterBridge {
             match attempt {
                 Ok(()) => return Ok(()),
                 Err(error)
-                    if presenter_code(&error) == Some(registry::error::STALE_TARGET_GENERATION) =>
+                    if presenter_code(&error) == Some(messages::ERROR_STALE_TARGET_GENERATION) =>
                 {
                     let moved = self.poll_outer_session();
                     self.drain_session_events()?;

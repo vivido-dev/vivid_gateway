@@ -449,7 +449,14 @@ fn terminating_hops_derive_independent_channel_authenticators() -> io::Result<()
     assert_ne!(inner_root.expose(), outer_root.expose());
 
     let derive = |root: &Secret32| {
-        let prk = extract_handshake_prk(root, &[1; 32], &[2; 32], &[0; 32]);
+        let prk = extract_handshake_prk(
+            root,
+            &vivid_protocol::auth::HandshakeNonces {
+                client: [1; 32],
+                server: [2; 32],
+            },
+            &[0; 32],
+        );
         derive_session_keys(&prk, 1, 1, &[3; 16]).0
     };
     let inner_keys = derive(&inner_root);

@@ -683,7 +683,11 @@ impl OuterMediaWriter {
                             "raster delta arrived for a non-delta outer track",
                         ));
                     };
-                    let frame = media::parse_delta_raster_frame(body, width, height, limit)?;
+                    let frame = media::parse_delta_raster_frame(
+                        body,
+                        vivid_protocol::media::RasterSize { width, height },
+                        limit,
+                    )?;
                     if self.awaiting_full_frame
                         || self.last_raster_id == 0
                         || frame.epoch != self.inner_epoch

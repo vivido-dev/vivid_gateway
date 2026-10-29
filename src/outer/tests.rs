@@ -1509,7 +1509,14 @@ fn active_live_raster_and_audio_keep_advancing_without_play() {
         .rebuild(&[surface], &[raster, audio], &[node])
         .unwrap();
 
-    let full = media::raster_frame_body(1, 1, 2, 1, &[0xff, 0, 0, 0xff, 0, 0, 0, 0xff]).unwrap();
+    let full = media::raster_frame_body(&vivid_protocol::media::RasterFrame {
+        epoch: 1,
+        frame_id: 1,
+        width: 2,
+        height: 1,
+        rgba: &[0xff, 0, 0, 0xff, 0, 0, 0, 0xff],
+    })
+    .unwrap();
     let audio_packet = |packet_id| {
         media::audio_packet_body(AudioPacket {
             epoch: 1,
@@ -1582,8 +1589,14 @@ fn active_live_raster_and_audio_keep_advancing_without_play() {
         "live audio was incorrectly capped at one timed pre-roll record"
     );
 
-    let next_frame =
-        media::raster_frame_body(1, 2, 2, 1, &[0, 0xff, 0, 0xff, 0, 0, 0, 0xff]).unwrap();
+    let next_frame = media::raster_frame_body(&vivid_protocol::media::RasterFrame {
+        epoch: 1,
+        frame_id: 2,
+        width: 2,
+        height: 1,
+        rgba: &[0, 0xff, 0, 0xff, 0, 0, 0, 0xff],
+    })
+    .unwrap();
     for (delivery, key, record_type, body) in [
         (3, raster_key, messages::RASTER_FRAME, next_frame),
         (4, audio_key, messages::AUDIO_PACKET, audio_packet(2)),
@@ -1901,33 +1914,35 @@ fn raster_writer(outer_delta_operations: u32) -> (vivid_sdk::Session, OuterMedia
 }
 
 fn full_frame_body(frame_id: u64) -> Vec<u8> {
-    media::raster_frame_body(
-        1,
+    media::raster_frame_body(&vivid_protocol::media::RasterFrame {
+        epoch: 1,
         frame_id,
-        RASTER_WIDTH,
-        RASTER_HEIGHT,
-        &[0x10, 0x20, 0x30, 0xff].repeat((RASTER_WIDTH * RASTER_HEIGHT) as usize),
-    )
+        width: RASTER_WIDTH,
+        height: RASTER_HEIGHT,
+        rgba: &[0x10, 0x20, 0x30, 0xff].repeat((RASTER_WIDTH * RASTER_HEIGHT) as usize),
+    })
     .unwrap()
 }
 
 fn delta_body(frame_id: u64, base_frame_id: u64) -> Vec<u8> {
     media::raster_delta_frame_body(
-        1,
-        frame_id,
-        base_frame_id,
-        0,
-        0,
-        RASTER_WIDTH,
-        RASTER_HEIGHT,
+        &vivid_protocol::media::RasterDeltaFrame {
+            epoch: 1,
+            frame_id,
+            base_frame_id,
+            pts_us: 0,
+            duration_us: 0,
+            width: RASTER_WIDTH,
+            height: RASTER_HEIGHT,
+            operations: &[RasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                rgba: &[0xaa, 0xbb, 0xcc, 0xff],
+            }],
+        },
         INNER_DELTA_OPERATIONS,
-        &[RasterDeltaOperation::Overwrite {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-            rgba: &[0xaa, 0xbb, 0xcc, 0xff],
-        }],
         false,
     )
     .unwrap()
