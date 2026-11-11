@@ -8,6 +8,7 @@
 //! vector-scene channel and its credit, and the surface lifecycle all cross two authenticated
 //! sessions on two sockets, because that is where ordering and liveness can actually go wrong.
 
+// Rust guideline compliant 2026-10-07
 use std::collections::HashSet;
 use std::io;
 use std::time::{Duration, Instant};
@@ -71,6 +72,105 @@ fn scene(colour: u32) -> Canvas {
         )
         .unwrap();
     canvas
+}
+
+#[test]
+fn plain_text_measurements_cross_two_authenticated_hops_in_each_owners_namespace() -> io::Result<()>
+{
+    use vivid_protocol::messages;
+    use vivid_protocol::overlay::wire::text::{MeasureText, TextMeasurement};
+    use vivid_protocol::vector::{Point, Scalar, Text};
+
+    let (inner, endpoint) = overlay_presenter()?;
+    inner.enable_overlay_host_relay();
+    let first = overlay_producer(&endpoint, &pane(&inner, 1)?, "plain-text-first")?;
+    let second = overlay_producer(&endpoint, &pane(&inner, 2)?, "plain-text-second")?;
+    let a = window_of(&first, 0., 0.)?;
+    let b = window_of(&second, 0., 0.)?;
+    let (outer, endpoint) = overlay_presenter()?;
+    outer.enable_overlay_host_relay();
+    let mut relay = bridge(&endpoint, &pane(&outer, 9)?)?;
+    let projection = snapshot(&inner, &[1, 2]).bridge_projection();
+    relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
+    let query = |source: &str| Text {
+        text: source.into(),
+        origin: Point::new(0., 0.).unwrap(),
+        size: Scalar::new(16.).unwrap(),
+        family: String::new(),
+        weight: 400,
+        italic: false,
+        color: Color(0xffff_ffff),
+        max_width: None,
+    };
+    let text_a = query("owner-a");
+    let text_b = query("owner-b");
+    std::thread::scope(|scope| -> io::Result<()> {
+        let first = scope.spawn(|| a.measure_text(&text_a));
+        let second = scope.spawn(|| b.measure_text(&text_b));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut inner_owners = HashSet::new();
+        let mut inner_addresses = HashSet::new();
+        let mut outer_addresses = HashSet::new();
+        while !first.is_finished() || !second.is_finished() {
+            for request in inner.take_overlay_host_requests() {
+                assert_eq!(request.record_type, messages::MEASURE_OVERLAY_TEXT);
+                inner_owners.insert(request.surface.producer);
+                inner_addresses.insert((request.surface.context, request.surface.surface));
+                assert!(relay.can_service_overlay_host_request(&request));
+                relay.start_overlay_host_request(request)?;
+            }
+            for request in outer.take_overlay_host_requests() {
+                assert_eq!(request.record_type, messages::MEASURE_OVERLAY_TEXT);
+                assert!(request.layout_ids.is_empty());
+                let envelope = messages::decode_control(&request.body)?;
+                let query =
+                    MeasureText::decode(request.surface.surface, &Value::Map(envelope.payload))?;
+                outer_addresses.insert((query.address.context_id, query.address.surface_id));
+                // A physical font-service fixture supplies distinctive metrics;
+                // the relay must preserve them and restore the inner address.
+                let width = if query.text.text == "owner-a" {
+                    73.
+                } else {
+                    91.
+                };
+                let answer = TextMeasurement {
+                    truncated_at: None,
+                    width: Scalar::new(width).unwrap(),
+                    height: Scalar::new(19.).unwrap(),
+                    lines: Vec::new(),
+                    clusters: Vec::new(),
+                };
+                outer.complete_overlay_host_request(
+                    request.id,
+                    Ok(messages::Envelope::new(
+                        envelope.request_id,
+                        answer.payload(query.address)?,
+                    )
+                    .encode()?),
+                );
+            }
+            for (id, response) in relay.take_overlay_host_replies() {
+                inner
+                    .complete_overlay_host_request(id, response.map_err(|error| error.to_string()));
+            }
+            assert!(Instant::now() < deadline, "plain measurement relay stalled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(first.join().unwrap()?.width, Scalar::new(73.).unwrap());
+        assert_eq!(second.join().unwrap()?.width, Scalar::new(91.).unwrap());
+        assert_eq!(inner_owners.len(), 2);
+        assert_eq!(
+            inner_addresses.len(),
+            1,
+            "owners intentionally reuse local IDs"
+        );
+        assert_eq!(
+            outer_addresses.len(),
+            2,
+            "outer surfaces must be re-originated"
+        );
+        Ok(())
+    })
 }
 
 #[test]
@@ -410,7 +510,16 @@ fn child_modal_and_pointer_capture_cross_the_gateway() -> io::Result<()> {
         &parent,
         OverlayWindowOptions::new(Rect::new(30., 30., 100., 80.).unwrap(), WindowMode::Modal),
     )?;
-    child.present(scene(2))?;
+    let mut child_scene = scene(2);
+    child_scene
+        .push(vivid_sdk::overlay::Command::Hit {
+            id: 1,
+            path: Path::rectangle(Rect::new(0., 0., 100., 80.).unwrap()).unwrap(),
+            role: vivid_sdk::overlay::HitRole::Input,
+            cursor: None,
+        })
+        .unwrap();
+    child.present(child_scene)?;
     let (outer, endpoint) = overlay_presenter()?;
     let mut relay = bridge(&endpoint, &pane(&outer, 9)?)?;
     let projection = snapshot(&inner, &[1]).bridge_projection();
@@ -443,8 +552,27 @@ fn child_modal_and_pointer_capture_cross_the_gateway() -> io::Result<()> {
             .any(|surface| Some(surface.key) == modal.1.parent)
     );
     assert!(outer.overlay_pointer(9, 45., 45., Some((1, true)), 0)?);
-    for (surface, body) in relay.take_overlay_input()? {
-        inner.relay_overlay_input(surface, &body)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        for (surface, body) in relay.take_overlay_input()? {
+            assert!(inner.relay_overlay_input(surface, &body)?);
+        }
+        if let Some(vivid_sdk::OverlayLaneEvent::Input(event)) =
+            producer.wait_event(Duration::from_millis(10))?
+            && matches!(
+                event.event,
+                vivid_sdk::overlay::Event::Pointer {
+                    button: Some((1, true)),
+                    ..
+                }
+            )
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial press never reached producer"
+        );
     }
     std::thread::scope(|scope| -> io::Result<()> {
         let capture = scope.spawn(|| producer.capture_pointer(&child, true));

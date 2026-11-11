@@ -1,5 +1,6 @@
 //! Relays inner overlay windows, text layouts and host requests into the outer session.
 
+// Rust guideline compliant 2026-10-07
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
@@ -169,16 +170,18 @@ impl OuterBridge {
         request: &vivid_sdk::presenter::OverlayHostRequest,
     ) -> bool {
         self.overlay_jobs.len() < MAX_OVERLAY_JOBS
-            && (request.record_type == messages::MEASURE_OVERLAY_TEXT_BATCH
-                || self
-                    .tracks
-                    .iter()
-                    .filter(|(key, _)| {
-                        key.producer == request.surface.producer
-                            && key.context == request.surface.context
-                            && key.surface == request.surface.surface
-                    })
-                    .all(|(_, track)| track.media_inflight == 0))
+            && (matches!(
+                request.record_type,
+                messages::MEASURE_OVERLAY_TEXT | messages::MEASURE_OVERLAY_TEXT_BATCH
+            ) || self
+                .tracks
+                .iter()
+                .filter(|(key, _)| {
+                    key.producer == request.surface.producer
+                        && key.context == request.surface.context
+                        && key.surface == request.surface.surface
+                })
+                .all(|(_, track)| track.media_inflight == 0))
     }
 
     /// Starts `request` on a worker thread.
@@ -294,6 +297,20 @@ impl OuterBridge {
                         .ok_or_else(|| invalid_data("outer overlay input lane is absent"))?
                         .capture(query, INPUT_REQUEST_TIMEOUT)?;
                     Vec::new()
+                }
+                messages::MEASURE_OVERLAY_TEXT => {
+                    use vivid_protocol::overlay::wire::text::{MeasureText, TextMeasurement};
+                    let mut query = MeasureText::decode(request.surface.surface, &value)?;
+                    let inner = query.address;
+                    query.address = address;
+                    let fields = host(
+                        messages::MEASURE_OVERLAY_TEXT,
+                        address.surface_id,
+                        query.payload()?,
+                    )?;
+                    let answer = TextMeasurement::decode(address, &Value::Map(fields))?;
+                    answer.validate_text(&query.text.text)?;
+                    answer.payload(inner)?
                 }
                 messages::MEASURE_OVERLAY_TEXT_BATCH => {
                     let mut query = MeasureBatch::decode(request.surface.surface, &value)

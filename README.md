@@ -11,6 +11,11 @@ re-origination half: `OuterBridge`, configured with `OuterBridge::builder` and c
 
 The two hops never share secrets, protocol identities, revisions, generations, epochs, or media
 IDs. Products provide the inner accepted-connection listener and the outer endpoints or factory.
+
+Plain text measurements and retained-layout batches both reach the physical host;
+addresses are re-originated on each hop and returned geometry is validated against
+the source text. Measurements do not wait for unrelated media delivery.
+
 The inner target is configurable through `PresentationTarget`; terminal and desktop targets are
 included. Resource contracts, supported profiles, and additional capture restrictions are route
 policy.
