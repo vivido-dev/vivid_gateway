@@ -69,6 +69,11 @@ impl OuterBridge {
                         "outer overlay input lane closed",
                     ));
                 }
+                vivid_sdk::OverlayLaneEvent::EditorEdit(_) => {
+                    return Err(invalid_data(
+                        "document editing is unavailable through this relay",
+                    ));
+                }
                 vivid_sdk::OverlayLaneEvent::Viewport(_) => continue,
             };
             let Some(key) = self.outer_surface_key(&event.address) else {
