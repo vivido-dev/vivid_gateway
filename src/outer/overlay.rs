@@ -171,13 +171,32 @@ impl OuterBridge {
 
     /// Whether [`start_overlay_host_request`](Self::start_overlay_host_request) would accept `request` now.
     ///
-    /// At most 16 requests run at once. Measurement and window actions do not wait for media; other requests wait
-    /// until its surface has no relayed media in flight, so it cannot overtake the scene it names.
+    /// At most 16 requests run at once, at most four per original producer.
+    /// Measurement and window actions do not wait for media; other requests wait
+    /// until their surface has no relayed media in flight. Expired actions are
+    /// ready for immediate rejection even if their projection disappeared.
     pub fn can_service_overlay_host_request(
         &self,
         request: &vivid_sdk::presenter::OverlayHostRequest,
     ) -> bool {
+        // Rejected/expired actions must leave an integration's queue even if their
+        // projection disappeared or live jobs occupy every slot. Preparation rejects
+        // them without spawning a worker or issuing any outer RPC.
+        if request.record_type == messages::OVERLAY_ACTION
+            && self
+                .action_relay
+                .as_ref()
+                .is_none_or(|route| !route.request(request).is_pending())
+        {
+            return true;
+        }
         self.overlay_jobs.len() < MAX_OVERLAY_JOBS
+            && self
+                .overlay_jobs
+                .iter()
+                .filter(|job| job.owner == request.surface.producer)
+                .count()
+                < MAX_OWNER_OVERLAY_JOBS
             && (request.record_type != messages::OVERLAY_ACTION
                 || self
                     .overlay_windows
@@ -236,11 +255,12 @@ impl OuterBridge {
             ));
         }
         let id = request.id;
+        let owner = request.surface.producer;
         let job = self.prepare_overlay_host_request(request)?;
         let worker = thread::Builder::new()
             .name("vivid-overlay-host".into())
             .spawn(job)?;
-        self.overlay_jobs.push((id, worker));
+        self.overlay_jobs.push(HostWorker { id, owner, worker });
         Ok(())
     }
 
@@ -250,8 +270,8 @@ impl OuterBridge {
     pub fn take_overlay_host_replies(&mut self) -> Vec<(u64, io::Result<Vec<u8>>)> {
         let mut index = 0;
         while index < self.overlay_jobs.len() {
-            if self.overlay_jobs[index].1.is_finished() {
-                let (id, worker) = self.overlay_jobs.swap_remove(index);
+            if self.overlay_jobs[index].worker.is_finished() {
+                let HostWorker { id, worker, .. } = self.overlay_jobs.swap_remove(index);
                 self.overlay_results.push((
                     id,
                     worker
@@ -266,7 +286,7 @@ impl OuterBridge {
     }
 
     pub(super) fn retire_overlay_jobs(&mut self) {
-        for (id, worker) in self.overlay_jobs.drain(..) {
+        for HostWorker { id, worker, .. } in self.overlay_jobs.drain(..) {
             let _ = worker.join();
             self.overlay_results.push((
                 id,
@@ -322,6 +342,9 @@ impl OuterBridge {
                 .as_ref()
                 .ok_or_else(|| invalid_data("window-action forwarding is not enabled"))?
                 .request(&request);
+            if !admission.is_pending() {
+                return Err(invalid_data("original window action is retired or expired"));
+            }
             let centered = if query.action == vivid_protocol::overlay::wire::WindowAction::Center {
                 let bounds = admission
                     .centered_bounds()
@@ -346,6 +369,9 @@ impl OuterBridge {
             .map_err(io::Error::other)?;
             let cancelled = Arc::clone(&self.cancellation.cancelled);
             return Ok(Box::new(move || {
+                if cancelled.load(Ordering::Acquire) || !admission.is_pending() {
+                    return Err(invalid_data("original window action is retired or expired"));
+                }
                 let status = host(
                     messages::QUERY_OVERLAY,
                     address.surface_id,
@@ -742,6 +768,12 @@ impl OuterBridge {
     }
 }
 
+pub(super) struct HostWorker {
+    id: u64,
+    owner: u64,
+    worker: thread::JoinHandle<io::Result<Vec<u8>>>,
+}
+
 pub(super) type OverlayJob = Box<dyn FnOnce() -> io::Result<Vec<u8>> + Send>;
 
 pub(super) type OverlayRevisions = Arc<RelayedScenes>;
@@ -767,6 +799,9 @@ const INPUT_LANE_GENERATION: u64 = 1;
 const MAX_INPUT_EVENTS_PER_CALL: usize = 64;
 /// Overlay host requests that may run at once, each on its own worker thread.
 const MAX_OVERLAY_JOBS: usize = 16;
+// A quarter of the pool leaves room for peers. Four also leaves half the
+// physical SDK host's eight per-session callback slots for another origin.
+const MAX_OWNER_OVERLAY_JOBS: usize = 4;
 /// Relayed scenes remembered per window for translating between inner and outer revisions.
 ///
 /// An input event, capture, caret or semantic tree naming an older scene can no longer be

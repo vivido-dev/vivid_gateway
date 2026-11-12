@@ -3,6 +3,7 @@ use super::overlay::RelayedScenes;
 use super::playback::default_play_request;
 use super::relay::{OUTER_MEDIA_WRITER_QUEUE, OuterMediaWriter, run_outer_media_writer};
 use super::*;
+use std::thread;
 use std::time::Duration;
 use vivid_protocol::registry;
 

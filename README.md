@@ -222,3 +222,41 @@ raise/lower pixels, pane-relative center, group close and an unchanged same-ID p
 See the [window-action evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-actions-macos.json).
 Production transport adoption, load/recovery and physical platform/device
 acceptance remain separate gates.
+
+## Slow clients and action deadlines
+
+Relayed actions run on the SDK's bounded host workers, leaving the authenticated
+control reader available for queries and cleanup. The SDK allows at most 64 host
+workers, at most eight per authenticated original producer (or a smaller negotiated
+pending-request budget). The gateway runs at most 16 host jobs and four per original
+producer, including text callbacks and actions. A busy origin returns `WouldBlock`
+so the integration can retain its bounded queue and continue servicing peers. Reap
+finished jobs with `take_overlay_host_replies` before scheduling the next batch.
+The synchronous `overlay_host_request` helper runs on the caller; integrations
+needing this scheduling policy must use the asynchronous API.
+
+An action's original ten-second deadline starts at admission and includes queueing
+and callback wakeup time. The SDK refuses acknowledgements after that deadline.
+The gateway checks the opaque receipt before querying the physical window and
+claims it immediately before mutation. Expired or retired actions are ready for
+immediate rejection even when live jobs fill the pool or the original projection
+is gone; `can_service_overlay_host_request` therefore can return true for a request
+that `start_overlay_host_request` immediately rejects without allocating a worker.
+Neither dispatch nor return of a delayed result refreshes the original deadline.
+
+A physical mutation already admitted before expiry may have happened even when
+the original call times out. Its late reply cannot advance the original window;
+there is no rollback or automatic retry. A new explicit producer action queries
+the independent physical revision again. The local deadline bounds original
+admission and acknowledgement, rather than arbitrary external transport writes or
+physical GPU presentation.
+
+The [local macOS pressure evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-pressure-macos.json)
+records real loopback checks for eight held actions and a rejected ninth, prompt
+same-session queries, same-ID peer actions, queued expiry after owner cleanup,
+late claimed results, four stalled font callbacks, peer retained-media receipts,
+focus revocation and recovered capacity. These pressure checks use authenticated
+socket/native protocol paths without GPU stress or physical input. Existing
+headless Metal fixtures separately cover the final GUI integration. Sustained
+multi-owner load, an unresponsive transport, combined display recovery and other
+platform/device acceptance remain open gates.

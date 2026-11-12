@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
 use std::time::Instant;
 use vivid_protocol::auth::Secret32;
 use vivid_protocol::cbor::Value;
@@ -31,7 +30,7 @@ pub use playback::{ClockState, EosState, PlaybackSnapshot};
 pub use relay::{DeliveryOutcome, MediaChunk};
 
 use config::{display_from_target, producer_config};
-use overlay::{OverlayLayouts, OverlayRevisions, OverlayWindowState};
+use overlay::{HostWorker, OverlayLayouts, OverlayRevisions, OverlayWindowState};
 use playback::{
     PositionJob, PositionObserver, RetiringSurface, hold_source, preferred_surface_clock,
 };
@@ -230,7 +229,7 @@ pub struct OuterBridge {
     document_target: std::sync::Weak<vivid_sdk::presenter::VirtualVivid>,
     documents: Arc<Mutex<document::Documents>>,
     document_input: std::collections::VecDeque<DocumentInput>,
-    overlay_jobs: Vec<(u64, thread::JoinHandle<io::Result<Vec<u8>>>)>,
+    overlay_jobs: Vec<HostWorker>,
     action_relay: Option<vivid_sdk::presenter::OverlayActionRoute>,
     overlay_results: Vec<(u64, io::Result<Vec<u8>>)>,
     overlay_input: Option<Arc<vivid_sdk::OverlayInputLane>>,
