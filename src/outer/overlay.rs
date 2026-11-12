@@ -24,7 +24,7 @@ impl OuterBridge {
     /// Returns an error when the input watchdog cannot be renewed or an event cannot be encoded, and
     /// [`io::ErrorKind::BrokenPipe`] when the outer overlay input lane closes.
     pub fn take_overlay_input(&mut self) -> io::Result<Vec<(BridgeSurfaceKey, Vec<u8>)>> {
-        let Some(input) = &self.overlay_input else {
+        let Some(input) = self.overlay_input.clone() else {
             return Ok(Vec::new());
         };
         if self.overlay_renewed.elapsed() >= INPUT_RENEW_INTERVAL {
@@ -69,16 +69,18 @@ impl OuterBridge {
                         "outer overlay input lane closed",
                     ));
                 }
-                vivid_sdk::OverlayLaneEvent::EditorEdit(_) => {
-                    return Err(invalid_data(
-                        "document editing is unavailable through this relay",
-                    ));
+                vivid_sdk::OverlayLaneEvent::EditorEdit(edit) => {
+                    self.queue_document_input(edit)?;
+                    continue;
                 }
                 vivid_sdk::OverlayLaneEvent::Viewport(_) => continue,
             };
             let Some(key) = self.outer_surface_key(&event.address) else {
                 continue;
             };
+            if matches!(event.event, vivid_protocol::overlay::Event::Focus(false)) {
+                self.retire_documents(Some(key));
+            }
             let Some(window) = self.overlay_windows.get(&key) else {
                 continue;
             };
@@ -122,7 +124,7 @@ impl OuterBridge {
     }
 
     /// The inner surface an outer window address belongs to.
-    fn outer_surface_key(&self, address: &WindowAddress) -> Option<BridgeSurfaceKey> {
+    pub(super) fn outer_surface_key(&self, address: &WindowAddress) -> Option<BridgeSurfaceKey> {
         self.surfaces
             .iter()
             .find(|(_, surface)| {
@@ -175,6 +177,7 @@ impl OuterBridge {
         request: &vivid_sdk::presenter::OverlayHostRequest,
     ) -> bool {
         self.overlay_jobs.len() < MAX_OVERLAY_JOBS
+            && self.document_request_available(request)
             && (matches!(
                 request.record_type,
                 messages::MEASURE_OVERLAY_TEXT | messages::MEASURE_OVERLAY_TEXT_BATCH
@@ -272,6 +275,9 @@ impl OuterBridge {
             .session
             .overlay_host_handle()
             .ok_or_else(|| invalid_data("outer overlay host is offline"))?;
+        if request.record_type == messages::SET_OVERLAY_TEXT_CONTEXT {
+            return self.prepare_document_request(&request, address, host);
+        }
         let overlay_layouts = Arc::clone(&self.overlay_layouts);
         let overlay_revisions = Arc::clone(&self.overlay_revisions);
         let input = self.overlay_input.clone();
@@ -508,8 +514,17 @@ impl OuterBridge {
     pub(super) fn sync_overlay_window(&mut self, surface: &BridgeSurface) -> io::Result<()> {
         let Some(window) = surface.overlay_window else {
             self.overlay_windows.remove(&surface.key);
+            self.retire_documents(Some(surface.key));
             return Ok(());
         };
+        if !window.visible
+            || self
+                .overlay_windows
+                .get(&surface.key)
+                .is_some_and(|old| old.inner_generation != window.generation)
+        {
+            self.retire_documents(Some(surface.key));
+        }
         if self.overlay_input.is_none() {
             let input = self
                 .session
@@ -604,7 +619,7 @@ impl OuterBridge {
     }
 }
 
-type OverlayJob = Box<dyn FnOnce() -> io::Result<Vec<u8>> + Send>;
+pub(super) type OverlayJob = Box<dyn FnOnce() -> io::Result<Vec<u8>> + Send>;
 
 pub(super) type OverlayRevisions = Arc<RelayedScenes>;
 
@@ -750,7 +765,7 @@ pub(super) struct OverlayLayouts {
 pub(super) struct OverlayWindowState {
     offset_x: i64,
     offset_y: i64,
-    inner_generation: u64,
+    pub(super) inner_generation: u64,
     /// The inner window's own revision last successfully relayed, so an unchanged snapshot does
     /// not re-send the same geometry every reconciliation pass.
     pub(super) projected: BridgeOverlayWindow,

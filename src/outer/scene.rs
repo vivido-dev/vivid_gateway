@@ -87,6 +87,7 @@ impl OuterBridge {
                     || source.surface != key.surface
             });
             self.overlay_windows.remove(&key);
+            self.retire_documents(Some(key));
             self.overlay_revisions.retire(Some(key));
             {
                 let mut layouts = self

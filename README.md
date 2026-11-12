@@ -15,9 +15,10 @@ IDs. Products provide the inner accepted-connection listener and the outer endpo
 Plain text measurements and retained-layout batches both reach the physical host;
 addresses are re-originated on each hop and returned geometry is validated against
 the source text. Measurements do not wait for unrelated media delivery.
-`overlay-editor-v1` is withheld: document context, selection and replacement are
-currently implemented for direct local native hosts. Gateway/mux re-origination
-and their platform acceptance remain separate qualification work.
+`overlay-editor-v1` is off by default. An explicitly opted-in, in-process gateway
+route re-originates document context and returns opaque typed edits to its original
+inner presenter. Legacy mux clients and generic/font-only outer hosts continue to
+decline it. See [Document relay](#document-relay) for the integration and limits.
 
 The inner target is configurable through `PresentationTarget`; terminal and desktop targets are
 included. Resource contracts, supported profiles, and additional capture restrictions are route
@@ -75,3 +76,77 @@ never synchronously drains a track after EOS; paused audio must leave seek/resum
 
 Playback completion snapshots include the source decoder reset serial; consumers must pass it
 back to the virtual presenter so a late EOS report cannot end a replacement generation.
+
+## Document relay
+
+A document-capable route must use all three parts of the contract: an opted-in
+bridge bound to the original inner presenter, the SDK's document-aware profile
+setter, and consumption of opaque typed document input. Configure this before
+inner producers authenticate:
+
+```rust
+inner.enable_overlay_host_relay();
+let mut bridge = OuterBridge::builder(authentication, display)
+    .control_endpoint(outer_endpoint)
+    .overlay_document_editing(&inner) // Arc<VirtualVivid>; lifetime is held weakly
+    .build()?;
+inner.set_overlay_document_host_profiles(&bridge.overlay_host_profiles());
+```
+
+Continue servicing projection/media changes, pending activation and bounded host
+requests as usual. Keep unscheduled requests until `can_service_overlay_host_request`
+returns true; publication is serialized per window while unrelated host services
+remain available. Drain ordinary input before typed edits, so focus revocation is
+observed first:
+
+```rust
+for (surface, body) in bridge.take_overlay_input()? {
+    inner.relay_overlay_input(surface, &body)?;
+}
+for edit in bridge.take_overlay_document_input() {
+    let accepted = edit.forward()?; // consumes the original grant; never retarget or retry
+    // false means the original editor, input scope or local deadline was retired.
+}
+```
+
+The physical presenter must actually negotiate `overlay-editor-v1`; the bridge
+never requires it or manufactures support. The legacy SDK `set_overlay_host_profiles`
+continues to withhold it even if a caller lists it. Generic/font-only physical hosts
+and current vvmux/vlib routes still decline it. Desktop targets cannot opt in because
+the terminal overlay profile is unavailable there. A new inner presenter needs a
+new bound bridge; opaque inputs have no serialization or destination-replacement API.
+
+Window addresses, scene revisions, editor incarnations and excerpt revisions are
+mapped independently between authenticated sessions. Text is at most 4 KiB per
+excerpt/commit/preedit, and sensitive contexts stay empty and masked. The bridge
+retains at most 64 document windows and 64 revision mappings per window; one request
+per window may be in flight. Counters use checked allocation and never reuse a
+failed request's proposed identity. Only an acknowledged physical context installs
+its reverse mapping. A failed or uncertain publication must not be retried as an edit.
+
+At most 64 typed input records await the caller, each for at most one second locally.
+An overflowing document queue drops document input while ordinary input continues.
+Forwarding is one-shot and rechecks the original inner authenticated writer/resume,
+source/channel/scene, input lane, focus incarnation and editor, plus the current
+excerpt for absolute operations. Own ordered relative commits may follow earlier
+revisions. Focus loss, hide, owner removal, cancellation and outer-session replacement
+retire queued and already-drained grants. Source-local IDs cannot select a peer.
+An integration must forward immediately; these receipts do not prove app mutation,
+GPU submission or physical display.
+
+The explicit native suite uses real loopback sockets on two independently authenticated
+hops and the SDK `NativeVectorHost` compilation/presentation API. It checks source
+scene 2 against an independently allocated outer scene, Unicode replacement,
+masked fields, same-ID peers, republished contexts after focus return, slow input
+expiry, outer replacement, cancellation and owner-scoped cleanup:
+
+```sh
+cargo test --all-targets --features native-vector-testing
+```
+
+This suite does not submit GPU work or drive a platform IME. The compositor's
+separate direct macOS Metal check remains covered; a combined gateway/GUI frontend,
+physical input sources/candidate menus, relay saturation under a production frontend,
+source lease resume, other platforms and mux transport adoption remain qualification
+gates. The [local macOS evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-relay-macos.json)
+records those boundaries. Production synchronized-media negotiation is unchanged.

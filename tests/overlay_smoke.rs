@@ -29,6 +29,9 @@ use vivid_sdk::{
 };
 
 mod common;
+#[cfg(feature = "native-vector-testing")]
+#[path = "overlay_smoke/document.rs"]
+mod document;
 
 use common::{TcpPresenterListener, pin_endpoints};
 

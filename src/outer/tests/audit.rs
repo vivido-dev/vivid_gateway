@@ -704,6 +704,14 @@ fn outer_sessions_never_require_overlay_profiles_and_offer_only_the_relayed_subs
             target,
         )
         .expect("gateway outer configuration");
+        assert!(
+            !config
+                .required_profiles
+                .iter()
+                .chain(&config.optional_profiles)
+                .any(|profile| profile == registry::OVERLAY_EDITOR),
+            "default relays withhold typed document editing"
+        );
         for profile in &relayed_under_terminal {
             assert!(
                 !config.required_profiles.iter().any(|p| p == profile),

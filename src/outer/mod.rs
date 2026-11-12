@@ -18,12 +18,15 @@ use vivid_sdk::{
 
 mod builder;
 mod config;
+mod document;
 mod overlay;
 mod playback;
 mod relay;
 mod scene;
 
 pub use builder::OuterBridgeBuilder;
+#[doc(inline)]
+pub use document::DocumentInput;
 pub use playback::{ClockState, EosState, PlaybackSnapshot};
 pub use relay::{DeliveryOutcome, MediaChunk};
 
@@ -106,23 +109,34 @@ impl Route {
         &self,
         authentication: &Secret32,
         target_profile: &str,
+        documents: bool,
     ) -> io::Result<vivid_sdk::Session> {
-        match self {
+        let mut config = match self {
             Self::Native {
                 control,
                 realtime,
                 bulk,
-            } => vivid_sdk::Session::connect(producer_config(
+            } => producer_config(
                 Some(control.clone()),
                 realtime.clone(),
                 bulk.clone(),
                 authentication,
                 target_profile,
-            )?),
-            Self::Factory(factory) => vivid_sdk::Session::connect_with_factory(
-                producer_config(None, None, None, authentication, target_profile)?,
-                Arc::clone(factory),
-            ),
+            )?,
+            Self::Factory(_) => producer_config(None, None, None, authentication, target_profile)?,
+        };
+        if documents && target_profile == vivid_protocol::registry::TERMINAL_SURFACE {
+            config
+                .optional_profiles
+                .push(vivid_protocol::registry::OVERLAY_EDITOR.into());
+        }
+        config.optional_profiles.sort();
+        config.optional_profiles.dedup();
+        match self {
+            Self::Native { .. } => vivid_sdk::Session::connect(config),
+            Self::Factory(factory) => {
+                vivid_sdk::Session::connect_with_factory(config, Arc::clone(factory))
+            }
         }
     }
 
@@ -191,6 +205,10 @@ impl BridgeCancel {
 /// Every object allocated here belongs exclusively to the outer session. Inner IDs are lookup
 /// keys only and never become outer Vivid IDs, revisions, generations, epochs, or media IDs.
 pub struct OuterBridge {
+    document_relay: bool,
+    document_target: std::sync::Weak<vivid_sdk::presenter::VirtualVivid>,
+    documents: Arc<Mutex<document::Documents>>,
+    document_input: std::collections::VecDeque<DocumentInput>,
     overlay_jobs: Vec<(u64, thread::JoinHandle<io::Result<Vec<u8>>>)>,
     overlay_results: Vec<(u64, io::Result<Vec<u8>>)>,
     overlay_input: Option<Arc<vivid_sdk::OverlayInputLane>>,
@@ -314,6 +332,10 @@ impl OuterBridge {
             overlay_windows: HashMap::new(),
             overlay_input: None,
             overlay_jobs: Vec::new(),
+            document_relay: false,
+            document_target: std::sync::Weak::new(),
+            documents: Arc::default(),
+            document_input: std::collections::VecDeque::new(),
             overlay_results: Vec::new(),
             overlay_environment: None,
             overlay_renewed: Instant::now(),
@@ -653,9 +675,11 @@ impl OuterBridge {
                 "bridge cancelled",
             ));
         }
-        let session = self
-            .route
-            .connect(&self.authentication, &self.target_profile)?;
+        let session = self.route.connect(
+            &self.authentication,
+            &self.target_profile,
+            self.document_relay,
+        )?;
         let display = display_from_target(&session, self.display)?;
         self.cancellation.install(&session)?;
         let replaced = std::mem::replace(&mut self.session, session);
@@ -663,6 +687,7 @@ impl OuterBridge {
         drop(replaced);
         // Before joining the request workers: one waiting on a retired scene is released by this.
         self.overlay_revisions.retire(None);
+        self.retire_documents(None);
         self.retire_overlay_jobs();
         let microphone_requests = self.microphones.requests();
         self.microphones = crate::microphone::Microphones::default();
@@ -670,6 +695,8 @@ impl OuterBridge {
         self.surfaces.clear();
         self.overlay_input.take();
         self.overlay_windows.clear();
+        self.documents = Arc::default();
+        self.document_input.clear();
         *self
             .overlay_layouts
             .lock()
@@ -815,6 +842,7 @@ impl std::fmt::Debug for OuterBridge {
 impl Drop for OuterBridge {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        self.retire_documents(None);
         self.retire_overlay_jobs();
         self.position_observer.take();
         for track in self.tracks.values() {

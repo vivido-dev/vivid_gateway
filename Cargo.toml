@@ -16,6 +16,8 @@ categories = ["network-programming", "multimedia"]
 # production build of the gateway. The presenter half of that API now lives in `vivid_sdk`, so this
 # forwards rather than gating anything locally.
 testing = ["vivid_sdk/testing"]
+# Explicit native font/vector qualification, independent of production relay defaults.
+native-vector-testing = ["vivid_sdk/vector-render"]
 
 [dependencies]
 vivid_protocol = { version = "1.5.12", path = "../vivid_protocol" }

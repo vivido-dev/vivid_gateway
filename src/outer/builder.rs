@@ -24,6 +24,7 @@ pub struct OuterBridgeBuilder {
     bulk: Option<String>,
     factory: Option<Arc<dyn ConnectionFactory>>,
     target_profile: String,
+    documents: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
 }
 
 impl OuterBridge {
@@ -41,6 +42,7 @@ impl OuterBridge {
             bulk: None,
             factory: None,
             target_profile: registry::TERMINAL_SURFACE.into(),
+            documents: None,
         }
     }
 }
@@ -86,6 +88,22 @@ impl OuterBridgeBuilder {
         self
     }
 
+    /// Opts into typed, owner-scoped document re-origination on terminal targets.
+    ///
+    /// Off by default. The caller must service host requests, drain ordinary input,
+    /// then drain `take_overlay_document_input` and forward each opaque input to
+    /// its original inner presenter. Install negotiated services with the SDK
+    /// document-aware host-profile setter. Legacy mux clients cannot route this type and
+    /// must leave this disabled. The outer native host must also negotiate the profile.
+    #[must_use]
+    pub fn overlay_document_editing(
+        mut self,
+        inner: &Arc<vivid_sdk::presenter::VirtualVivid>,
+    ) -> Self {
+        self.documents = Some(Arc::downgrade(inner));
+        self
+    }
+
     /// Connects the outer producer session and returns the bridge driving it.
     ///
     /// # Errors
@@ -96,6 +114,12 @@ impl OuterBridgeBuilder {
     /// authentication failures, and an outer target descriptor that carries no usable terminal
     /// geometry when `display` has none either, are returned as the outer session reports them.
     pub fn build(self) -> io::Result<OuterBridge> {
+        if self.documents.is_some() && self.target_profile != registry::TERMINAL_SURFACE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "document relay requires a terminal overlay target",
+            ));
+        }
         let route = match (self.control, self.factory) {
             (Some(control), None) => Route::Native {
                 control,
@@ -113,8 +137,16 @@ impl OuterBridgeBuilder {
                 ));
             }
         };
-        let session = route.connect(&self.authentication, &self.target_profile)?;
-        OuterBridge::from_session(session, self.authentication, route, self.display)
+        let session = route.connect(
+            &self.authentication,
+            &self.target_profile,
+            self.documents.is_some(),
+        )?;
+        let mut bridge =
+            OuterBridge::from_session(session, self.authentication, route, self.display)?;
+        bridge.document_relay = self.documents.is_some();
+        bridge.document_target = self.documents.unwrap_or_default();
+        Ok(bridge)
     }
 }
 
@@ -128,6 +160,7 @@ impl std::fmt::Debug for OuterBridgeBuilder {
             .field("bulk", &self.bulk)
             .field("factory", &self.factory.is_some())
             .field("target_profile", &self.target_profile)
+            .field("documents", &self.documents.is_some())
             .finish()
     }
 }

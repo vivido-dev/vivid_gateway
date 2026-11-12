@@ -39,6 +39,6 @@ mod outer;
 pub use microphone::MicrophonePacket;
 #[doc(inline)]
 pub use outer::{
-    BridgeCancel, ClockState, DeliveryOutcome, EosState, MediaChunk, OuterBridge,
+    BridgeCancel, ClockState, DeliveryOutcome, DocumentInput, EosState, MediaChunk, OuterBridge,
     OuterBridgeBuilder, PlaybackSnapshot,
 };
