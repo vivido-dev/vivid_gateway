@@ -3,6 +3,7 @@
 // Rust guideline compliant 2026-10-07
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -170,17 +171,39 @@ impl OuterBridge {
 
     /// Whether [`start_overlay_host_request`](Self::start_overlay_host_request) would accept `request` now.
     ///
-    /// At most 16 requests run at once. Text measurement may always start; any other request waits
+    /// At most 16 requests run at once. Measurement and focus do not wait for media; other requests wait
     /// until its surface has no relayed media in flight, so it cannot overtake the scene it names.
     pub fn can_service_overlay_host_request(
         &self,
         request: &vivid_sdk::presenter::OverlayHostRequest,
     ) -> bool {
         self.overlay_jobs.len() < MAX_OVERLAY_JOBS
+            && (request.record_type != messages::OVERLAY_ACTION
+                || self
+                    .overlay_windows
+                    .get(&request.surface)
+                    .is_some_and(|window| {
+                        messages::decode_control(&request.body)
+                            .ok()
+                            .and_then(|envelope| {
+                                vivid_protocol::overlay::wire::Action::decode(
+                                    request.surface.surface,
+                                    &Value::Map(envelope.payload),
+                                )
+                                .ok()
+                            })
+                            .is_none_or(|action| {
+                                window.inner_generation > action.address.generation
+                                    || (window.inner_generation == action.address.generation
+                                        && window.projected.revision >= action.expected_revision)
+                            })
+                    }))
             && self.document_request_available(request)
             && (matches!(
                 request.record_type,
-                messages::MEASURE_OVERLAY_TEXT | messages::MEASURE_OVERLAY_TEXT_BATCH
+                messages::MEASURE_OVERLAY_TEXT
+                    | messages::MEASURE_OVERLAY_TEXT_BATCH
+                    | messages::OVERLAY_ACTION
             ) || self
                 .tracks
                 .iter()
@@ -277,6 +300,67 @@ impl OuterBridge {
             .ok_or_else(|| invalid_data("outer overlay host is offline"))?;
         if request.record_type == messages::SET_OVERLAY_TEXT_CONTEXT {
             return self.prepare_document_request(&request, address, host);
+        }
+        if request.record_type == messages::OVERLAY_ACTION {
+            let envelope = messages::decode_control(&request.body)?;
+            let mut query = vivid_protocol::overlay::wire::Action::decode(
+                request.surface.surface,
+                &Value::Map(envelope.payload),
+            )?;
+            let window = self
+                .overlay_windows
+                .get(&request.surface)
+                .ok_or_else(|| invalid_data("focus window is absent"))?;
+            if query.action != vivid_protocol::overlay::wire::WindowAction::Focus
+                || query.address.context_id != request.surface.context
+                || query.address.generation != window.inner_generation
+                || query.expected_revision != window.projected.revision
+            {
+                return Err(invalid_data("focus window revision is stale"));
+            }
+            let admission = self
+                .focus_relay
+                .as_ref()
+                .ok_or_else(|| invalid_data("focus forwarding is not enabled"))?
+                .request(&request);
+            query.address = address;
+            let owner = vivid_protocol::identity::SessionIdentity::new(
+                vivid_protocol::identity::PresenterInstanceId([0; 16]),
+                self.session.info().session_id,
+            )
+            .map_err(io::Error::other)?;
+            let cancelled = Arc::clone(&self.cancellation.cancelled);
+            return Ok(Box::new(move || {
+                let status = host(
+                    messages::QUERY_OVERLAY,
+                    address.surface_id,
+                    vivid_protocol::overlay::wire::Query {
+                        context_id: address.context_id,
+                        surface_id: address.surface_id,
+                    }
+                    .payload()?,
+                )?;
+                let status = vivid_protocol::overlay::wire::Status::decode(
+                    owner,
+                    address.surface_id,
+                    &Value::Map(status),
+                )?;
+                if status.window.address != address {
+                    return Err(invalid_data("outer focus window generation changed"));
+                }
+                query.expected_revision = status.window.expected_revision;
+                if cancelled.load(Ordering::Acquire) || !admission.claim() {
+                    return Err(invalid_data("original focus request is retired"));
+                }
+                let fields = host(
+                    messages::OVERLAY_ACTION,
+                    address.surface_id,
+                    query.payload()?,
+                )?;
+                messages::Envelope::new(0, fields)
+                    .encode()
+                    .map_err(io::Error::other)
+            }));
         }
         let overlay_layouts = Arc::clone(&self.overlay_layouts);
         let overlay_revisions = Arc::clone(&self.overlay_revisions);

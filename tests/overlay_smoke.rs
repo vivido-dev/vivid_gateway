@@ -32,6 +32,8 @@ mod common;
 #[cfg(feature = "native-vector-testing")]
 #[path = "overlay_smoke/document.rs"]
 mod document;
+#[path = "overlay_smoke/focus.rs"]
+mod focus;
 
 use common::{TcpPresenterListener, pin_endpoints};
 

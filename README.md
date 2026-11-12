@@ -153,11 +153,54 @@ the gateway still requires core control, live media, observability and its targe
 The static-host socket regression covers that negotiation without inventing audio
 or timed capabilities.
 
-The combined check explicitly acquires outer window focus with a pointer gesture.
-Producer-requested focus is absent from projection snapshots and is not forwarded
-by that adapter. Production GUI/mux adoption must address that gap and qualify
-saturation, source lease/lane recovery and combined display retry. Physical input
+The combined check now uses explicit producer-requested focus forwarding, without
+a peer pointer-focus workaround. Production GUI/mux adoption must opt into that
+contract and qualify saturation, source lease/lane recovery and combined display retry. Physical input
 sources/candidate menus, other platforms/devices and static Metal builds remain
 unrun. The [native core evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-relay-macos.json)
 and [combined GUI evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-gateway-gui-macos.json)
-record those boundaries. Production synchronized-media negotiation is unchanged.
+record the initial boundaries; the [focus follow-up](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-focus-macos.json)
+records the subsequent focus coverage. Production synchronized-media negotiation is unchanged.
+
+## Producer focus forwarding
+
+Focus intent is an action, not persistent geometry in a projection snapshot.
+An in-process terminating route can opt in before producers authenticate:
+
+```rust
+inner.enable_overlay_host_relay();
+let mut bridge = OuterBridge::builder(authentication, display)
+    .control_endpoint(outer_endpoint)
+    .overlay_focus_forwarding(&inner) // Arc<VirtualVivid>; exclusive original-presenter route
+    .build()?;
+```
+
+Continue servicing bounded `OverlayHostRequest` jobs and returning physical input
+through `take_overlay_input`. Focus uses the existing `OVERLAY_ACTION` wire record
+and requires negotiated overlay input. The builder attaches one opaque SDK
+`OverlayFocusRoute`; ordinary snapshot-only mux routes keep their existing behavior.
+It is independent of document editing, which retains its separate opt-in contract.
+
+Each admission retains the exact original request, owner/context/surface, window
+generation/revision, authenticated writer/resume and canonical input lane. Altered
+or duplicate requests cannot claim another owner's admission. At most 64 host RPCs
+await service, for at most ten seconds. A focus job does not wait for media delivery;
+it waits for its window projection, queries the physical window's current revision,
+then consumes admission immediately before dispatch to the fixed outer address.
+An admitted RPC can finish after concurrent retirement; uncertain results are not
+retried against replacement windows or sessions.
+
+Window addresses and revisions are independent on each hop. The inner revision
+advances only after a successful physical acknowledgement. That acknowledgement
+does not synthesize local focus or input: physical focus events remain authoritative.
+An inactive pane can remember the request without activating itself or another pane.
+Cancellation, route drop and outer-session replacement retire pending and already
+drained focus admissions and clear old window focus while preserving pane activation.
+After route loss, focus requests fail closed until a fresh route attaches.
+
+Socket regressions cover repeated focus across different per-hop revisions,
+same-ID owners, inactive panes, isolated physical peers, tampering/replay, owner
+removal, route drop, cancellation and session replacement. The compositor's opt-in
+macOS headless Metal check also verifies focus-driven keyboard and native editor
+delivery without a pointer gesture. Production transport adoption, other window
+actions, load/recovery and physical platform/device acceptance remain separate gates.

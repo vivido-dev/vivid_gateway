@@ -148,6 +148,8 @@ impl Route {
     }
 }
 
+type CancelHook = Arc<dyn Fn() + Send + Sync>;
+
 /// Cancels a bridge from another thread, including any session that later replaces its current one.
 ///
 /// Obtained from [`OuterBridge::cancel_handle`]. Cancellation is sticky: a replacement session
@@ -155,8 +157,9 @@ impl Route {
 #[derive(Clone)]
 pub struct BridgeCancel {
     cancelled: Arc<AtomicBool>,
-    current: Arc<std::sync::Mutex<Arc<dyn Fn() + Send + Sync>>>,
+    current: Arc<Mutex<CancelHook>>,
     factory: Option<Arc<dyn ConnectionFactory>>,
+    focus: Arc<Mutex<Option<CancelHook>>>,
 }
 
 impl std::fmt::Debug for BridgeCancel {
@@ -174,6 +177,14 @@ impl BridgeCancel {
     /// Blocking calls on the bridge's thread return promptly with an error once this runs.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        let focus = self
+            .focus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(focus) = focus {
+            focus();
+        }
         if let Some(factory) = &self.factory {
             factory.cancel();
         }
@@ -198,6 +209,16 @@ impl BridgeCancel {
         }
         Ok(())
     }
+    fn install_focus(&self, route: &vivid_sdk::presenter::OverlayFocusRoute) {
+        let cancel = route.cancel_handle();
+        *self
+            .focus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&cancel));
+        if self.cancelled.load(Ordering::Acquire) {
+            cancel();
+        }
+    }
 }
 
 /// Vivid 1.5 producer side of the nested presenter.
@@ -210,6 +231,7 @@ pub struct OuterBridge {
     documents: Arc<Mutex<document::Documents>>,
     document_input: std::collections::VecDeque<DocumentInput>,
     overlay_jobs: Vec<(u64, thread::JoinHandle<io::Result<Vec<u8>>>)>,
+    focus_relay: Option<vivid_sdk::presenter::OverlayFocusRoute>,
     overlay_results: Vec<(u64, io::Result<Vec<u8>>)>,
     overlay_input: Option<Arc<vivid_sdk::OverlayInputLane>>,
     overlay_environment: Option<Vec<u8>>,
@@ -317,6 +339,7 @@ impl OuterBridge {
             cancelled: Arc::new(AtomicBool::new(false)),
             current: Arc::new(std::sync::Mutex::new(session.cancel_handle())),
             factory: route.factory(),
+            focus: Arc::default(),
         };
         let position_observer = PositionObserver::new(&session)?;
         Ok(Self {
@@ -332,6 +355,7 @@ impl OuterBridge {
             overlay_windows: HashMap::new(),
             overlay_input: None,
             overlay_jobs: Vec::new(),
+            focus_relay: None,
             document_relay: false,
             document_target: std::sync::Weak::new(),
             documents: Arc::default(),
@@ -681,6 +705,10 @@ impl OuterBridge {
             self.document_relay,
         )?;
         let display = display_from_target(&session, self.display)?;
+        if let Some(focus) = &mut self.focus_relay {
+            focus.retire_pending();
+            self.cancellation.install_focus(focus);
+        }
         self.cancellation.install(&session)?;
         let replaced = std::mem::replace(&mut self.session, session);
         // Drop cancels the retired SDK transport without waiting for GOODBYE.
@@ -842,6 +870,7 @@ impl std::fmt::Debug for OuterBridge {
 impl Drop for OuterBridge {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        self.focus_relay.take();
         self.retire_documents(None);
         self.retire_overlay_jobs();
         self.position_observer.take();
