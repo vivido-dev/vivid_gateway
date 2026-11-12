@@ -159,7 +159,7 @@ pub struct BridgeCancel {
     cancelled: Arc<AtomicBool>,
     current: Arc<Mutex<CancelHook>>,
     factory: Option<Arc<dyn ConnectionFactory>>,
-    focus: Arc<Mutex<Option<CancelHook>>>,
+    actions: Arc<Mutex<Option<CancelHook>>>,
 }
 
 impl std::fmt::Debug for BridgeCancel {
@@ -177,13 +177,13 @@ impl BridgeCancel {
     /// Blocking calls on the bridge's thread return promptly with an error once this runs.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-        let focus = self
-            .focus
+        let actions = self
+            .actions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if let Some(focus) = focus {
-            focus();
+        if let Some(actions) = actions {
+            actions();
         }
         if let Some(factory) = &self.factory {
             factory.cancel();
@@ -209,10 +209,10 @@ impl BridgeCancel {
         }
         Ok(())
     }
-    fn install_focus(&self, route: &vivid_sdk::presenter::OverlayFocusRoute) {
+    fn install_actions(&self, route: &vivid_sdk::presenter::OverlayActionRoute) {
         let cancel = route.cancel_handle();
         *self
-            .focus
+            .actions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&cancel));
         if self.cancelled.load(Ordering::Acquire) {
@@ -231,7 +231,7 @@ pub struct OuterBridge {
     documents: Arc<Mutex<document::Documents>>,
     document_input: std::collections::VecDeque<DocumentInput>,
     overlay_jobs: Vec<(u64, thread::JoinHandle<io::Result<Vec<u8>>>)>,
-    focus_relay: Option<vivid_sdk::presenter::OverlayFocusRoute>,
+    action_relay: Option<vivid_sdk::presenter::OverlayActionRoute>,
     overlay_results: Vec<(u64, io::Result<Vec<u8>>)>,
     overlay_input: Option<Arc<vivid_sdk::OverlayInputLane>>,
     overlay_environment: Option<Vec<u8>>,
@@ -339,7 +339,7 @@ impl OuterBridge {
             cancelled: Arc::new(AtomicBool::new(false)),
             current: Arc::new(std::sync::Mutex::new(session.cancel_handle())),
             factory: route.factory(),
-            focus: Arc::default(),
+            actions: Arc::default(),
         };
         let position_observer = PositionObserver::new(&session)?;
         Ok(Self {
@@ -355,7 +355,7 @@ impl OuterBridge {
             overlay_windows: HashMap::new(),
             overlay_input: None,
             overlay_jobs: Vec::new(),
-            focus_relay: None,
+            action_relay: None,
             document_relay: false,
             document_target: std::sync::Weak::new(),
             documents: Arc::default(),
@@ -705,9 +705,9 @@ impl OuterBridge {
             self.document_relay,
         )?;
         let display = display_from_target(&session, self.display)?;
-        if let Some(focus) = &mut self.focus_relay {
-            focus.retire_pending();
-            self.cancellation.install_focus(focus);
+        if let Some(actions) = &mut self.action_relay {
+            actions.retire_pending();
+            self.cancellation.install_actions(actions);
         }
         self.cancellation.install(&session)?;
         let replaced = std::mem::replace(&mut self.session, session);
@@ -870,7 +870,7 @@ impl std::fmt::Debug for OuterBridge {
 impl Drop for OuterBridge {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        self.focus_relay.take();
+        self.action_relay.take();
         self.retire_documents(None);
         self.retire_overlay_jobs();
         self.position_observer.take();

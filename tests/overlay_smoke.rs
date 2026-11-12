@@ -28,6 +28,9 @@ use vivid_sdk::{
     TrackConfiguration, TrackMode,
 };
 
+#[cfg(feature = "native-vector-testing")]
+#[path = "overlay_smoke/actions.rs"]
+mod actions;
 mod common;
 #[cfg(feature = "native-vector-testing")]
 #[path = "overlay_smoke/document.rs"]

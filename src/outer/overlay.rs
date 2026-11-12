@@ -171,7 +171,7 @@ impl OuterBridge {
 
     /// Whether [`start_overlay_host_request`](Self::start_overlay_host_request) would accept `request` now.
     ///
-    /// At most 16 requests run at once. Measurement and focus do not wait for media; other requests wait
+    /// At most 16 requests run at once. Measurement and window actions do not wait for media; other requests wait
     /// until its surface has no relayed media in flight, so it cannot overtake the scene it names.
     pub fn can_service_overlay_host_request(
         &self,
@@ -310,19 +310,34 @@ impl OuterBridge {
             let window = self
                 .overlay_windows
                 .get(&request.surface)
-                .ok_or_else(|| invalid_data("focus window is absent"))?;
-            if query.action != vivid_protocol::overlay::wire::WindowAction::Focus
-                || query.address.context_id != request.surface.context
+                .ok_or_else(|| invalid_data("action window is absent"))?;
+            if query.address.context_id != request.surface.context
                 || query.address.generation != window.inner_generation
                 || query.expected_revision != window.projected.revision
             {
-                return Err(invalid_data("focus window revision is stale"));
+                return Err(invalid_data("action window revision is stale"));
             }
             let admission = self
-                .focus_relay
+                .action_relay
                 .as_ref()
-                .ok_or_else(|| invalid_data("focus forwarding is not enabled"))?
+                .ok_or_else(|| invalid_data("window-action forwarding is not enabled"))?
                 .request(&request);
+            let centered = if query.action == vivid_protocol::overlay::wire::WindowAction::Center {
+                let bounds = admission
+                    .centered_bounds()
+                    .ok_or_else(|| invalid_data("original center bounds are unavailable"))?;
+                Some(
+                    Rect::new(
+                        bounds.origin.x.get() + exact_f64(window.offset_x)?,
+                        bounds.origin.y.get() + exact_f64(window.offset_y)?,
+                        bounds.width.get(),
+                        bounds.height.get(),
+                    )
+                    .map_err(io::Error::other)?,
+                )
+            } else {
+                None
+            };
             query.address = address;
             let owner = vivid_protocol::identity::SessionIdentity::new(
                 vivid_protocol::identity::PresenterInstanceId([0; 16]),
@@ -346,11 +361,35 @@ impl OuterBridge {
                     &Value::Map(status),
                 )?;
                 if status.window.address != address {
-                    return Err(invalid_data("outer focus window generation changed"));
+                    return Err(invalid_data("outer action window generation changed"));
                 }
                 query.expected_revision = status.window.expected_revision;
                 if cancelled.load(Ordering::Acquire) || !admission.claim() {
-                    return Err(invalid_data("original focus request is retired"));
+                    return Err(invalid_data("original window action is retired"));
+                }
+                if let Some(bounds) = centered {
+                    if bounds.width != status.window.options.bounds.width
+                        || bounds.height != status.window.options.bounds.height
+                    {
+                        return Err(invalid_data("physical window size changed before center"));
+                    }
+                    let mut request = status.window;
+                    request.options.bounds = bounds;
+                    let fields = host(
+                        messages::SET_OVERLAY_WINDOW,
+                        address.surface_id,
+                        request.payload(owner)?,
+                    )?;
+                    let accepted =
+                        SetWindow::decode(owner, address.surface_id, &Value::Map(fields))?;
+                    if accepted.address != address || accepted.options.bounds != bounds {
+                        return Err(invalid_data(
+                            "physical center acknowledgement changed bounds",
+                        ));
+                    }
+                    return messages::Envelope::new(0, Vec::new())
+                        .encode()
+                        .map_err(io::Error::other);
                 }
                 let fields = host(
                     messages::OVERLAY_ACTION,

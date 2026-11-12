@@ -6,7 +6,7 @@ use std::sync::Arc;
 use vivid_protocol::messages;
 use vivid_sdk::presenter::OverlayHostRequest;
 
-fn fixture() -> io::Result<(Arc<VirtualVivid>, VirtualVivid, OuterBridge)> {
+pub(super) fn fixture() -> io::Result<(Arc<VirtualVivid>, VirtualVivid, OuterBridge)> {
     let (inner, _) = overlay_presenter()?;
     let inner = Arc::new(inner);
     inner.enable_overlay_host_relay();
@@ -16,11 +16,11 @@ fn fixture() -> io::Result<(Arc<VirtualVivid>, VirtualVivid, OuterBridge)> {
         DisplayMetrics::default(),
     )
     .control_endpoint(endpoint)
-    .overlay_focus_forwarding(&inner)
+    .overlay_action_forwarding(&inner)
     .build()?;
     Ok((inner, outer, relay))
 }
-fn producer(inner: &VirtualVivid, id: u64) -> io::Result<OverlaySession> {
+pub(super) fn producer(inner: &VirtualVivid, id: u64) -> io::Result<OverlaySession> {
     overlay_producer(&inner.endpoint(), &pane(inner, id)?, "focus-owner")
 }
 fn project(inner: &VirtualVivid, relay: &mut OuterBridge) -> io::Result<()> {
@@ -28,13 +28,13 @@ fn project(inner: &VirtualVivid, relay: &mut OuterBridge) -> io::Result<()> {
     relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
     Ok(())
 }
-fn input(inner: &VirtualVivid, relay: &mut OuterBridge) -> io::Result<()> {
+pub(super) fn input(inner: &VirtualVivid, relay: &mut OuterBridge) -> io::Result<()> {
     for (surface, body) in relay.take_overlay_input()? {
         inner.relay_overlay_input(surface, &body)?;
     }
     Ok(())
 }
-fn request(inner: &VirtualVivid) -> io::Result<OverlayHostRequest> {
+pub(super) fn request(inner: &VirtualVivid) -> io::Result<OverlayHostRequest> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(request) = inner.take_overlay_host_requests().into_iter().next() {
@@ -220,10 +220,10 @@ fn drained_focus_requests_expire_on_owner_removal_and_outer_replacement() -> io:
 }
 
 #[test]
-fn dropped_focus_route_fails_closed_and_cannot_revive_a_drained_request() -> io::Result<()> {
+fn dropped_action_route_fails_closed_and_cannot_revive_a_drained_request() -> io::Result<()> {
     let (inner, outer, mut relay) = fixture()?;
     assert_eq!(
-        inner.attach_overlay_focus_relay().unwrap_err().kind(),
+        inner.attach_overlay_action_relay().unwrap_err().kind(),
         io::ErrorKind::AlreadyExists
     );
     let producer = producer(&inner, 1)?;
@@ -246,7 +246,7 @@ fn dropped_focus_route_fails_closed_and_cannot_revive_a_drained_request() -> io:
         DisplayMetrics::default(),
     )
     .control_endpoint(outer.endpoint())
-    .overlay_focus_forwarding(&inner)
+    .overlay_action_forwarding(&inner)
     .build()?;
     project(&inner, &mut fresh)?;
     fresh.overlay_host_request(&old).unwrap_err();

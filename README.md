@@ -162,29 +162,34 @@ and [combined GUI evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-
 record the initial boundaries; the [focus follow-up](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-focus-macos.json)
 records the subsequent focus coverage. Production synchronized-media negotiation is unchanged.
 
-## Producer focus forwarding
+## Producer window-action forwarding
 
-Focus intent is an action, not persistent geometry in a projection snapshot.
+Producer focus, raise, lower, center and close requests travel as actions,
+independently of persistent geometry snapshots.
 An in-process terminating route can opt in before producers authenticate:
 
 ```rust
 inner.enable_overlay_host_relay();
 let mut bridge = OuterBridge::builder(authentication, display)
     .control_endpoint(outer_endpoint)
-    .overlay_focus_forwarding(&inner) // Arc<VirtualVivid>; exclusive original-presenter route
+    .overlay_action_forwarding(&inner) // Arc<VirtualVivid>; exclusive original-presenter route
     .build()?;
 ```
 
 Continue servicing bounded `OverlayHostRequest` jobs and returning physical input
-through `take_overlay_input`. Focus uses the existing `OVERLAY_ACTION` wire record
-and requires negotiated overlay input. The builder attaches one opaque SDK
-`OverlayFocusRoute`; ordinary snapshot-only mux routes keep their existing behavior.
+through `take_overlay_input`. The builder attaches one opaque SDK
+`OverlayActionRoute`; ordinary snapshot-only mux routes keep their existing behavior.
 It is independent of document editing, which retains its separate opt-in contract.
+This replaces the focus-only builder and SDK route/request API names with
+`overlay_action_forwarding`, `attach_overlay_action_relay`, `OverlayActionRoute`
+and `OverlayActionRequest`. No wire records or registry assignments change.
 
 Each admission retains the exact original request, owner/context/surface, window
-generation/revision, authenticated writer/resume and canonical input lane. Altered
-or duplicate requests cannot claim another owner's admission. At most 64 host RPCs
-await service, for at most ten seconds. A focus job does not wait for media delivery;
+generation/revision and authenticated writer/resume. Focus, raise and lower also
+retain the canonical input lane. Center and close require window control authority
+without granting input. Altered or duplicate requests cannot claim another owner's
+admission. At most 64 host RPCs await service, for at most ten seconds. A
+window-action job does not wait for media delivery;
 it waits for its window projection, queries the physical window's current revision,
 then consumes admission immediately before dispatch to the fixed outer address.
 An admitted RPC can finish after concurrent retirement; uncertain results are not
@@ -195,12 +200,25 @@ advances only after a successful physical acknowledgement. That acknowledgement
 does not synthesize local focus or input: physical focus events remain authoritative.
 An inactive pane can remember the request without activating itself or another pane.
 Cancellation, route drop and outer-session replacement retire pending and already
-drained focus admissions and clear old window focus while preserving pane activation.
-After route loss, focus requests fail closed until a fresh route attaches.
+drained action admissions and clear old window focus while preserving pane activation.
+After route loss, window-action requests fail closed until a fresh route attaches.
+
+Center captures the original pane viewport, rejects a queued request if that
+viewport changes, and translates the centered bounds by the relay placement offset.
+The physical update uses `SET_OVERLAY_WINDOW` with its current revision and preserves
+all other physical window options. Other actions use existing `OVERLAY_ACTION`.
+Raise/lower preserve keyboard focus and capture. `OverlayWindow::request_close`
+dismisses a parent and its descendants; `close` then releases producer-owned
+surfaces and retained resources. A successful close fences later submissions from
+that group. Physical dismissal before or after the RPC reply produces one
+original dismissal per window.
 
 Socket regressions cover repeated focus across different per-hop revisions,
 same-ID owners, inactive panes, isolated physical peers, tampering/replay, owner
 removal, route drop, cancellation and session replacement. The compositor's opt-in
 macOS headless Metal check also verifies focus-driven keyboard and native editor
-delivery without a pointer gesture. Production transport adoption, other window
-actions, load/recovery and physical platform/device acceptance remain separate gates.
+delivery without a pointer gesture. A separate macOS Metal action check verifies
+raise/lower pixels, pane-relative center, group close and an unchanged same-ID peer.
+See the [window-action evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-actions-macos.json).
+Production transport adoption, load/recovery and physical platform/device
+acceptance remain separate gates.

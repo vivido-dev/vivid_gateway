@@ -25,7 +25,7 @@ pub struct OuterBridgeBuilder {
     factory: Option<Arc<dyn ConnectionFactory>>,
     target_profile: String,
     documents: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
-    focus: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
+    actions: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
 }
 
 impl OuterBridge {
@@ -44,7 +44,7 @@ impl OuterBridge {
             factory: None,
             target_profile: registry::TERMINAL_SURFACE.into(),
             documents: None,
-            focus: None,
+            actions: None,
         }
     }
 }
@@ -106,17 +106,19 @@ impl OuterBridgeBuilder {
         self
     }
 
-    /// Forwards producer-requested focus through its original terminating presenter.
+    /// Forwards producer-requested window actions through its original terminating presenter.
     ///
     /// Off by default. Enable host relaying on `inner` before building; this
-    /// attaches an exclusive SDK focus route. Continue servicing bounded host
-    /// requests and physical input events. Legacy snapshot-only mux routes are unchanged.
+    /// attaches an exclusive SDK action route. Continue servicing bounded host
+    /// requests and physical input events. Supports focus, raise, lower, center
+    /// and close; center preserves the original pane viewport and placement offset.
+    /// Legacy snapshot-only mux routes are unchanged.
     #[must_use]
-    pub fn overlay_focus_forwarding(
+    pub fn overlay_action_forwarding(
         mut self,
         inner: &Arc<vivid_sdk::presenter::VirtualVivid>,
     ) -> Self {
-        self.focus = Some(Arc::downgrade(inner));
+        self.actions = Some(Arc::downgrade(inner));
         self
     }
 
@@ -130,12 +132,12 @@ impl OuterBridgeBuilder {
     /// authentication failures, and an outer target descriptor that carries no usable terminal
     /// geometry when `display` has none either, are returned as the outer session reports them.
     pub fn build(self) -> io::Result<OuterBridge> {
-        if (self.documents.is_some() || self.focus.is_some())
+        if (self.documents.is_some() || self.actions.is_some())
             && self.target_profile != registry::TERMINAL_SURFACE
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "focus and document relays require a terminal overlay target",
+                "window-action and document relays require a terminal overlay target",
             ));
         }
         let route = match (self.control, self.factory) {
@@ -164,7 +166,7 @@ impl OuterBridgeBuilder {
             OuterBridge::from_session(session, self.authentication, route, self.display)?;
         bridge.document_relay = self.documents.is_some();
         bridge.document_target = self.documents.unwrap_or_default();
-        if let Some(inner) = self.focus {
+        if let Some(inner) = self.actions {
             if !bridge
                 .overlay_host_profiles()
                 .iter()
@@ -172,17 +174,17 @@ impl OuterBridgeBuilder {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "focus relay requires outer overlay input",
+                    "window-action relay requires outer overlay input",
                 ));
             }
-            let focus = inner
+            let actions = inner
                 .upgrade()
                 .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "original focus presenter is gone")
+                    io::Error::new(io::ErrorKind::NotFound, "original action presenter is gone")
                 })?
-                .attach_overlay_focus_relay()?;
-            bridge.cancellation.install_focus(&focus);
-            bridge.focus_relay = Some(focus);
+                .attach_overlay_action_relay()?;
+            bridge.cancellation.install_actions(&actions);
+            bridge.action_relay = Some(actions);
         }
         Ok(bridge)
     }
@@ -199,7 +201,7 @@ impl std::fmt::Debug for OuterBridgeBuilder {
             .field("factory", &self.factory.is_some())
             .field("target_profile", &self.target_profile)
             .field("documents", &self.documents.is_some())
-            .field("focus", &self.focus.is_some())
+            .field("actions", &self.actions.is_some())
             .finish()
     }
 }
