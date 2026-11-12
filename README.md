@@ -145,8 +145,19 @@ cargo test --all-targets --features native-vector-testing
 ```
 
 This suite does not submit GPU work or drive a platform IME. The compositor's
-separate direct macOS Metal check remains covered; a combined gateway/GUI frontend,
-physical input sources/candidate menus, relay saturation under a production frontend,
-source lease resume, other platforms and mux transport adoption remain qualification
-gates. The [local macOS evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-relay-macos.json)
-records those boundaries. Production synchronized-media negotiation is unchanged.
+developer-only `vector-relay-testing` adapter separately exercises this core with
+independent producer processes, actual macOS Metal rendering, GUI display receipts,
+clipboard grants and synthetic native document/composition callbacks. Static hosts
+can decline timed-media and audio-gain: both profiles are optional on the outer hop;
+the gateway still requires core control, live media, observability and its target.
+The static-host socket regression covers that negotiation without inventing audio
+or timed capabilities.
+
+The combined check explicitly acquires outer window focus with a pointer gesture.
+Producer-requested focus is absent from projection snapshots and is not forwarded
+by that adapter. Production GUI/mux adoption must address that gap and qualify
+saturation, source lease/lane recovery and combined display retry. Physical input
+sources/candidate menus, other platforms/devices and static Metal builds remain
+unrun. The [native core evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-relay-macos.json)
+and [combined GUI evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-gateway-gui-macos.json)
+record those boundaries. Production synchronized-media negotiation is unchanged.

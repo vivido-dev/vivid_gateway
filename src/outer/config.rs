@@ -112,11 +112,9 @@ pub(super) fn producer_config(
         registry::TERMINAL_SURFACE => ProducerConfig {
             target_profile: vivid_sdk::TERMINAL_SURFACE.into(),
             required_profiles: vec![
-                vivid_sdk::AUDIO_GAIN.into(),
                 vivid_sdk::LIVE_MEDIA.into(),
                 vivid_sdk::OBSERVABILITY.into(),
                 vivid_sdk::TERMINAL_SURFACE.into(),
-                vivid_sdk::TIMED_MEDIA.into(),
                 vivid_sdk::CORE_CONTROL.into(),
             ],
             // Optional: an outer presenter that cannot host overlay windows must keep working
@@ -147,6 +145,7 @@ pub(super) fn producer_config(
         }
     };
     config.optional_profiles.extend([
+        registry::AUDIO_GAIN.into(),
         registry::TIMED_MEDIA.into(),
         registry::TIMED_MEDIA_SYNC.into(),
     ]);

@@ -78,6 +78,48 @@ fn scene(colour: u32) -> Canvas {
 }
 
 #[test]
+fn static_vector_host_does_not_need_timed_media_or_audio_gain() -> io::Result<()> {
+    let (inner, endpoint) = overlay_presenter()?;
+    let producer = overlay_producer(&endpoint, &pane(&inner, 1)?, "static-vector")?;
+    let window = window_of(&producer, 0., 0.)?;
+    window.present(scene(0xff22_4488))?;
+    let listener = TcpPresenterListener::bind()?;
+    let endpoint = listener.endpoint();
+    let mut config = PresenterConfig::terminal_with_overlay(MediaConfig::default());
+    config.supported_profiles.retain(|profile| {
+        !matches!(
+            profile.as_str(),
+            vivid_protocol::registry::TIMED_MEDIA
+                | vivid_protocol::registry::TIMED_MEDIA_SYNC
+                | vivid_protocol::registry::AUDIO_GAIN
+        )
+    });
+    let outer = VirtualVivid::start_configured_eventless(listener, config)?;
+    let mut relay = bridge(&endpoint, &pane(&outer, 9)?)?;
+    let current = snapshot(&inner, &[1]);
+    let projection = current.bridge_projection();
+    relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
+    for source in current.sources {
+        for (record_type, bytes) in source.retained_vector {
+            relay.media_chunk(MediaChunk {
+                delivery_id: 0,
+                source: source.key,
+                record_type,
+                offset: 0,
+                total: u32::try_from(bytes.len()).unwrap(),
+                last: true,
+                bytes: bytes.to_vec(),
+            })?;
+            finish_delivery(&inner, &mut relay, 0)?;
+        }
+    }
+    let projected = snapshot(&outer, &[9]);
+    assert_eq!(projected.sources.len(), 1);
+    assert!(!projected.sources[0].retained_vector.is_empty());
+    Ok(())
+}
+
+#[test]
 fn plain_text_measurements_cross_two_authenticated_hops_in_each_owners_namespace() -> io::Result<()>
 {
     use vivid_protocol::messages;
