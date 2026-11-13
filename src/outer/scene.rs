@@ -61,6 +61,13 @@ impl OuterBridge {
             };
             let surface = remaining.remove(index);
             self.sync_overlay_window(surface)?;
+            if surface.overlay_window.is_some()
+                && let Some(route) = &self.action_relay
+            {
+                self.overlay_input_epochs
+                    .entry(surface.key)
+                    .or_insert_with(|| route.input_epoch(surface.key));
+            }
             self.sync_overlay_layouts(surface)?;
             established.insert(surface.key);
         }
@@ -87,6 +94,7 @@ impl OuterBridge {
                     || source.surface != key.surface
             });
             self.overlay_windows.remove(&key);
+            self.overlay_input_epochs.remove(&key);
             self.retire_documents(Some(key));
             self.overlay_revisions.retire(Some(key));
             {

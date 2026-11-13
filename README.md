@@ -109,6 +109,9 @@ for edit in bridge.take_overlay_document_input() {
 }
 ```
 
+If action forwarding is also enabled, replace the ordinary-input loop above with
+`take_overlay_routed_input` and consume each receipt's `forward()` before typed edits.
+
 The physical presenter must actually negotiate `overlay-editor-v1`; the bridge
 never requires it or manufactures support. The legacy SDK `set_overlay_host_profiles`
 continues to withhold it even if a caller lists it. Generic/font-only physical hosts
@@ -177,7 +180,9 @@ let mut bridge = OuterBridge::builder(authentication, display)
 ```
 
 Continue servicing bounded `OverlayHostRequest` jobs and returning physical input
-through `take_overlay_input`. The builder attaches one opaque SDK
+through one-shot `take_overlay_routed_input` receipts. Forward each receipt with
+`input.forward()` immediately, before draining typed document edits. Bound action
+routes reject the legacy byte-returning `take_overlay_input` API. The builder attaches one opaque SDK
 `OverlayActionRoute`; ordinary snapshot-only mux routes keep their existing behavior.
 It is independent of document editing, which retains its separate opt-in contract.
 This replaces the focus-only builder and SDK route/request API names with
@@ -260,3 +265,50 @@ socket/native protocol paths without GPU stress or physical input. Existing
 headless Metal fixtures separately cover the final GUI integration. Sustained
 multi-owner load, an unresponsive transport, combined display recovery and other
 platform/device acceptance remain open gates.
+
+## Source resume and input-lane replacement
+
+An opted-in action route binds each physical overlay window to an opaque original
+`OverlayInputEpoch`. It includes the source identity, authenticated resume generation
+and canonical input-lane generation. This is comparison metadata and grants no
+input. `take_overlay_routed_input` discards physical feedback while the captured
+incarnation is absent or differs from the original presenter. Each returned
+`OverlayRelayInput` is one-shot and non-serializable; `forward()` rechecks that
+incarnation atomically at the original mutation. Source resume, lane replacement,
+route retirement and a one-second local receipt deadline fence already-drained
+input too. A bound action route returns `Unsupported` from the legacy byte API
+before consuming events; ordinary snapshot-only routes keep their existing API.
+
+```rust
+for input in bridge.take_overlay_routed_input()? {
+    let accepted = input.forward(); // consumes its original receipt; never retarget
+}
+```
+
+On the next projection reconciliation, changed incarnations retire only their old
+physical surfaces, tracks, mappings and document grants before creating fresh outer
+identities. Child windows follow their parent through this removal pass, including
+a popup first created during a lane gap. Old frame targets and queued physical
+addresses cannot name the replacement. The same-ID peer keeps its physical surface.
+Recreated sources request full retained-frame replay through `take_full_frame_requests`;
+service that API as usual before expecting fresh display/input admission. SDK lane
+open/revocation advances projection revision so the local adapter reconciles it.
+
+Lane loss or replacement promptly cancels queued and claimed focus/raise/lower
+admissions. An old physical result or acknowledgement cannot restore their original
+input grant. Center and close retain independent control authority and can finish
+without an input lane. Lease suspension cancels every pending original host request;
+authenticated resume retains logical IDs but adopts surfaces/tracks explicitly,
+advances the media channel, and opens a newer input lane. Old lane cleanup cannot
+close that replacement, and old channels cannot publish into it. A fresh explicit
+action queries the current physical revision rather than replaying an old request.
+
+The [local macOS recovery evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-resume-macos.json)
+records two authenticated hops with the `NativeVectorHost` API, reused owner-local
+IDs, queued/claimed action retirement, stale focus feedback, already-drained input
+rejection, the real one-second receipt deadline, native frame/input invalidation,
+retained-media replay and isolated cleanup. These are protocol/native
+API recovery checks without GPU submission. Separate direct/action/relay Metal
+fixtures exercise the final GUI integration with synthetic callbacks. Automatic
+source lease recovery in a production GUI/mux frontend, combined GPU/display loss,
+physical input/device behavior and other operating systems remain open gates.

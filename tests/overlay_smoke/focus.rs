@@ -28,9 +28,9 @@ fn project(inner: &VirtualVivid, relay: &mut OuterBridge) -> io::Result<()> {
     relay.rebuild(&projection.surfaces, &projection.sources, &projection.nodes)?;
     Ok(())
 }
-pub(super) fn input(inner: &VirtualVivid, relay: &mut OuterBridge) -> io::Result<()> {
-    for (surface, body) in relay.take_overlay_input()? {
-        inner.relay_overlay_input(surface, &body)?;
+pub(super) fn input(_inner: &VirtualVivid, relay: &mut OuterBridge) -> io::Result<()> {
+    for input in relay.take_overlay_routed_input()? {
+        input.forward();
     }
     Ok(())
 }

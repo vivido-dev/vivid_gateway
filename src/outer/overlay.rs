@@ -24,7 +24,52 @@ impl OuterBridge {
     ///
     /// Returns an error when the input watchdog cannot be renewed or an event cannot be encoded, and
     /// [`io::ErrorKind::BrokenPipe`] when the outer overlay input lane closes.
+    /// Bound action routes return `Unsupported`; use `take_overlay_routed_input` instead.
     pub fn take_overlay_input(&mut self) -> io::Result<Vec<(BridgeSurfaceKey, Vec<u8>)>> {
+        if self.action_relay.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bound action routes require take_overlay_routed_input",
+            ));
+        }
+        self.drain_overlay_input()
+    }
+
+    /// Drains one-shot input receipts bound to the original source incarnation.
+    ///
+    /// Required for an opted-in action route. Forward each receipt immediately;
+    /// it rechecks source resume and input-lane identity at the original mutation.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` without an action route, or input transport/decode errors.
+    pub fn take_overlay_routed_input(
+        &mut self,
+    ) -> io::Result<Vec<vivid_sdk::presenter::OverlayRelayInput>> {
+        if self.action_relay.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "original action route is unavailable",
+            ));
+        }
+        let events = self.drain_overlay_input()?;
+        let route = self.action_relay.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "original action route is unavailable",
+            )
+        })?;
+        let mut inputs = Vec::new();
+        for (key, body) in events {
+            if let Some(epoch) = self.overlay_input_epochs.get(&key).copied().flatten()
+                && let Some(input) = route.input(epoch, &body)?
+            {
+                inputs.push(input);
+            }
+        }
+        Ok(inputs)
+    }
+
+    fn drain_overlay_input(&mut self) -> io::Result<Vec<(BridgeSurfaceKey, Vec<u8>)>> {
         let Some(input) = self.overlay_input.clone() else {
             return Ok(Vec::new());
         };
@@ -79,6 +124,14 @@ impl OuterBridge {
             let Some(key) = self.outer_surface_key(&event.address) else {
                 continue;
             };
+            if let Some(route) = &self.action_relay
+                && self
+                    .overlay_input_epochs
+                    .get(&key)
+                    .is_none_or(|epoch| epoch.is_none() || *epoch != route.input_epoch(key))
+            {
+                continue;
+            }
             if matches!(event.event, vivid_protocol::overlay::Event::Focus(false)) {
                 self.retire_documents(Some(key));
             }

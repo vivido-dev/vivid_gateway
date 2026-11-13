@@ -231,6 +231,8 @@ pub struct OuterBridge {
     document_input: std::collections::VecDeque<DocumentInput>,
     overlay_jobs: Vec<HostWorker>,
     action_relay: Option<vivid_sdk::presenter::OverlayActionRoute>,
+    overlay_input_epochs:
+        HashMap<BridgeSurfaceKey, Option<vivid_sdk::presenter::OverlayInputEpoch>>,
     overlay_results: Vec<(u64, io::Result<Vec<u8>>)>,
     overlay_input: Option<Arc<vivid_sdk::OverlayInputLane>>,
     overlay_environment: Option<Vec<u8>>,
@@ -355,6 +357,7 @@ impl OuterBridge {
             overlay_input: None,
             overlay_jobs: Vec::new(),
             action_relay: None,
+            overlay_input_epochs: HashMap::new(),
             document_relay: false,
             document_target: std::sync::Weak::new(),
             documents: Arc::default(),
@@ -538,6 +541,78 @@ impl OuterBridge {
         recovering: &HashSet<BridgeSourceKey>,
     ) -> io::Result<HashSet<BridgeSourceKey>> {
         validate_snapshot(surfaces, sources, nodes)?;
+        self.rebuild_inner(surfaces, sources, nodes, recovering, true)
+    }
+
+    fn rebuild_inner(
+        &mut self,
+        surfaces: &[BridgeSurface],
+        sources: &[BridgeSource],
+        nodes: &[BridgeNode],
+        recovering: &HashSet<BridgeSourceKey>,
+        renew_input: bool,
+    ) -> io::Result<HashSet<BridgeSourceKey>> {
+        let mut retired: HashSet<_> = if renew_input {
+            self.action_relay
+                .as_ref()
+                .map(|route| {
+                    surfaces
+                        .iter()
+                        .filter(|surface| {
+                            self.overlay_input_epochs
+                                .get(&surface.key)
+                                .is_some_and(|epoch| *epoch != route.input_epoch(surface.key))
+                        })
+                        .map(|surface| surface.key)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        // Include new or differently stamped child windows before the temporary
+        // removal pass, so no retained child names a missing physical parent.
+        loop {
+            let before = retired.len();
+            for surface in surfaces {
+                if surface
+                    .overlay_window
+                    .and_then(|window| window.parent)
+                    .is_some_and(|parent| retired.contains(&parent))
+                {
+                    retired.insert(surface.key);
+                }
+            }
+            if retired.len() == before {
+                break;
+            }
+        }
+        if !retired.is_empty() {
+            // Retire the old independent physical identities before rebinding the
+            // same original IDs. Queued events and frames keep the old addresses.
+            let kept_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| !retired.contains(&surface.key))
+                .cloned()
+                .collect();
+            let kept_sources: Vec<_> = sources
+                .iter()
+                .filter(|source| !retired.contains(&surface_key(source)))
+                .cloned()
+                .collect();
+            let kept_nodes: Vec<_> = nodes
+                .iter()
+                .filter(|node| !retired.contains(&node.surface))
+                .cloned()
+                .collect();
+            self.rebuild_inner(
+                &kept_surfaces,
+                &kept_sources,
+                &kept_nodes,
+                recovering,
+                false,
+            )?;
+        }
         self.desired_surfaces = surfaces.to_vec();
         let unfinished = self.unfinished_tracks.keys().copied().collect::<Vec<_>>();
         for key in unfinished {
@@ -671,6 +746,14 @@ impl OuterBridge {
         self.reconcile_nodes(nodes)?;
         self.update_playback(&[], sources)?;
         self.remove_absent_surfaces(surfaces)?;
+        self.full_frames
+            .extend(recreated.iter().copied().filter(|key| {
+                retired.contains(&BridgeSurfaceKey {
+                    producer: key.producer,
+                    context: key.context,
+                    surface: key.surface,
+                })
+            }));
         Ok(recreated)
     }
 
@@ -722,6 +805,7 @@ impl OuterBridge {
         self.surfaces.clear();
         self.overlay_input.take();
         self.overlay_windows.clear();
+        self.overlay_input_epochs.clear();
         self.documents = Arc::default();
         self.document_input.clear();
         *self

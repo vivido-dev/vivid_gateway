@@ -110,7 +110,8 @@ impl OuterBridgeBuilder {
     ///
     /// Off by default. Enable host relaying on `inner` before building; this
     /// attaches an exclusive SDK action route. Continue servicing bounded host
-    /// requests and physical input events. Supports focus, raise, lower, center
+    /// requests and forward `take_overlay_routed_input` receipts immediately.
+    /// Supports focus, raise, lower, center
     /// and close; center preserves the original pane viewport and placement offset.
     /// Legacy snapshot-only mux routes are unchanged.
     #[must_use]

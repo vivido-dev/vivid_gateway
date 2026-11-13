@@ -40,6 +40,9 @@ mod focus;
 #[cfg(feature = "native-vector-testing")]
 #[path = "overlay_smoke/pressure.rs"]
 mod pressure;
+#[cfg(feature = "native-vector-testing")]
+#[path = "overlay_smoke/recovery.rs"]
+mod recovery;
 
 use common::{TcpPresenterListener, pin_endpoints};
 
