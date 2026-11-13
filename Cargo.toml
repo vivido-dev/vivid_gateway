@@ -24,6 +24,7 @@ vivid_protocol = { version = "1.5.12", path = "../vivid_protocol" }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["presenter"] }
 
 [dev-dependencies]
+socket2 = "0.6.5"
 tempfile = "3"
 vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["testing"] }
 

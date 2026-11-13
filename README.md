@@ -190,9 +190,15 @@ same presenter. The SDK's exclusive `OverlayPresentationRoute` captures one-shot
 `OverlayPresentationReceipt`s for exact accepted submissions. Original scenes and
 ACKs advance only after matching physical outcomes; an accepted but undisplayed
 repaint cannot revoke valid early Unicode input for the current scene. Cancellation
-fails closed and never restores synthetic ACKs. One pending scene per original
-window mirrors native coalescing, with bounded outer receipt history. Retained replay
-does not manufacture another original ACK. Outer vector revisions are allocated per
+fails closed and never restores synthetic ACKs. Only unforwarded scenes coalesce;
+already-forwarded scenes retain their own outcomes across newer source acceptance.
+The SDK bounds copies and receipt metadata to four per owner and 64 globally,
+and charges additional forwarded canvases against its encoded retained-byte budget.
+`DeliveryOutcome::superseded` identifies an intentionally coalesced delivery: release
+its ingress with `VirtualVivid::release_bridge_delivery`, without manufacturing
+presentation or source loss. Outer-attachment replacement explicitly abandons its
+copies after releasing the mapping lock. Retained replay does not manufacture
+another original ACK. Outer vector revisions are allocated per
 window, including across track replacement. Old channel-bound document receipts
 reject immediately even before downstream reconciliation.
 
@@ -388,6 +394,23 @@ fixtures exercise the final GUI integration with synthetic callbacks. Automatic
 source lease recovery in a production GUI/mux frontend, combined GPU/display loss,
 physical input/device behavior and other operating systems remain open gates.
 
-Local display-recovery acceptance waits for fresh editor/focus admission before
-its first post-retry key. An image receipt alone does not prove keyboard readiness;
-immediate keys during post-retry focus/geometry turnover remain unqualified.
+The compositor's display-loss banner now overlays its retained app, preserving
+the viewport through retry. Eight direct/relay Metal runs admit the first fresh
+key without waiting for editor republication and continue rejecting stale input.
+The [retry and native TCP follow-up](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-retry-tcp-macos.json)
+also covers native kernel write backpressure: a loopback peer stops reading, real
+socket buffers fill, and a native write remains blocked for at least 100 ms.
+Same-owner control and a same-ID peer keep progressing, the existing 32-record
+media handoff stays bounded, and cancellation retires the writer within two seconds.
+The test-only `socket2` dependency bounds native buffers below one authenticated
+vector frame so the observation cannot be only a protocol-credit wait. No writer
+condition variable or fabricated I/O error creates this native stall. Packet-loss
+blackholes and correlated transport/display loss remain unrun.
+
+Multiple in-flight source revisions now have native socket/host API regressions:
+a forwarded first scene remains displayable and editable after a second is
+accepted, repeated attachment replacement preserves replay, and an obsolete
+unforwarded delivery reaches neither the physical host nor source-loss recovery.
+These fixtures do not submit GPU work. Aggressive multi-submission Metal load and
+lease/channel recovery with multiple unresolved forwarded scenes remain explicit
+qualification gates.

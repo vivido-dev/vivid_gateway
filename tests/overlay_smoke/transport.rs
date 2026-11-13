@@ -282,3 +282,6 @@ fn a_blackholed_control_read_cancels_without_stopping_a_same_id_peer() -> io::Re
 fn a_blackholed_track_write_leaves_control_live_and_cancels_within_its_owner() -> io::Result<()> {
     stalled_transport(Stall::TrackWrite)
 }
+
+#[path = "transport_kernel.rs"]
+mod kernel;

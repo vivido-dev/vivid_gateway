@@ -1884,6 +1884,7 @@ fn raster_writer(outer_delta_operations: u32) -> (vivid_sdk::Session, OuterMedia
     let channel = Arc::new(session.open_track_channel(&track).unwrap());
     let writer = OuterMediaWriter {
         presentation_relay: None,
+        superseded: false,
         overlay_layouts: Arc::default(),
         overlay_revisions: Arc::default(),
         writer_id: 1,
@@ -2084,6 +2085,7 @@ fn live_raster_writer(
     let channel = Arc::new(session.open_track_channel(&track).unwrap());
     let writer = OuterMediaWriter {
         presentation_relay: None,
+        superseded: false,
         overlay_layouts: Arc::default(),
         overlay_revisions: Arc::default(),
         writer_id: 1,
@@ -2138,7 +2140,11 @@ fn an_activated_static_writer_does_not_wait_out_the_presenter_between_records() 
         let completion = completions
             .recv_timeout(Duration::from_secs(5))
             .unwrap_or_else(|error| panic!("frame {frame_id} was never written: {error}"));
-        assert!(completion.delivered, "frame {frame_id} was rejected");
+        assert_eq!(
+            completion.disposition,
+            super::relay::MediaDisposition::Delivered,
+            "frame {frame_id} was rejected"
+        );
     }
 }
 

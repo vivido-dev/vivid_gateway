@@ -923,3 +923,197 @@ fn an_accepted_undisplayed_repaint_keeps_the_physical_editor_scene_live() -> io:
     }
     Ok(())
 }
+
+#[test]
+fn a_forwarded_scene_can_be_displayed_and_edited_after_newer_source_acceptance() -> io::Result<()> {
+    let (inner, _) = overlay_presenter()?;
+    let inner = Arc::new(inner);
+    inner.enable_overlay_host_relay();
+    let listener = TcpPresenterListener::bind()?;
+    let endpoint = listener.endpoint();
+    let mut config = PresenterConfig::terminal_with_overlay(MediaConfig::default());
+    config
+        .supported_profiles
+        .push(registry::OVERLAY_EDITOR.into());
+    let outer = Arc::new(VirtualVivid::start_configured_eventless(listener, config)?);
+    let mut host = NativeVectorHost::attach(Arc::clone(&outer), "")?;
+    let mut relay = OuterBridge::builder(
+        Secret32::from_hex(&pane(&outer, 9)?).map_err(io::Error::other)?,
+        DisplayMetrics::default(),
+    )
+    .control_endpoint(endpoint)
+    .overlay_document_editing(&inner)
+    .build()?;
+    inner.set_overlay_document_host_profiles(&relay.overlay_host_profiles());
+    let first = connect(&inner, 1)?;
+    let second = connect(&inner, 2)?;
+    let a = window_of(&first, 0., 0.)?;
+    let b = window_of(&second, 260., 0.)?;
+    let one = a.submit(canvas())?;
+    let peer = b.submit(canvas())?;
+    accepted(&a, 1)?;
+    accepted(&b, 1)?;
+    let keys = [1, 2].map(|pane| snapshot(&inner, &[pane]).sources[0].key);
+    assert_eq!(
+        (keys[0].context, keys[0].surface, keys[0].track),
+        (keys[1].context, keys[1].surface, keys[1].track)
+    );
+    assert_ne!(keys[0].producer, keys[1].producer);
+    // Both frames crossed the outer socket, but no physical scene is shown yet.
+    project(&inner, &mut relay)?;
+    for _ in 0..12 {
+        let current = snapshot(&inner, &[1, 2]).bridge_projection();
+        relay.replace_session(&current.surfaces, &current.sources, &current.nodes)?;
+        project(&inner, &mut relay)?;
+        assert_eq!(
+            one.wait(Duration::ZERO)?,
+            None,
+            "attachment replacement invented a source outcome"
+        );
+        assert_eq!(peer.wait(Duration::ZERO)?, None);
+    }
+    let two = a.submit(canvas())?;
+    accepted(&a, 2)?;
+    assert_eq!(
+        one.wait(Duration::ZERO)?,
+        None,
+        "new acceptance retired forwarded scene 1"
+    );
+    let target = display(&mut host, &inner, &mut relay, 2);
+    let target = click(&mut host, &target, 10.);
+    clicked(&inner, &mut relay, &first)?;
+    assert_eq!(
+        one.wait(Duration::from_secs(3))?,
+        Some(vivid_sdk::overlay::PresentationOutcome::Presented)
+    );
+    assert_eq!(
+        peer.wait(Duration::from_secs(3))?,
+        Some(vivid_sdk::overlay::PresentationOutcome::Presented)
+    );
+    assert_eq!(a.reconcile()?.presented_revision, 1);
+    assert_eq!(two.wait(Duration::ZERO)?, None);
+    let text = host.text_target(&target).unwrap();
+    publish(&inner, &mut relay, &mut host, &a, 1, context(41, 73))?;
+    send(&mut host, &text, "é文漢");
+    assert!(pending(&inner, &mut relay).forward()?);
+    let edit = received(&first);
+    assert_eq!(edit.scene_revision, 1);
+    assert_eq!(edit.commit.as_deref(), Some("é文漢"));
+    project(&inner, &mut relay)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let frame = host.prepare(9, 1.)?;
+        host.presented(&frame)?;
+        input(&inner, &mut relay)?;
+        if let Some(outcome) = two.wait(Duration::ZERO)? {
+            assert_eq!(outcome, vivid_sdk::overlay::PresentationOutcome::Presented);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "newer physical scene did not acknowledge its original"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(a.reconcile()?.presented_revision, 2);
+    assert_eq!(b.reconcile()?.presented_revision, 1);
+    while let Some(event) = second.wait_event(Duration::ZERO)? {
+        assert!(!matches!(event, vivid_sdk::OverlayLaneEvent::EditorEdit(_)));
+    }
+    Ok(())
+}
+
+#[test]
+fn an_unforwarded_superseded_scene_is_coalesced_without_presentation_or_source_loss()
+-> io::Result<()> {
+    let (inner, _) = overlay_presenter()?;
+    let inner = Arc::new(inner);
+    inner.enable_overlay_host_relay();
+    let listener = TcpPresenterListener::bind()?;
+    let endpoint = listener.endpoint();
+    let mut config = PresenterConfig::terminal_with_overlay(MediaConfig::default());
+    config
+        .supported_profiles
+        .push(registry::OVERLAY_EDITOR.into());
+    let outer = Arc::new(VirtualVivid::start_configured_eventless(listener, config)?);
+    let mut host = NativeVectorHost::attach(Arc::clone(&outer), "")?;
+    let mut relay = OuterBridge::builder(
+        Secret32::from_hex(&pane(&outer, 9)?).map_err(io::Error::other)?,
+        DisplayMetrics::default(),
+    )
+    .control_endpoint(endpoint)
+    .overlay_document_editing(&inner)
+    .build()?;
+    inner.set_overlay_document_host_profiles(&relay.overlay_host_profiles());
+    let first = connect(&inner, 1)?;
+    let second = connect(&inner, 2)?;
+    let a = window_of(&first, 0., 0.)?;
+    let b = window_of(&second, 260., 0.)?;
+    let one = a.submit(canvas())?;
+    let peer = b.submit(canvas())?;
+    accepted(&a, 1)?;
+    accepted(&b, 1)?;
+    let original = snapshot(&inner, &[1]).sources.remove(0);
+    let (kind, body) = original.retained_vector.last().unwrap();
+    let two = a.submit(canvas())?;
+    accepted(&a, 2)?;
+    assert_eq!(
+        one.wait(Duration::from_secs(3))?,
+        Some(vivid_sdk::overlay::PresentationOutcome::Superseded)
+    );
+    let current = snapshot(&inner, &[1, 2]).bridge_projection();
+    relay.rebuild(&current.surfaces, &current.sources, &current.nodes)?;
+    relay.media_chunk(MediaChunk {
+        delivery_id: 0,
+        source: original.key,
+        record_type: *kind,
+        offset: 0,
+        total: u32::try_from(body.len()).unwrap(),
+        last: true,
+        bytes: body.to_vec(),
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let discarded = loop {
+        if let Some(result) = relay.take_media_completions().into_iter().next() {
+            break result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "obsolete frame did not release the writer"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert!(discarded.superseded);
+    assert!(!discarded.delivered);
+    assert_eq!(discarded.sequence, 0);
+    assert!(relay.take_source_losses().is_empty());
+    assert!(
+        host.prepare(9, 1.)?.drawings().is_empty(),
+        "obsolete source frame reached the physical host"
+    );
+    assert_eq!(a.reconcile()?.presented_revision, 0);
+    assert_eq!(two.wait(Duration::ZERO)?, None);
+    project(&inner, &mut relay)?;
+    let _ = display(&mut host, &inner, &mut relay, 2);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let frame = host.prepare(9, 1.)?;
+        host.presented(&frame)?;
+        input(&inner, &mut relay)?;
+        if let Some(outcome) = two.wait(Duration::ZERO)? {
+            assert_eq!(outcome, vivid_sdk::overlay::PresentationOutcome::Presented);
+            if let Some(outcome) = peer.wait(Duration::ZERO)? {
+                assert_eq!(outcome, vivid_sdk::overlay::PresentationOutcome::Presented);
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh frame or peer did not progress after coalescing"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(a.reconcile()?.presented_revision, 2);
+    assert_eq!(b.reconcile()?.presented_revision, 1);
+    Ok(())
+}

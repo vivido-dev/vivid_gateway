@@ -961,13 +961,19 @@ impl RelayedScenes {
             .windows
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match key {
-            Some(key) => {
-                windows.remove(&key);
-            }
-            None => windows.clear(),
-        }
+        let retired: Vec<_> = match key {
+            Some(key) => windows.remove(&key).into_iter().collect(),
+            None => windows.drain().map(|(_, value)| value).collect(),
+        };
         self.presented.notify_all();
+        drop(windows);
+        // A replaced physical attachment may replay the newest original scene.
+        // Retire its copies without inventing a source presentation outcome.
+        for window in retired {
+            for (_, receipt) in window.presentations {
+                receipt.abandon();
+            }
+        }
     }
 
     /// The outer revision relaying `inner`, once the outer presenter has it on screen.

@@ -263,7 +263,7 @@ impl OuterBridge {
                 // A late retained hydration from a replaced writer must not be attributed to a
                 // new track that happens to reuse the same SDK object ID.
                 if completion.delivery_id == 0 {
-                    completion.delivered = false;
+                    completion.disposition = MediaDisposition::Failed;
                 }
                 continue;
             };
@@ -273,7 +273,7 @@ impl OuterBridge {
             }
             if completion.needs_full_frame {
                 self.full_frames.insert(completion.source);
-            } else if !completion.delivered {
+            } else if completion.disposition == MediaDisposition::Failed {
                 self.losses.insert(completion.source);
             }
         }
@@ -284,7 +284,8 @@ impl OuterBridge {
             .filter(|value| !value.eos)
             .map(|value| DeliveryOutcome {
                 delivery_id: value.delivery_id,
-                delivered: value.delivered,
+                delivered: value.disposition == MediaDisposition::Delivered,
+                superseded: value.disposition == MediaDisposition::Superseded,
                 sequence: value.sequence,
                 object_id: value.object_id,
             })
@@ -365,6 +366,7 @@ impl OuterBridge {
             let writer = OuterMediaWriter {
                 overlay_revisions: Arc::clone(&self.overlay_revisions),
                 presentation_relay: self.presentation_relay.clone(),
+                superseded: false,
                 overlay_layouts: Arc::clone(&self.overlay_layouts),
                 writer_id,
                 key: source.key,
@@ -534,6 +536,11 @@ pub struct DeliveryOutcome {
     pub delivery_id: u64,
     /// Whether the outer track accepted the record.
     pub delivered: bool,
+    /// The original scene was intentionally coalesced without an outer write.
+    ///
+    /// Release its original ingress allowance with `release_bridge_delivery`;
+    /// do not complete it as a failed delivery or manufacture presentation.
+    pub superseded: bool,
     /// The outer media sequence the record was sent as, or zero when it was not delivered.
     pub sequence: u64,
     /// The outer track object the record was written to.
@@ -542,6 +549,7 @@ pub struct DeliveryOutcome {
 
 pub(super) struct OuterMediaWriter {
     pub(super) presentation_relay: Option<Arc<vivid_sdk::presenter::OverlayPresentationRoute>>,
+    pub(super) superseded: bool,
     pub(super) overlay_revisions: OverlayRevisions,
     pub(super) overlay_layouts: Arc<Mutex<OverlayLayouts>>,
     pub(super) writer_id: u64,
@@ -588,12 +596,19 @@ pub(super) struct PendingBody {
     pub(super) bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MediaDisposition {
+    Delivered,
+    Failed,
+    Superseded,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct MediaCompletion {
     pub(super) writer_id: u64,
     pub(super) source: BridgeSourceKey,
     pub(super) delivery_id: u64,
-    pub(super) delivered: bool,
+    pub(super) disposition: MediaDisposition,
     pub(super) sequence: u64,
     pub(super) object_id: u64,
     pub(super) needs_full_frame: bool,
@@ -645,10 +660,20 @@ impl OuterMediaWriter {
                     }
                 }
                 frame.canvas = canvas;
-                let receipt = self
-                    .presentation_relay
-                    .as_ref()
-                    .and_then(|route| route.capture(self.key, frame.epoch, frame.revision));
+                let receipt = if let Some(route) = &self.presentation_relay {
+                    match route.capture(self.key, frame.epoch, frame.revision)? {
+                        vivid_sdk::presenter::OverlayPresentationCapture::Forwarded(receipt) => {
+                            Some(receipt)
+                        }
+                        vivid_sdk::presenter::OverlayPresentationCapture::Replay => None,
+                        vivid_sdk::presenter::OverlayPresentationCapture::Discard => {
+                            self.superseded = true;
+                            return Ok(0);
+                        }
+                    }
+                } else {
+                    None
+                };
                 let inner_revision = frame.revision;
                 let (epoch, _) = next_outer_identity(self, frame.epoch)?;
                 frame.epoch = epoch;
@@ -663,8 +688,9 @@ impl OuterMediaWriter {
                 let revision = window.next_revision;
                 frame.revision = revision;
                 if window.revisions.len() == RELAYED_REVISIONS {
-                    let (retired, _) = window.revisions.pop_front().unwrap();
-                    window.presentations.retain(|(outer, _)| *outer != retired);
+                    window.revisions.pop_front();
+                    // Outcome receipts have their own bounded SDK credits. Do
+                    // not discard an unresolved physical outcome with history.
                 }
                 window.revisions.push_back((revision, inner_revision));
                 if let Some(receipt) = receipt {
@@ -800,13 +826,16 @@ pub(super) fn run_outer_media_writer(
                 body,
             } => {
                 writer.needs_full_frame = false;
+                writer.superseded = false;
                 let result = writer
                     .forward_media(record_type, &body)
                     .and_then(|sequence| {
-                        if !matches!(
-                            writer.kind,
-                            BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
-                        ) && !writer.slot_activated.load(Ordering::Acquire)
+                        if sequence != 0
+                            && !matches!(
+                                writer.kind,
+                                BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
+                            )
+                            && !writer.slot_activated.load(Ordering::Acquire)
                         {
                             writer.channel.wait_for_reusable_media_capacity()?;
                         }
@@ -819,18 +848,26 @@ pub(super) fn run_outer_media_writer(
         if writer.needs_full_frame {
             writer.awaiting_full_frame = true;
         }
-        let delivered = result.is_ok();
+        let delivered = result.is_ok() && !writer.superseded;
         let completion = MediaCompletion {
             writer_id: writer.writer_id,
             source: writer.key,
             delivery_id,
-            delivered,
+            disposition: if writer.superseded {
+                MediaDisposition::Superseded
+            } else if delivered {
+                MediaDisposition::Delivered
+            } else {
+                MediaDisposition::Failed
+            },
             sequence: result.unwrap_or(0),
             object_id: writer.object_id,
             needs_full_frame: writer.needs_full_frame,
             eos,
         };
-        if completions.send(completion).is_err() || eos || (!delivered && !writer.needs_full_frame)
+        if completions.send(completion).is_err()
+            || eos
+            || (!delivered && !writer.needs_full_frame && !writer.superseded)
         {
             break;
         }

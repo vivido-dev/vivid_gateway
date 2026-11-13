@@ -1,0 +1,289 @@
+//! A non-reading TCP peer must not strand a native socket writer or another owner.
+
+// Rust guideline compliant 2026-10-07
+use super::*;
+use std::{
+    net::TcpListener,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    thread::JoinHandle,
+};
+
+// Bound the fixture independently of the gateway's own source/queue budgets.
+const MAX_SOCKETS: usize = 32;
+const COPY_BYTES: usize = 64 * 1024;
+// Keep both native buffers below one bounded 256-KiB overlay record, so the
+// experiment reaches a kernel write rather than stopping at channel credit.
+const SOCKET_BYTES: usize = 16 * 1024;
+
+#[derive(Default)]
+struct Writes {
+    active: AtomicBool,
+    completed_bytes: AtomicU64,
+}
+struct NativeWriter {
+    stream: TcpStream,
+    writes: Arc<Writes>,
+}
+impl Write for NativeWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writes.active.store(true, Ordering::Release);
+        // No condition variable, credit wait or injected error here: only the
+        // operating system's blocking write can keep this flag set.
+        let result = self.stream.write(buf);
+        if let Ok(count) = result {
+            self.writes
+                .completed_bytes
+                .fetch_add(u64::try_from(count).unwrap(), Ordering::AcqRel);
+        }
+        self.writes.active.store(false, Ordering::Release);
+        result
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+struct KernelCarrier {
+    endpoint: String,
+    gate: Arc<Gate>,
+    writes: Arc<Writes>,
+    sockets: Mutex<Vec<TcpStream>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+impl KernelCarrier {
+    fn new(endpoint: &str) -> Self {
+        Self {
+            endpoint: endpoint.strip_prefix("tcp:").unwrap().into(),
+            gate: Arc::new(Gate {
+                state: Mutex::new(State {
+                    mode: Stall::None,
+                    entered: false,
+                    cancelled: false,
+                }),
+                changed: Condvar::new(),
+            }),
+            writes: Arc::default(),
+            sockets: Mutex::default(),
+            workers: Mutex::default(),
+        }
+    }
+    fn retain(&self, streams: &[&TcpStream]) -> io::Result<()> {
+        let mut sockets = self.sockets.lock().unwrap();
+        if self.gate.state.lock().unwrap().cancelled
+            || sockets.len().saturating_add(streams.len()) > MAX_SOCKETS
+        {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        for stream in streams {
+            sockets.push(stream.try_clone()?);
+        }
+        Ok(())
+    }
+    fn blocked_write(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.writes.active.load(Ordering::Acquire) {
+                let completed = self.writes.completed_bytes.load(Ordering::Acquire);
+                // Observe an actual native write, not just a full gateway queue
+                // or a sender parked on authenticated protocol credit.
+                std::thread::sleep(Duration::from_millis(100));
+                if self.writes.active.load(Ordering::Acquire)
+                    && self.writes.completed_bytes.load(Ordering::Acquire) == completed
+                {
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "native TCP writer never blocked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+impl ConnectionFactory for KernelCarrier {
+    fn open(&self, kind: ConnectionKind, _: Option<LaneClass>) -> io::Result<Connection> {
+        let upstream = TcpStream::connect(&self.endpoint)?;
+        upstream.set_nodelay(true)?;
+        if kind != ConnectionKind::Track {
+            self.retain(&[&upstream])?;
+            return Connection::from_streams(upstream.try_clone()?, upstream, kind);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (mut receiver, _) = listener.accept()?;
+        client.set_nodelay(true)?;
+        receiver.set_nodelay(true)?;
+        socket2::SockRef::from(&client).set_send_buffer_size(SOCKET_BYTES)?;
+        socket2::SockRef::from(&receiver).set_recv_buffer_size(SOCKET_BYTES)?;
+        self.retain(&[&client, &receiver, &upstream])?;
+        let mut remote_reader = upstream.try_clone()?;
+        let mut response = receiver.try_clone()?;
+        let gate = Arc::clone(&self.gate);
+        let mut remote_writer = upstream;
+        let mut workers = self.workers.lock().unwrap();
+        workers.push(std::thread::spawn(move || {
+            let mut buffer = vec![0u8; COPY_BYTES].into_boxed_slice();
+            loop {
+                let Ok(count) = receiver.read(&mut buffer) else {
+                    return;
+                };
+                if count == 0
+                    || gate.wait(Stall::TrackWrite).is_err()
+                    || remote_writer.write_all(&buffer[..count]).is_err()
+                {
+                    return;
+                }
+            }
+        }));
+        workers.push(std::thread::spawn(move || {
+            let _ = io::copy(&mut remote_reader, &mut response);
+        }));
+        drop(workers);
+        Connection::from_streams(
+            client.try_clone()?,
+            NativeWriter {
+                stream: client,
+                writes: Arc::clone(&self.writes),
+            },
+            kind,
+        )
+    }
+    fn cancel(&self) {
+        let mut state = self.gate.state.lock().unwrap();
+        state.cancelled = true;
+        self.gate.changed.notify_all();
+        drop(state);
+        for stream in self.sockets.lock().unwrap().iter() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+impl Drop for KernelCarrier {
+    fn drop(&mut self) {
+        self.cancel();
+        for worker in self.workers.lock().unwrap().drain(..) {
+            worker.join().unwrap();
+        }
+    }
+}
+fn large_scene() -> Canvas {
+    let mut path = Path::builder().move_to(0.5, 0.5);
+    // Two paths stay within the producer's 256-KiB record grant. Fractional
+    // coordinates keep each encoded scalar wide enough to exceed the fixture's
+    // native socket buffers with one valid authenticated vector record.
+    for index in 0..4094 {
+        path = path.line_to(f64::from(index % 180) + 0.25, f64::from(index % 90) + 0.75);
+    }
+    let path = path.close().build().unwrap();
+    let mut canvas = Canvas::new();
+    for _ in 0..2 {
+        canvas
+            .fill(path.clone(), Brush::Solid(Color(0xff33_5577)))
+            .unwrap();
+    }
+    canvas
+}
+#[test]
+fn native_tcp_backpressure_cancels_while_control_and_a_same_id_peer_progress() -> io::Result<()> {
+    let (inner, endpoint) = overlay_presenter()?;
+    let first = overlay_producer(&endpoint, &pane(&inner, 1)?, "native-stall")?;
+    let second = overlay_producer(&endpoint, &pane(&inner, 2)?, "peer")?;
+    let a = window_of(&first, 0., 0.)?;
+    let b = window_of(&second, 260., 0.)?;
+    assert_eq!(
+        a.submit(large_scene())?.wait(Duration::from_secs(3))?,
+        Some(vivid_sdk::overlay::PresentationOutcome::Presented)
+    );
+    assert_eq!(
+        b.submit(scene(1))?.wait(Duration::from_secs(3))?,
+        Some(vivid_sdk::overlay::PresentationOutcome::Presented)
+    );
+    let (outer, endpoint) = overlay_presenter()?;
+    let carrier = Arc::new(KernelCarrier::new(&endpoint));
+    let mut blocked = OuterBridge::builder(
+        Secret32::from_hex(&pane(&outer, 9)?).map_err(io::Error::other)?,
+        DisplayMetrics::default(),
+    )
+    .connection_factory(Arc::<KernelCarrier>::clone(&carrier))
+    .build()?;
+    let mut peer = bridge(&endpoint, &pane(&outer, 10)?)?;
+    let keys = [1, 2].map(|pane| snapshot(&inner, &[pane]).bridge_projection().surfaces[0].key);
+    assert_eq!(
+        (keys[0].context, keys[0].surface),
+        (keys[1].context, keys[1].surface)
+    );
+    assert_ne!(keys[0].producer, keys[1].producer);
+    for (relay, pane) in [(&mut blocked, 1), (&mut peer, 2)] {
+        reconcile(&inner, relay, pane)?;
+        frame(&inner, relay, pane)?;
+        finish_delivery(&inner, relay, 0)?;
+        relay.retry_pending_activation()?;
+    }
+    let source_keys = [1, 2].map(|pane| snapshot(&inner, &[pane]).sources[0].key);
+    assert_eq!(
+        (
+            source_keys[0].context,
+            source_keys[0].surface,
+            source_keys[0].track
+        ),
+        (
+            source_keys[1].context,
+            source_keys[1].surface,
+            source_keys[1].track
+        )
+    );
+    let peer_surface = peer.outer_surface_id(keys[1]);
+    let cancel = blocked.cancel_handle();
+    std::thread::scope(|scope| -> io::Result<()> {
+        let (drop_tx, drop_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let _cleanup = Cleanup {
+            cancel: cancel.clone(),
+            drop_tx: drop_tx.clone(),
+        };
+        carrier.gate.arm(Stall::TrackWrite);
+        let source = snapshot(&inner, &[1]).sources[0].key;
+        let mut queued = 0;
+        while blocked.can_accept_media(source) && queued < 32 {
+            frame(&inner, &mut blocked, 1)?;
+            queued += 1;
+        }
+        assert!(
+            !blocked.can_accept_media(source),
+            "native stall escaped the bounded media queue"
+        );
+        carrier.gate.entered();
+        carrier.blocked_write();
+        a.set_bounds(Rect::new(8., 8., 240., 120.).unwrap())?;
+        reconcile(&inner, &mut blocked, 1)?;
+        assert!(carrier.writes.active.load(Ordering::Acquire));
+        let worker = scope.spawn(move || {
+            let _ = drop_rx.recv();
+            drop(blocked);
+            done_tx.send(()).unwrap();
+        });
+        // Prove the original control lane and a same-ID independent owner remain
+        // usable while the stalled owner's actual write(2) is still outstanding.
+        b.set_bounds(Rect::new(264., 4., 240., 120.).unwrap())?;
+        reconcile(&inner, &mut peer, 2)?;
+        assert_eq!(
+            b.submit(scene(2))?.wait(Duration::from_secs(3))?,
+            Some(vivid_sdk::overlay::PresentationOutcome::Presented)
+        );
+        frame(&inner, &mut peer, 2)?;
+        finish_delivery(&inner, &mut peer, 0)?;
+        assert_eq!(peer.outer_surface_id(keys[1]), peer_surface);
+        assert!(carrier.writes.active.load(Ordering::Acquire));
+        let start = Instant::now();
+        cancel.cancel();
+        let _ = drop_tx.send(());
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("native TCP cancellation did not retire the writer");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(!carrier.writes.active.load(Ordering::Acquire));
+        worker.join().unwrap();
+        eprintln!(
+            "Verified native TCP write blocked for at least 100 ms, {queued} bounded media handoffs, same-owner control and same-ID peer progress; cancellation retired the writer in {} ms.",
+            start.elapsed().as_millis()
+        );
+        Ok(())
+    })
+}
