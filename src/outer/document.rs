@@ -36,9 +36,13 @@ struct Window {
     outer_address: WindowAddress,
     inner: Option<Context>,
     outer: Option<Context>,
-    revisions: VecDeque<(u64, u64)>,
+    revisions: VecDeque<Revision>,
     busy: bool,
-    target: Option<vivid_sdk::presenter::OverlayDocumentTarget>,
+}
+struct Revision {
+    outer: u64,
+    inner: u64,
+    target: vivid_sdk::presenter::OverlayDocumentTarget,
 }
 struct Grant {
     documents: Arc<Mutex<Documents>>,
@@ -192,7 +196,6 @@ impl OuterBridge {
                 outer: None,
                 revisions: VecDeque::new(),
                 busy: false,
-                target: None,
             }))
         }));
         let mut state = window.lock().expect("document window mutex");
@@ -224,7 +227,7 @@ impl OuterBridge {
             if !reservation.0.live(&documents) {
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            let state = reservation.0.window.lock().expect("document window mutex");
+            let mut state = reservation.0.window.lock().expect("document window mutex");
             let allocate = |documents: &mut Documents| -> io::Result<u64> {
                 documents.next = documents
                     .next
@@ -250,18 +253,31 @@ impl OuterBridge {
                     } else {
                         allocate(&mut documents)?
                     };
-                    outer.revision = if state.inner.as_ref() == Some(inner) {
-                        state
-                            .outer
-                            .as_ref()
-                            .ok_or_else(|| invalid_data("missing outer excerpt"))?
-                            .revision
-                    } else {
-                        allocate(&mut documents)?
-                    };
+                    // Each publication has its own captured grant, even when the
+                    // excerpt is unchanged. Old callbacks retain their own mapping.
+                    outer.revision = allocate(&mut documents)?;
                     Ok(outer)
                 })
                 .transpose()?;
+            if state.inner.as_ref().map(|c| c.editor) != query.context.as_ref().map(|c| c.editor) {
+                state.revisions.clear();
+            }
+            if let (Some(inner), Some(outer)) = (&query.context, &context) {
+                if state.revisions.len() >= CAPACITY {
+                    state.revisions.pop_front();
+                }
+                state.revisions.push_back(Revision {
+                    outer: outer.revision,
+                    inner: inner.revision,
+                    target,
+                });
+            }
+            // The physical control reader exposes this context before its host
+            // callback acknowledges. Publish the immutable mapping first so input
+            // admitted in that interval cannot use the previous scene's grant.
+            // A failed/uncertain RPC never rolls back input or retargets old mappings.
+            state.inner = query.context;
+            state.outer.clone_from(&context);
             drop(state);
             drop(documents);
             let fields = host(
@@ -270,7 +286,7 @@ impl OuterBridge {
                 SetContext {
                     address,
                     scene_revision: scene,
-                    context: context.clone(),
+                    context,
                 }
                 .payload()?,
             )?;
@@ -282,26 +298,6 @@ impl OuterBridge {
             if !reservation.0.live(&documents) {
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            let mut state = reservation.0.window.lock().expect("document window mutex");
-            if state.inner.as_ref().map(|c| c.editor) != query.context.as_ref().map(|c| c.editor) {
-                state.revisions.clear();
-            }
-            if let (Some(inner), Some(outer)) = (&query.context, &context)
-                && !state
-                    .revisions
-                    .iter()
-                    .any(|(revision, _)| *revision == outer.revision)
-            {
-                if state.revisions.len() >= CAPACITY {
-                    state.revisions.pop_front();
-                }
-                state.revisions.push_back((outer.revision, inner.revision));
-            }
-            state.target = Some(target);
-            state.inner = query.context;
-            state.outer = context;
-            drop(state);
-            drop(documents);
             Ok(messages::Envelope::new(envelope.request_id, fields).encode()?)
         }))
     }
@@ -324,11 +320,10 @@ impl OuterBridge {
         if edit.validate_context(context).is_err() {
             return Ok(());
         }
-        let Some(inner_revision) = state
+        let Some(revision) = state
             .revisions
             .iter()
-            .find(|(outer, _)| *outer == edit.revision)
-            .map(|(_, inner)| *inner)
+            .find(|revision| revision.outer == edit.revision)
         else {
             return Ok(());
         };
@@ -352,10 +347,8 @@ impl OuterBridge {
             .as_ref()
             .ok_or_else(|| invalid_data("missing source context"))?
             .editor;
-        edit.revision = inner_revision;
-        let Some(target) = state.target.clone() else {
-            return Ok(());
-        };
+        edit.revision = revision.inner;
+        let target = revision.target.clone();
         drop(state);
         drop(documents);
         self.document_input

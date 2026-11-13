@@ -99,6 +99,34 @@ fn click(host: &mut NativeVectorHost, target: &VectorInputTarget, x: f64) -> Vec
     host.flush_input();
     target
 }
+fn clicked(
+    inner: &VirtualVivid,
+    relay: &mut OuterBridge,
+    producer: &OverlaySession,
+) -> io::Result<()> {
+    // The release follows all initial focus transitions on the same input lane.
+    // A single nonblocking drain is not a round-trip barrier under load.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        input(inner, relay)?;
+        if let Some(vivid_sdk::OverlayLaneEvent::Input(event)) =
+            producer.wait_event(Duration::from_millis(1))?
+            && matches!(
+                event.event,
+                vivid_sdk::overlay::Event::Pointer {
+                    button: Some((1, false)),
+                    ..
+                }
+            )
+        {
+            return Ok(());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "original pointer release stalled"
+        );
+    }
+}
 fn publish(
     inner: &VirtualVivid,
     relay: &mut OuterBridge,
@@ -237,7 +265,7 @@ fn native_documents_reoriginate_revisions_and_revoke_delayed_input_without_harmi
     project(&inner, &mut relay)?;
     let target = display(&mut host, &inner, &mut relay, 2);
     let target = click(&mut host, &target, 10.);
-    input(&inner, &mut relay)?;
+    clicked(&inner, &mut relay, &first)?;
     let text = host.text_target(&target).unwrap();
     let original = context(41, 73);
     publish(&inner, &mut relay, &mut host, &a, 2, original.clone())?;
@@ -297,7 +325,19 @@ fn native_documents_reoriginate_revisions_and_revoke_delayed_input_without_harmi
     send(&mut host, &text, "focus-old");
     let delayed = pending(&inner, &mut relay);
     let target = click(&mut host, &target, 270.);
-    input(&inner, &mut relay)?;
+    clicked(&inner, &mut relay, &second)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        input(&inner, &mut relay)?;
+        if !a.reconcile()?.focused {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "original focus revocation stalled"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(
         !delayed.forward()?,
         "focus loss must retire the bridge grant"
@@ -370,7 +410,7 @@ fn native_documents_reoriginate_revisions_and_revoke_delayed_input_without_harmi
     project(&inner, &mut relay)?;
     let target = display(&mut host, &inner, &mut relay, 1);
     let target = click(&mut host, &target, 270.);
-    input(&inner, &mut relay)?;
+    clicked(&inner, &mut relay, &second)?;
     let peer_text = host.text_target(&target).unwrap();
     peer_context.revision += 1;
     publish(&inner, &mut relay, &mut host, &b, 2, peer_context.clone())?;
@@ -436,4 +476,237 @@ fn document_negotiation_requires_both_a_capable_physical_host_and_an_opted_in_br
         "legacy mux consumers must not negotiate a typed channel they cannot carry"
     );
     Ok(())
+}
+
+#[test]
+fn unicode_commit_uses_the_applied_context_before_its_publication_acknowledgement() -> io::Result<()>
+{
+    composition_before_ack(false)
+}
+
+#[test]
+fn retained_relative_composition_keeps_its_original_grant_across_repaint() -> io::Result<()> {
+    composition_before_ack(true)
+}
+
+fn composition_before_ack(retained_callback: bool) -> io::Result<()> {
+    let (inner, _) = overlay_presenter()?;
+    let inner = Arc::new(inner);
+    inner.enable_overlay_host_relay();
+    let listener = TcpPresenterListener::bind()?;
+    let endpoint = listener.endpoint();
+    let mut config = PresenterConfig::terminal_with_overlay(MediaConfig::default());
+    config
+        .supported_profiles
+        .push(registry::OVERLAY_EDITOR.into());
+    let outer = Arc::new(VirtualVivid::start_configured_eventless(listener, config)?);
+    let mut host = NativeVectorHost::attach(Arc::clone(&outer), "")?;
+    let mut relay = OuterBridge::builder(
+        Secret32::from_hex(&pane(&outer, 9)?).map_err(io::Error::other)?,
+        DisplayMetrics::default(),
+    )
+    .control_endpoint(endpoint)
+    .overlay_document_editing(&inner)
+    .build()?;
+    inner.set_overlay_document_host_profiles(&relay.overlay_host_profiles());
+    let first = connect(&inner, 1)?;
+    let second = connect(&inner, 2)?;
+    let a = window_of(&first, 0., 0.)?;
+    let b = window_of(&second, 260., 0.)?;
+    a.present(canvas())?;
+    b.present(canvas())?;
+    project(&inner, &mut relay)?;
+    let target = display(&mut host, &inner, &mut relay, 2);
+    let target = click(&mut host, &target, 10.);
+    clicked(&inner, &mut relay, &first)?;
+    let text = host.text_target(&target).unwrap();
+    let original = context(41, 73);
+    publish(&inner, &mut relay, &mut host, &a, 1, original.clone())?;
+    let mapped = host.editor_state(&text).unwrap().document.unwrap();
+    assert_eq!(
+        host.dispatch_document(
+            &text,
+            &VectorDocumentEdit {
+                editor: mapped.editor,
+                revision: mapped.revision,
+                preedit: Some(("é😀漢".into(), Some(2..6))),
+                ..Default::default()
+            }
+        )?,
+        VectorInputResult::Delivered { text: false }
+    );
+    assert!(pending(&inner, &mut relay).forward()?);
+    assert_eq!(received(&first).preedit, Some(("é😀漢".into(), Some(2..6))));
+    send(&mut host, &text, "stale scene");
+    let stale_scene = pending(&inner, &mut relay);
+    // Repaint preedit while preserving the original editor and excerpt revision.
+    let a_key = snapshot(&inner, &[1]).bridge_projection().surfaces[0].key;
+    let a_id = relay.outer_surface_id(a_key).unwrap();
+    let previous = host
+        .prepare(9, 1.)?
+        .drawings()
+        .iter()
+        .find(|drawing| drawing.window.surface_id() == a_id)
+        .unwrap()
+        .submission;
+    let submitted = a.submit(canvas())?;
+    assert_eq!(
+        submitted.wait(Duration::from_secs(3))?,
+        Some(vivid_sdk::overlay::PresentationOutcome::Presented)
+    );
+    project(&inner, &mut relay)?;
+    let display_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let frame = host.prepare(9, 1.)?;
+        let changed = frame
+            .drawings()
+            .iter()
+            .any(|drawing| drawing.window.surface_id() == a_id && drawing.submission != previous);
+        if changed && host.presented(&frame)? {
+            break;
+        }
+        assert!(Instant::now() < display_deadline, "preedit repaint stalled");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    input(&inner, &mut relay)?;
+    let peer_surface =
+        relay.outer_surface_id(snapshot(&inner, &[2]).bridge_projection().surfaces[0].key);
+    let mut next = original.clone();
+    if !retained_callback {
+        next.revision += 1;
+    }
+    std::thread::scope(|scope| -> io::Result<()> {
+        let publication = scope.spawn(|| a.set_text_context(2, Some(next.clone())));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let request = loop {
+            if let Some(request) = inner.take_overlay_host_requests().pop() {
+                break request;
+            }
+            assert!(Instant::now() < deadline, "inner context request stalled");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        relay.start_overlay_host_request(request)?;
+        // The control reader applies the context before the host callback replies.
+        let physical = loop {
+            input(&inner, &mut relay)?;
+            if let Some((_, reply)) = relay.take_overlay_host_replies().into_iter().next() {
+                panic!("physical publication failed before callback: {reply:?}");
+            }
+            if let Some(request) = outer.take_overlay_host_requests().pop() {
+                break request;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "physical context request stalled"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            physical.record_type,
+            vivid_protocol::messages::SET_OVERLAY_TEXT_CONTEXT
+        );
+        assert!(!publication.is_finished());
+        assert!(
+            !stale_scene.forward()?,
+            "old displayed scene gained input after repaint"
+        );
+        if retained_callback {
+            assert_eq!(
+                host.dispatch_document(
+                    &text,
+                    &VectorDocumentEdit {
+                        editor: mapped.editor,
+                        revision: mapped.revision,
+                        commit: Some("é文漢".into()),
+                        ..Default::default()
+                    }
+                )?,
+                VectorInputResult::Delivered { text: true }
+            );
+        } else {
+            send(&mut host, &text, "é文漢");
+        }
+        let input_deadline = Instant::now() + Duration::from_secs(2);
+        let mut delivered = false;
+        loop {
+            input(&inner, &mut relay)?;
+            if let Some(edit) = relay.take_overlay_document_input().pop() {
+                delivered = edit.forward()?;
+                break;
+            }
+            if Instant::now() >= input_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(b.bounds()?, Rect::new(260., 0., 240., 120.).unwrap());
+        assert_eq!(
+            peer_surface,
+            relay.outer_surface_id(snapshot(&inner, &[2]).bridge_projection().surfaces[0].key)
+        );
+        outer.complete_overlay_host_request(
+            physical.id,
+            Ok(vivid_protocol::messages::Envelope::new(1, Vec::new()).encode()?),
+        );
+        while !publication.is_finished() {
+            for (id, reply) in relay.take_overlay_host_replies() {
+                inner.complete_overlay_host_request(id, reply.map_err(|error| error.to_string()));
+            }
+            assert!(Instant::now() < deadline, "context acknowledgement stalled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        publication.join().unwrap()?;
+        assert!(
+            delivered,
+            "Unicode commit lost between physical context application and publication acknowledgement: retained={retained_callback}, original focused={}, physical context={:?}",
+            a.reconcile()?.focused,
+            host.editor_state(&text).and_then(|state| state.document)
+        );
+        let commit = received(&first);
+        assert_eq!(commit.commit.as_deref(), Some("é文漢"));
+        assert_eq!(
+            (commit.editor, commit.revision, commit.scene_revision),
+            (41, next.revision, 2)
+        );
+        assert!(first.editor_event_targets(&commit, &a)?);
+        // Republishing the same editor after an original focus round trip must
+        // not lend the fresh grant to an old physical callback revision.
+        let prior = host.editor_state(&text).unwrap().document.unwrap();
+        let temporary = window_of(&first, 600., 0.)?;
+        temporary.request_focus()?;
+        a.request_focus()?;
+        publish(&inner, &mut relay, &mut host, &a, 2, next.clone())?;
+        assert_eq!(
+            host.dispatch_document(
+                &text,
+                &VectorDocumentEdit {
+                    editor: prior.editor,
+                    revision: prior.revision,
+                    commit: Some("old focus".into()),
+                    ..Default::default()
+                }
+            )?,
+            VectorInputResult::Delivered { text: true }
+        );
+        assert!(
+            !pending(&inner, &mut relay).forward()?,
+            "old callback borrowed a republished focus grant"
+        );
+        send(&mut host, &text, "fresh");
+        assert!(pending(&inner, &mut relay).forward()?);
+        assert_eq!(received(&first).commit.as_deref(), Some("fresh"));
+        let end = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < end {
+            for producer in [&first, &second] {
+                if let Some(event) = producer.wait_event(Duration::from_millis(1))? {
+                    assert!(
+                        !matches!(event, vivid_sdk::OverlayLaneEvent::EditorEdit(_)),
+                        "extra or cross-owner commit"
+                    );
+                }
+            }
+        }
+        temporary.close()?;
+        Ok(())
+    })
 }

@@ -124,8 +124,13 @@ mapped independently between authenticated sessions. Text is at most 4 KiB per
 excerpt/commit/preedit, and sensitive contexts stay empty and masked. The bridge
 retains at most 64 document windows and 64 revision mappings per window; one request
 per window may be in flight. Counters use checked allocation and never reuse a
-failed request's proposed identity. Only an acknowledged physical context installs
-its reverse mapping. A failed or uncertain publication must not be retried as an edit.
+failed request's proposed identity. Install each immutable reverse mapping before
+calling the physical host: its control reader applies the context before the host
+callback acknowledges it. Each publication gets a fresh outer excerpt revision and
+retains its own original input target, including when the excerpt is unchanged.
+A failed or uncertain publication does not roll back admitted input or lend a new
+grant to an old callback; it must not be retried as an edit. The original presenter
+still rechecks the exact mapped scene and current editor authority at delivery.
 
 At most 64 typed input records await the caller, each for at most one second locally.
 An overflowing document queue drops document input while ordinary input continues.
@@ -146,6 +151,18 @@ expiry, outer replacement, cancellation and owner-scoped cleanup:
 ```sh
 cargo test --all-targets --features native-vector-testing
 ```
+
+Two controlled publication regressions hold a physical context acknowledgement
+while delivering Unicode through the applied context, including a retained relative
+composition callback from before repaint. Both reproduce commit loss against the
+previous implementation. The SDK's opaque editor target now retains source/window,
+track/channel/epoch, focus and lane incarnation across ordinary repaint; each edit
+still names the exact current displayed scene. Old scene receipts and callbacks
+from a focus round trip fail, fresh callbacks deliver once, and same-ID peers keep
+their physical identity and receive no document edits. Revision history stores at
+most 64 target/identity mappings per window, without retaining historical excerpts.
+The [local macOS Unicode follow-up](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-unicode-macos.json)
+records overlapping full typed-relay Metal checks and separate isolated fixtures.
 
 This suite does not submit GPU work or drive a platform IME. The compositor's
 developer-only `vector-relay-testing` adapter separately exercises this core with
@@ -255,7 +272,8 @@ GUI action launches. No physical key is retried or retargeted and the ten-second
 action admission deadline is unchanged. Production integration, sustained load,
 physical input/devices and other platforms remain separate gates. The full typed-relay
 fixture also hit one Unicode commit timeout during overlapping acceptance workloads;
-final isolated fixtures passed, but broader loaded composition remains unqualified.
+the Unicode follow-up above qualifies the corrected local publication/repaint ordering.
+Sustained production workloads remain unqualified.
 
 ## Slow clients and action deadlines
 
