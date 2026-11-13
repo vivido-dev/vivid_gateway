@@ -90,12 +90,12 @@ impl OuterBridge {
                     continue;
                 }
                 vivid_sdk::OverlayLaneEvent::Outcome(outcome) => {
-                    if outcome.outcome
-                        == vivid_protocol::overlay::wire::PresentationOutcome::Presented
-                        && let Some(key) = self.outer_surface_key(&outcome.submission.address)
-                    {
-                        self.overlay_revisions
-                            .record_presented(key, outcome.submission.revision)?;
+                    if let Some(key) = self.outer_surface_key(&outcome.submission.address) {
+                        self.overlay_revisions.record_outcome(
+                            key,
+                            outcome.submission.revision,
+                            outcome.outcome,
+                        )?;
                     }
                     continue;
                 }
@@ -904,6 +904,8 @@ pub(super) struct RelayedScenes {
 
 #[derive(Default)]
 pub(super) struct WindowScenes {
+    pub(super) next_revision: u64,
+    pub(super) presentations: VecDeque<(u64, vivid_sdk::presenter::OverlayPresentationReceipt)>,
     /// `(outer, inner)` revisions of the last [`RELAYED_REVISIONS`] scenes relayed, oldest first.
     pub(super) revisions: VecDeque<(u64, u64)>,
     /// The outer revision the outer presenter last reported presented.
@@ -917,10 +919,38 @@ impl RelayedScenes {
         self.windows.lock().map_err(poisoned("overlay revisions"))
     }
 
+    #[cfg(test)]
     pub(super) fn record_presented(&self, key: BridgeSurfaceKey, outer: u64) -> io::Result<()> {
-        if let Some(window) = self.lock()?.get_mut(&key) {
-            window.presented = Some(outer);
-            self.presented.notify_all();
+        self.record_outcome(
+            key,
+            outer,
+            vivid_protocol::overlay::wire::PresentationOutcome::Presented,
+        )
+    }
+    pub(super) fn record_outcome(
+        &self,
+        key: BridgeSurfaceKey,
+        outer: u64,
+        outcome: vivid_protocol::overlay::wire::PresentationOutcome,
+    ) -> io::Result<()> {
+        let receipt = {
+            let mut windows = self.lock()?;
+            windows.get_mut(&key).and_then(|window| {
+                if outcome == vivid_protocol::overlay::wire::PresentationOutcome::Presented {
+                    window.presented = Some(outer);
+                    self.presented.notify_all();
+                }
+                window
+                    .presentations
+                    .iter()
+                    .position(|(revision, _)| *revision == outer)
+                    .and_then(|index| window.presentations.remove(index))
+                    .map(|(_, receipt)| receipt)
+            })
+        };
+        // Never acquire the original presenter's lock under the media mapping lock.
+        if let Some(receipt) = receipt {
+            receipt.complete(outcome);
         }
         Ok(())
     }

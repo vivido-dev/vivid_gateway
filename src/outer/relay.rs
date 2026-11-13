@@ -364,6 +364,7 @@ impl OuterBridge {
             let slot_activated = Arc::new(AtomicBool::new(false));
             let writer = OuterMediaWriter {
                 overlay_revisions: Arc::clone(&self.overlay_revisions),
+                presentation_relay: self.presentation_relay.clone(),
                 overlay_layouts: Arc::clone(&self.overlay_layouts),
                 writer_id,
                 key: source.key,
@@ -540,6 +541,7 @@ pub struct DeliveryOutcome {
 }
 
 pub(super) struct OuterMediaWriter {
+    pub(super) presentation_relay: Option<Arc<vivid_sdk::presenter::OverlayPresentationRoute>>,
     pub(super) overlay_revisions: OverlayRevisions,
     pub(super) overlay_layouts: Arc<Mutex<OverlayLayouts>>,
     pub(super) writer_id: u64,
@@ -643,16 +645,31 @@ impl OuterMediaWriter {
                     }
                 }
                 frame.canvas = canvas;
+                let receipt = self
+                    .presentation_relay
+                    .as_ref()
+                    .and_then(|route| route.capture(self.key, frame.epoch, frame.revision));
                 let inner_revision = frame.revision;
-                let (epoch, revision) = next_outer_identity(self, frame.epoch)?;
+                let (epoch, _) = next_outer_identity(self, frame.epoch)?;
                 frame.epoch = epoch;
-                frame.revision = revision;
                 let mut mappings = self.overlay_revisions.lock()?;
-                let revisions = &mut mappings.entry(key).or_default().revisions;
-                if revisions.len() == RELAYED_REVISIONS {
-                    revisions.pop_front();
+                let window = mappings.entry(key).or_default();
+                // Overlay revisions belong to the window, including a replacement
+                // track being primed; a new track must not restart that namespace.
+                window.next_revision = window
+                    .next_revision
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("outer overlay revision exhausted"))?;
+                let revision = window.next_revision;
+                frame.revision = revision;
+                if window.revisions.len() == RELAYED_REVISIONS {
+                    let (retired, _) = window.revisions.pop_front().unwrap();
+                    window.presentations.retain(|(outer, _)| *outer != retired);
                 }
-                revisions.push_back((revision, inner_revision));
+                window.revisions.push_back((revision, inner_revision));
+                if let Some(receipt) = receipt {
+                    window.presentations.push_back((revision, receipt));
+                }
                 drop(mappings);
                 self.channel.send_vector(&frame)
             }

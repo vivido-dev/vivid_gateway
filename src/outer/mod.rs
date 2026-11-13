@@ -159,6 +159,7 @@ pub struct BridgeCancel {
     current: Arc<Mutex<CancelHook>>,
     factory: Option<Arc<dyn ConnectionFactory>>,
     actions: Arc<Mutex<Option<CancelHook>>>,
+    presentations: Arc<Mutex<Option<CancelHook>>>,
 }
 
 impl std::fmt::Debug for BridgeCancel {
@@ -183,6 +184,14 @@ impl BridgeCancel {
             .clone();
         if let Some(actions) = actions {
             actions();
+        }
+        if let Some(cancel) = self
+            .presentations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            cancel();
         }
         if let Some(factory) = &self.factory {
             factory.cancel();
@@ -225,6 +234,7 @@ impl BridgeCancel {
 /// Every object allocated here belongs exclusively to the outer session. Inner IDs are lookup
 /// keys only and never become outer Vivid IDs, revisions, generations, epochs, or media IDs.
 pub struct OuterBridge {
+    presentation_relay: Option<Arc<vivid_sdk::presenter::OverlayPresentationRoute>>,
     document_relay: bool,
     document_target: std::sync::Weak<vivid_sdk::presenter::VirtualVivid>,
     documents: Arc<Mutex<document::Documents>>,
@@ -341,9 +351,11 @@ impl OuterBridge {
             current: Arc::new(std::sync::Mutex::new(session.cancel_handle())),
             factory: route.factory(),
             actions: Arc::default(),
+            presentations: Arc::default(),
         };
         let position_observer = PositionObserver::new(&session)?;
         Ok(Self {
+            presentation_relay: None,
             cancellation,
             session,
             microphones: crate::microphone::Microphones::default(),

@@ -58,18 +58,33 @@ fn fixture() -> io::Result<(
     NativeVectorHost,
     OuterBridge,
 )> {
+    fixture_mode(false)
+}
+fn fixture_mode(
+    presentations: bool,
+) -> io::Result<(
+    Arc<VirtualVivid>,
+    Arc<VirtualVivid>,
+    NativeVectorHost,
+    OuterBridge,
+)> {
     let (inner, _) = overlay_presenter()?;
     let inner = Arc::new(inner);
     inner.enable_overlay_host_relay();
     let (outer, endpoint) = overlay_presenter()?;
     let outer = Arc::new(outer);
     let host = NativeVectorHost::attach(Arc::clone(&outer), "")?;
-    let relay = OuterBridge::builder(
+    let builder = OuterBridge::builder(
         Secret32::from_hex(&pane(&outer, 9)?).map_err(io::Error::other)?,
         DisplayMetrics::default(),
     )
     .control_endpoint(endpoint)
-    .overlay_action_forwarding(&inner)
+    .overlay_action_forwarding(&inner);
+    let relay = if presentations {
+        builder.overlay_presentation_forwarding(&inner)
+    } else {
+        builder
+    }
     .build()?;
     Ok((inner, outer, host, relay))
 }
@@ -541,7 +556,15 @@ fn replacing_the_lane_after_physical_focus_cannot_deliver_old_feedback_or_acknow
 #[test]
 fn leased_source_resume_preserves_ids_but_retires_old_actions_frames_and_channels_only_for_its_owner()
 -> io::Result<()> {
-    let (inner, _outer, mut host, mut relay) = fixture()?;
+    leased_source_resume(false)
+}
+#[test]
+fn leased_source_resume_fences_old_authority_with_deferred_physical_presentation() -> io::Result<()>
+{
+    leased_source_resume(true)
+}
+fn leased_source_resume(presentations: bool) -> io::Result<()> {
+    let (inner, _outer, mut host, mut relay) = fixture_mode(presentations)?;
     let mut a = Producer::new(&inner, 1, true)?;
     let mut b = Producer::new(&inner, 2, false)?;
     assert_eq!(a.surface.id(), b.surface.id());

@@ -127,6 +127,17 @@ fn clicked(
         );
     }
 }
+fn accepted(window: &OverlayWindow, revision: u64) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while window.reconcile()?.accepted_revision < revision {
+        assert!(
+            Instant::now() < deadline,
+            "original frame acceptance stalled"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
 fn publish(
     inner: &VirtualVivid,
     relay: &mut OuterBridge,
@@ -254,13 +265,10 @@ fn native_documents_reoriginate_revisions_and_revoke_delayed_input_without_harmi
     let a = window_of(&first, 0., 0.)?;
     let b = window_of(&second, 260., 0.)?;
     for window in [&a, &b] {
-        for _ in 0..2 {
-            let submission = window.submit(canvas())?;
-            assert_eq!(
-                submission.wait(Duration::from_secs(3))?,
-                Some(vivid_sdk::overlay::PresentationOutcome::Presented)
-            );
-        }
+        // Source acceptance is not a physical display acknowledgement.
+        window.present(canvas())?;
+        window.present(canvas())?;
+        accepted(window, 2)?;
     }
     project(&inner, &mut relay)?;
     let target = display(&mut host, &inner, &mut relay, 2);
@@ -550,10 +558,7 @@ fn composition_before_ack(retained_callback: bool) -> io::Result<()> {
         .unwrap()
         .submission;
     let submitted = a.submit(canvas())?;
-    assert_eq!(
-        submitted.wait(Duration::from_secs(3))?,
-        Some(vivid_sdk::overlay::PresentationOutcome::Presented)
-    );
+    accepted(&a, 2)?;
     project(&inner, &mut relay)?;
     let display_deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -568,7 +573,18 @@ fn composition_before_ack(retained_callback: bool) -> io::Result<()> {
         assert!(Instant::now() < display_deadline, "preedit repaint stalled");
         std::thread::sleep(Duration::from_millis(1));
     }
-    input(&inner, &mut relay)?;
+    let acknowledged = Instant::now() + Duration::from_secs(3);
+    loop {
+        input(&inner, &mut relay)?;
+        if submitted.wait(Duration::ZERO)?.is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < acknowledged,
+            "original presentation acknowledgement stalled"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let peer_surface =
         relay.outer_surface_id(snapshot(&inner, &[2]).bridge_projection().surfaces[0].key);
     let mut next = original.clone();
@@ -709,4 +725,201 @@ fn composition_before_ack(retained_callback: bool) -> io::Result<()> {
         temporary.close()?;
         Ok(())
     })
+}
+
+#[test]
+fn an_accepted_undisplayed_repaint_keeps_the_physical_editor_scene_live() -> io::Result<()> {
+    let (inner, _) = overlay_presenter()?;
+    let inner = Arc::new(inner);
+    inner.enable_overlay_host_relay();
+    let listener = TcpPresenterListener::bind()?;
+    let endpoint = listener.endpoint();
+    let mut config = PresenterConfig::terminal_with_overlay(MediaConfig::default());
+    config
+        .supported_profiles
+        .push(registry::OVERLAY_EDITOR.into());
+    let outer = Arc::new(VirtualVivid::start_configured_eventless(listener, config)?);
+    let mut host = NativeVectorHost::attach(Arc::clone(&outer), "")?;
+    let mut relay = OuterBridge::builder(
+        Secret32::from_hex(&pane(&outer, 9)?).map_err(io::Error::other)?,
+        DisplayMetrics::default(),
+    )
+    .control_endpoint(endpoint)
+    .overlay_document_editing(&inner)
+    .build()?;
+    inner.set_overlay_document_host_profiles(&relay.overlay_host_profiles());
+    let first = connect(&inner, 1)?;
+    let second = connect(&inner, 2)?;
+    let a = window_of(&first, 0., 0.)?;
+    let b = window_of(&second, 260., 0.)?;
+    a.present(canvas())?;
+    b.present(canvas())?;
+    accepted(&a, 1)?;
+    accepted(&b, 1)?;
+    assert_eq!(
+        a.reconcile()?.presented_revision,
+        0,
+        "source acceptance manufactured display proof"
+    );
+    project(&inner, &mut relay)?;
+    let target = display(&mut host, &inner, &mut relay, 2);
+    let target = click(&mut host, &target, 10.);
+    clicked(&inner, &mut relay, &first)?;
+    let text = host.text_target(&target).unwrap();
+    publish(&inner, &mut relay, &mut host, &a, 1, context(41, 73))?;
+    let original = host.editor_state(&text).unwrap().document.unwrap();
+    assert_eq!(
+        host.dispatch_document(
+            &text,
+            &VectorDocumentEdit {
+                editor: original.editor,
+                revision: original.revision,
+                preedit: Some(("é😀漢".into(), Some(2..6))),
+                ..Default::default()
+            }
+        )?,
+        VectorInputResult::Delivered { text: false }
+    );
+    assert!(pending(&inner, &mut relay).forward()?);
+    assert_eq!(received(&first).preedit, Some(("é😀漢".into(), Some(2..6))));
+    let next = a.submit(canvas())?;
+    accepted(&a, 2)?;
+    assert_eq!(
+        next.wait(Duration::ZERO)?,
+        None,
+        "undisplayed source repaint was acknowledged"
+    );
+    assert_eq!(a.reconcile()?.presented_revision, 1);
+    // Deliberately do not send scene 2 downstream yet. The physical native
+    // editor still owns scene 1 and must accept its immediate Unicode commit.
+    send(&mut host, &text, "é文漢");
+    assert!(
+        pending(&inner, &mut relay).forward()?,
+        "valid physical composition lost to an undisplayed source repaint"
+    );
+    let commit = received(&first);
+    assert_eq!(
+        (commit.editor, commit.revision, commit.scene_revision),
+        (41, 73, 1)
+    );
+    assert_eq!(commit.commit.as_deref(), Some("é文漢"));
+    send(&mut host, &text, "old scene");
+    let stale = pending(&inner, &mut relay);
+    project(&inner, &mut relay)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let frame = host.prepare(9, 1.)?;
+        host.presented(&frame)?;
+        input(&inner, &mut relay)?;
+        if let Some(outcome) = next.wait(Duration::ZERO)? {
+            assert_eq!(outcome, vivid_sdk::overlay::PresentationOutcome::Presented);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "downstream presentation did not reach the source"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(a.reconcile()?.presented_revision, 2);
+    assert!(
+        !stale.forward()?,
+        "old physical scene gained the newly displayed scene's authority"
+    );
+    publish(
+        &inner,
+        &mut relay,
+        &mut host,
+        &a,
+        2,
+        Context {
+            editor: 41,
+            revision: 74,
+            text: "a😀é文漢z".into(),
+            cursor: 13,
+            anchor: 13,
+            sensitive: false,
+        },
+    )?;
+    send(&mut host, &text, "fresh");
+    assert!(pending(&inner, &mut relay).forward()?);
+    let current = received(&first);
+    assert_eq!(
+        (
+            current.revision,
+            current.scene_revision,
+            current.commit.as_deref()
+        ),
+        (74, 2, Some("fresh"))
+    );
+    // Replacing only the vector track must retire already-drained document
+    // authority before its replacement reaches the physical presenter.
+    send(&mut host, &text, "retired channel");
+    let old_channel = pending(&inner, &mut relay);
+    let replacement = a.replace_track(canvas())?;
+    accepted(&a, 3)?;
+    assert!(
+        !old_channel.forward()?,
+        "retired media channel retained document authority"
+    );
+    project(&inner, &mut relay)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let fresh = loop {
+        relay.retry_pending_activation()?;
+        let frame = host.prepare(9, 1.)?;
+        if host.presented(&frame)? {
+            input(&inner, &mut relay)?;
+            if replacement.wait(Duration::ZERO)?.is_some() {
+                break host.input_target(&frame).unwrap();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement vector track did not present"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(
+        host.dispatch_document(
+            &text,
+            &VectorDocumentEdit {
+                editor: original.editor,
+                revision: original.revision,
+                commit: Some("old target".into()),
+                ..Default::default()
+            }
+        )?,
+        VectorInputResult::Rejected
+    );
+    let fresh = host.text_target(&fresh).unwrap();
+    publish(
+        &inner,
+        &mut relay,
+        &mut host,
+        &a,
+        3,
+        Context {
+            editor: 41,
+            revision: 75,
+            text: "a😀é文漢z".into(),
+            cursor: 13,
+            anchor: 13,
+            sensitive: false,
+        },
+    )?;
+    send(&mut host, &fresh, "replacement");
+    assert!(pending(&inner, &mut relay).forward()?);
+    let changed = received(&first);
+    assert_eq!(
+        (changed.scene_revision, changed.commit.as_deref()),
+        (3, Some("replacement"))
+    );
+    assert_eq!(b.reconcile()?.presented_revision, 1);
+    while let Some(event) = second.wait_event(Duration::ZERO)? {
+        assert!(
+            !matches!(event, vivid_sdk::OverlayLaneEvent::EditorEdit(_)),
+            "composition crossed same-ID owners"
+        );
+    }
+    Ok(())
 }

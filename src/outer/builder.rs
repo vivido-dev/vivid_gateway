@@ -26,6 +26,7 @@ pub struct OuterBridgeBuilder {
     target_profile: String,
     documents: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
     actions: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
+    presentations: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
 }
 
 impl OuterBridge {
@@ -45,6 +46,7 @@ impl OuterBridge {
             target_profile: registry::TERMINAL_SURFACE.into(),
             documents: None,
             actions: None,
+            presentations: None,
         }
     }
 }
@@ -92,7 +94,8 @@ impl OuterBridgeBuilder {
 
     /// Opts into typed, owner-scoped document re-origination on terminal targets.
     ///
-    /// Off by default. The caller must service host requests, drain ordinary input,
+    /// Off by default. Build before inner producers authenticate; this also binds
+    /// original presentation to downstream outcomes. Service host requests, drain ordinary input,
     /// then drain `take_overlay_document_input` and forward each opaque input to
     /// its original inner presenter. Install negotiated services with the SDK
     /// document-aware host-profile setter. Legacy mux clients cannot route this type and
@@ -103,6 +106,7 @@ impl OuterBridgeBuilder {
         inner: &Arc<vivid_sdk::presenter::VirtualVivid>,
     ) -> Self {
         self.documents = Some(Arc::downgrade(inner));
+        self.presentations = Some(Arc::downgrade(inner));
         self
     }
 
@@ -123,6 +127,21 @@ impl OuterBridgeBuilder {
         self
     }
 
+    /// Defers original scene publication until a matching physical display outcome.
+    ///
+    /// Attach before inner producers authenticate. Continue draining ordinary overlay
+    /// input even when no user input arrives: it carries presentation outcomes too.
+    /// This prevents an accepted but undisplayed source repaint from retiring the
+    /// editor scene that still owns physical input. Legacy snapshot routes are unchanged.
+    #[must_use]
+    pub fn overlay_presentation_forwarding(
+        mut self,
+        inner: &Arc<vivid_sdk::presenter::VirtualVivid>,
+    ) -> Self {
+        self.presentations = Some(Arc::downgrade(inner));
+        self
+    }
+
     /// Connects the outer producer session and returns the bridge driving it.
     ///
     /// # Errors
@@ -133,12 +152,25 @@ impl OuterBridgeBuilder {
     /// authentication failures, and an outer target descriptor that carries no usable terminal
     /// geometry when `display` has none either, are returned as the outer session reports them.
     pub fn build(self) -> io::Result<OuterBridge> {
-        if (self.documents.is_some() || self.actions.is_some())
+        if (self.documents.is_some() || self.actions.is_some() || self.presentations.is_some())
             && self.target_profile != registry::TERMINAL_SURFACE
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "window-action and document relays require a terminal overlay target",
+            ));
+        }
+        let origins: Vec<_> = [&self.documents, &self.actions, &self.presentations]
+            .into_iter()
+            .flatten()
+            .collect();
+        if origins
+            .windows(2)
+            .any(|pair| !std::sync::Weak::ptr_eq(pair[0], pair[1]))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bound host services require the same original presenter",
             ));
         }
         let route = match (self.control, self.factory) {
@@ -187,6 +219,37 @@ impl OuterBridgeBuilder {
             bridge.cancellation.install_actions(&actions);
             bridge.action_relay = Some(actions);
         }
+        if let Some(inner) = self.presentations {
+            if !bridge
+                .overlay_host_profiles()
+                .iter()
+                .any(|profile| profile == registry::OVERLAY_INPUT)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "presentation relay requires outer overlay input",
+                ));
+            }
+            let route = Arc::new(
+                inner
+                    .upgrade()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "original presentation presenter is gone",
+                        )
+                    })?
+                    .attach_overlay_presentation_relay()?,
+            );
+            *bridge
+                .cancellation
+                .presentations
+                .lock()
+                .map_err(|_poison| {
+                    io::Error::other("presentation cancellation mutex poisoned")
+                })? = Some(route.cancel_handle());
+            bridge.presentation_relay = Some(route);
+        }
         Ok(bridge)
     }
 }
@@ -203,6 +266,7 @@ impl std::fmt::Debug for OuterBridgeBuilder {
             .field("target_profile", &self.target_profile)
             .field("documents", &self.documents.is_some())
             .field("actions", &self.actions.is_some())
+            .field("presentations", &self.presentations.is_some())
             .finish()
     }
 }

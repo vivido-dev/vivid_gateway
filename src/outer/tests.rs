@@ -1883,6 +1883,7 @@ fn raster_writer(outer_delta_operations: u32) -> (vivid_sdk::Session, OuterMedia
         .unwrap();
     let channel = Arc::new(session.open_track_channel(&track).unwrap());
     let writer = OuterMediaWriter {
+        presentation_relay: None,
         overlay_layouts: Arc::default(),
         overlay_revisions: Arc::default(),
         writer_id: 1,
@@ -2082,6 +2083,7 @@ fn live_raster_writer(
         .unwrap();
     let channel = Arc::new(session.open_track_channel(&track).unwrap());
     let writer = OuterMediaWriter {
+        presentation_relay: None,
         overlay_layouts: Arc::default(),
         overlay_revisions: Arc::default(),
         writer_id: 1,

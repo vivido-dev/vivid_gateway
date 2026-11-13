@@ -165,7 +165,7 @@ The [local macOS Unicode follow-up](../vivid_compositor/docs/performance/2026-11
 records overlapping full typed-relay Metal checks and separate isolated fixtures.
 
 This suite does not submit GPU work or drive a platform IME. The compositor's
-developer-only `vector-relay-testing` adapter separately exercises this core with
+ordinary opt-in `vector-gateway` route and `vector-relay-testing` fixtures exercise this core with
 independent producer processes, actual macOS Metal rendering, GUI display receipts,
 clipboard grants and synthetic native document/composition callbacks. Static hosts
 can decline timed-media and audio-gain: both profiles are optional on the outer hop;
@@ -174,13 +174,41 @@ The static-host socket regression covers that negotiation without inventing audi
 or timed capabilities.
 
 The combined check now uses explicit producer-requested focus forwarding, without
-a peer pointer-focus workaround. Production GUI/mux adoption must opt into that
-contract and qualify saturation, source lease/lane recovery and combined display retry. Physical input
+a peer pointer-focus workaround. Frontends must explicitly bind that contract.
+The local compositor now offers it with `vector-gateway`; production mux adoption
+and automatic frontend lease recovery remain incomplete. Physical input
 sources/candidate menus, other platforms/devices and static Metal builds remain
 unrun. The [native core evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-relay-macos.json)
 and [combined GUI evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-gateway-gui-macos.json)
 record the initial boundaries; the [focus follow-up](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-focus-macos.json)
 records the subsequent focus coverage. Production synchronized-media negotiation is unchanged.
+
+Typed document routes now automatically bind original scene presentation. Build the
+bridge before any inner producer authenticates. `overlay_presentation_forwarding`
+can also opt in without documents; document/action/presentation origins must be the
+same presenter. The SDK's exclusive `OverlayPresentationRoute` captures one-shot
+`OverlayPresentationReceipt`s for exact accepted submissions. Original scenes and
+ACKs advance only after matching physical outcomes; an accepted but undisplayed
+repaint cannot revoke valid early Unicode input for the current scene. Cancellation
+fails closed and never restores synthetic ACKs. One pending scene per original
+window mirrors native coalescing, with bounded outer receipt history. Retained replay
+does not manufacture another original ACK. Outer vector revisions are allocated per
+window, including across track replacement. Old channel-bound document receipts
+reject immediately even before downstream reconciliation.
+
+Additional native socket regressions cover deferred-presentation lease resume,
+track replacement and two owners reusing local IDs. Controlled carrier delivery
+stalls over real TCP isolate control reads and track writes, fill the bounded media
+queue, preserve control and peer progress, and verify cancellation. These are not
+native kernel-buffer exhaustion or real network-blackhole qualification. The local
+macOS frontend passes logical GPU retry and a five-minute paced four-owner workload;
+automatic frontend lease recovery, production mux adoption, prolonged high-rate
+load, physical input and other platforms/devices remain explicit gates. The ordinary GUI sample builds,
+and the unlocked macOS sample passes ordinary startup, exact-owner focus and
+close-policy cleanup through local control. Native screenshot inspection is
+unverified after a UI-tool timeout; see the
+[unlocked GUI follow-up](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-visible-macos.json). See the
+[local qualification evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-local-macos.json).
 
 ## Producer window-action forwarding
 
@@ -359,3 +387,7 @@ API recovery checks without GPU submission. Separate direct/action/relay Metal
 fixtures exercise the final GUI integration with synthetic callbacks. Automatic
 source lease recovery in a production GUI/mux frontend, combined GPU/display loss,
 physical input/device behavior and other operating systems remain open gates.
+
+Local display-recovery acceptance waits for fresh editor/focus admission before
+its first post-retry key. An image receipt alone does not prove keyboard readiness;
+immediate keys during post-retry focus/geometry turnover remain unqualified.

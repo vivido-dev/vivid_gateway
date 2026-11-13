@@ -43,6 +43,8 @@ mod pressure;
 #[cfg(feature = "native-vector-testing")]
 #[path = "overlay_smoke/recovery.rs"]
 mod recovery;
+#[path = "overlay_smoke/transport.rs"]
+mod transport;
 
 use common::{TcpPresenterListener, pin_endpoints};
 
