@@ -305,3 +305,333 @@ fn a_queued_center_refuses_a_changed_original_viewport_and_a_peer_retarget() -> 
     assert_eq!(a.bounds()?, Rect::new(0., 0., 240., 120.).unwrap());
     Ok(())
 }
+
+#[test]
+fn acknowledged_focus_revision_does_not_republish_identical_geometry_or_revoke_first_key()
+-> io::Result<()> {
+    use vivid_sdk::presenter::{VectorInputEvent, VectorInputResult};
+    let (inner, outer, mut host, mut relay) = fixture()?;
+    let first = producer(&inner, 1)?;
+    let second = producer(&inner, 2)?;
+    let a = window_of(&first, 0., 0.)?;
+    let b = window_of(&second, 260., 0.)?;
+    a.present(scene(1))?;
+    b.present(scene(2))?;
+    project(&inner, &mut relay)?;
+    hydrate(&mut host, &inner, &mut relay, 2)?;
+    action(&inner, &mut relay, &a, OverlayWindow::request_focus)?;
+    display(&mut host, &inner, &mut relay, 2)?;
+    let frame = host.prepare(9, 1.)?;
+    assert!(host.presented(&frame)?);
+    let target = host.input_target(&frame).unwrap();
+    let before = snapshot(&outer, &[9]);
+    project(&inner, &mut relay)?;
+    let after = snapshot(&outer, &[9]);
+    let key = host.dispatch_input(
+        &target,
+        VectorInputEvent::Key {
+            usage: 21,
+            down: true,
+            repeat: false,
+            modifiers: 0,
+            text: None,
+        },
+    )?;
+    assert_eq!(
+        overlay_windows(&before),
+        overlay_windows(&after),
+        "acknowledgement revision republished persistent geometry"
+    );
+    assert_eq!(key, VectorInputResult::Delivered { text: false });
+    assert!(
+        frame.same_content(&host.prepare(9, 1.)?),
+        "revision-only reconciliation invalidated displayed frame"
+    );
+    assert_eq!(
+        host.dispatch_input(
+            &target,
+            VectorInputEvent::Key {
+                usage: 21,
+                down: false,
+                repeat: false,
+                modifiers: 0,
+                text: None,
+            }
+        )?,
+        VectorInputResult::Delivered { text: false }
+    );
+    let mut pressed = 0;
+    let mut released = 0;
+    let end = Instant::now() + Duration::from_secs(3);
+    while released == 0 {
+        input(&inner, &mut relay)?;
+        if let Some(vivid_sdk::OverlayLaneEvent::Input(event)) =
+            first.wait_event(Duration::from_millis(2))?
+            && let vivid_protocol::overlay::Event::Key {
+                physical: 21, down, ..
+            } = event.event
+        {
+            if down {
+                pressed += 1;
+            } else {
+                released += 1;
+            }
+        }
+        assert!(Instant::now() < end, "first key feedback stalled");
+    }
+    assert_eq!(pressed, 1, "first physical key must arrive exactly once");
+    assert_eq!(released, 1, "first physical key must release exactly once");
+    while let Some(event) = second.wait_event(Duration::ZERO)? {
+        assert!(
+            !matches!(
+                event,
+                vivid_sdk::OverlayLaneEvent::Input(vivid_protocol::overlay::wire::InputEvent {
+                    event: vivid_protocol::overlay::Event::Key { .. },
+                    ..
+                })
+            ),
+            "first key crossed owners"
+        );
+    }
+    a.set_bounds(Rect::new(8., 8., 240., 120.).unwrap())?;
+    project(&inner, &mut relay)?;
+    assert!(
+        !frame.same_content(&host.prepare(9, 1.)?),
+        "real geometry change lost its display boundary"
+    );
+    assert_eq!(
+        host.dispatch_input(
+            &target,
+            VectorInputEvent::Key {
+                usage: 4,
+                down: true,
+                repeat: false,
+                modifiers: 0,
+                text: None,
+            }
+        )?,
+        VectorInputResult::Rejected,
+        "old image gained input after real geometry changed"
+    );
+    display(&mut host, &inner, &mut relay, 2)?;
+    action(&inner, &mut relay, &a, OverlayWindow::center)?;
+    display(&mut host, &inner, &mut relay, 2)?;
+    let centered = host.prepare(9, 1.)?;
+    assert!(host.presented(&centered)?);
+    let current = host.input_target(&centered).unwrap();
+    let before_center = overlay_windows(&snapshot(&outer, &[9]));
+    project(&inner, &mut relay)?;
+    assert_eq!(
+        before_center,
+        overlay_windows(&snapshot(&outer, &[9])),
+        "acknowledged Center republished its already-applied bounds"
+    );
+    assert_eq!(
+        host.dispatch_input(
+            &current,
+            VectorInputEvent::Key {
+                usage: 22,
+                down: true,
+                repeat: false,
+                modifiers: 0,
+                text: None,
+            }
+        )?,
+        VectorInputResult::Delivered { text: false }
+    );
+    assert_eq!(
+        host.dispatch_input(
+            &current,
+            VectorInputEvent::Key {
+                usage: 22,
+                down: false,
+                repeat: false,
+                modifiers: 0,
+                text: None,
+            }
+        )?,
+        VectorInputResult::Delivered { text: false }
+    );
+    assert!(a.reconcile()?.focused);
+    assert!(!b.reconcile()?.focused);
+    Ok(())
+}
+
+#[test]
+fn focus_waits_for_preceding_owner_popup_but_not_for_a_same_id_peer() -> io::Result<()> {
+    let (inner, _outer, mut host, mut relay) = fixture()?;
+    let first = producer(&inner, 1)?;
+    let second = producer(&inner, 2)?;
+    let a = window_of(&first, 0., 0.)?;
+    let peer = window_of(&second, 260., 0.)?;
+    let child = first.create_child(
+        &a,
+        OverlayWindowOptions::new(Rect::new(160., 40., 48., 32.).unwrap(), WindowMode::Popup),
+    )?;
+    a.present(scene(1))?;
+    peer.present(scene(2))?;
+    let full = snapshot(&inner, &[1, 2]).bridge_projection();
+    let owner = snapshot(&inner, &[1]).surfaces[0].producer;
+    let mut partial = full.clone();
+    let child_key = full
+        .surfaces
+        .iter()
+        .find(|surface| {
+            surface.key.producer == owner
+                && surface
+                    .overlay_window
+                    .is_some_and(|window| window.parent.is_some())
+        })
+        .unwrap()
+        .key;
+    let is_child = |key: BridgeSurfaceKey| key == child_key;
+    partial.surfaces.retain(|surface| !is_child(surface.key));
+    partial.sources.retain(|source| {
+        !is_child(BridgeSurfaceKey {
+            producer: source.key.producer,
+            context: source.key.context,
+            surface: source.key.surface,
+        })
+    });
+    partial.nodes.retain(|node| !is_child(node.surface));
+    relay.rebuild(&partial.surfaces, &partial.sources, &partial.nodes)?;
+    std::thread::scope(|scope| -> io::Result<()> {
+        let focused = scope.spawn(|| a.request_focus());
+        let request = super::focus::request(&inner)?;
+        let overtook = relay.can_service_overlay_host_request(&request);
+        if overtook {
+            inner.complete_overlay_host_request(
+                request.id,
+                Err("missing owner projection barrier".into()),
+            );
+        }
+        assert!(
+            !overtook,
+            "focus overtook a popup created earlier by the original owner"
+        );
+        assert_eq!(
+            relay
+                .start_overlay_host_request(request.clone())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let peer_job = scope.spawn(|| peer.request_focus());
+        let peer_request = super::focus::request(&inner)?;
+        assert!(
+            relay.can_service_overlay_host_request(&peer_request),
+            "owner barrier blocked an independent same-ID peer"
+        );
+        let response = relay.overlay_host_request(&peer_request)?;
+        inner.complete_overlay_host_request(peer_request.id, Ok(response));
+        peer_job.join().unwrap()?;
+        relay.rebuild(&full.surfaces, &full.sources, &full.nodes)?;
+        assert!(relay.can_service_overlay_host_request(&request));
+        let response = relay.overlay_host_request(&request)?;
+        inner.complete_overlay_host_request(request.id, Ok(response));
+        focused.join().unwrap()?;
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            input(&inner, &mut relay)?;
+            if a.reconcile()?.focused {
+                break;
+            }
+            assert!(Instant::now() < end, "ordered focus feedback stalled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!child.reconcile()?.focused);
+        assert!(!peer.reconcile()?.focused);
+        // The role barrier does not wait for popup media or GPU presentation.
+        assert_eq!(display(&mut host, &inner, &mut relay, 0)?.len(), 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn static_vector_waits_for_its_original_window_role_without_blocking_a_peer() -> io::Result<()> {
+    let (inner, _outer, mut host, mut relay) = fixture()?;
+    let first = producer(&inner, 1)?;
+    let second = producer(&inner, 2)?;
+    let parent = window_of(&first, 0., 0.)?;
+    let peer = window_of(&second, 260., 0.)?;
+    let child = first.create_child(
+        &parent,
+        OverlayWindowOptions::new(Rect::new(160., 40., 48., 32.).unwrap(), WindowMode::Popup),
+    )?;
+    child.present(scene(1))?;
+    peer.present(scene(2))?;
+    let snapshot = snapshot(&inner, &[1, 2]);
+    let full = snapshot.bridge_projection();
+    let child_key = full
+        .surfaces
+        .iter()
+        .find(|surface| {
+            surface
+                .overlay_window
+                .is_some_and(|window| window.parent.is_some())
+        })
+        .unwrap()
+        .key;
+    let mut partial = full.clone();
+    partial
+        .surfaces
+        .iter_mut()
+        .find(|surface| surface.key == child_key)
+        .unwrap()
+        .overlay_window = None;
+    relay.rebuild(&partial.surfaces, &partial.sources, &partial.nodes)?;
+    let source = snapshot
+        .sources
+        .iter()
+        .find(|source| {
+            source.key.producer == child_key.producer
+                && source.key.context == child_key.context
+                && source.key.surface == child_key.surface
+        })
+        .unwrap();
+    assert!(relay.outer_track_id(source.key).is_some());
+    assert!(
+        !relay.can_accept_media(source.key),
+        "static frame overtook its original window role"
+    );
+    let (record_type, bytes) = &source.retained_vector[0];
+    let chunk = || MediaChunk {
+        delivery_id: 0,
+        source: source.key,
+        record_type: *record_type,
+        offset: 0,
+        total: u32::try_from(bytes.len()).unwrap(),
+        last: true,
+        bytes: bytes.to_vec(),
+    };
+    assert_eq!(
+        relay.media_chunk(chunk()).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let peer_source = snapshot
+        .sources
+        .iter()
+        .find(|source| source.key.producer != child_key.producer)
+        .unwrap();
+    assert!(
+        relay.can_accept_media(peer_source.key),
+        "role barrier blocked a same-ID peer"
+    );
+    for (record_type, bytes) in &peer_source.retained_vector {
+        relay.media_chunk(MediaChunk {
+            delivery_id: 0,
+            source: peer_source.key,
+            record_type: *record_type,
+            offset: 0,
+            total: u32::try_from(bytes.len()).unwrap(),
+            last: true,
+            bytes: bytes.to_vec(),
+        })?;
+    }
+    display(&mut host, &inner, &mut relay, 1)?;
+    relay.rebuild(&full.surfaces, &full.sources, &full.nodes)?;
+    assert!(relay.can_accept_media(source.key));
+    relay.media_chunk(chunk())?;
+    display(&mut host, &inner, &mut relay, 2)?;
+    Ok(())
+}

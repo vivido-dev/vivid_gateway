@@ -270,6 +270,8 @@ impl OuterBridge {
                                         && window.projected.revision >= action.expected_revision)
                             })
                     }))
+            && (request.record_type != messages::OVERLAY_ACTION
+                || self.action_projection_ready(request))
             && self.document_request_available(request)
             && (matches!(
                 request.record_type,
@@ -285,6 +287,22 @@ impl OuterBridge {
                         && key.surface == request.surface.surface
                 })
                 .all(|(_, track)| track.media_inflight == 0))
+    }
+
+    fn action_projection_ready(&self, request: &vivid_sdk::presenter::OverlayHostRequest) -> bool {
+        self.action_relay
+            .as_ref()
+            .and_then(|route| route.request(request).preceding_windows())
+            .is_some_and(|windows| {
+                windows.iter().all(|before| {
+                    self.overlay_windows
+                        .get(&before.surface)
+                        .is_some_and(|after| {
+                            after.inner_generation == before.generation
+                                && after.projected.revision >= before.revision
+                        })
+                })
+            })
     }
 
     /// Starts `request` on a worker thread.
@@ -397,6 +415,12 @@ impl OuterBridge {
                 .request(&request);
             if !admission.is_pending() {
                 return Err(invalid_data("original window action is retired or expired"));
+            }
+            if !self.action_projection_ready(&request) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "preceding owner windows have not reached the physical projection",
+                ));
             }
             let centered = if query.action == vivid_protocol::overlay::wire::WindowAction::Center {
                 let bounds = admission
@@ -636,11 +660,7 @@ impl OuterBridge {
         }))
     }
 
-    /// Relay one surface's overlay window to the outer session, if it has one and its geometry
-    /// changed since the last relay. The outer presenter's own window revision is tracked so the
-    /// next update names the correct `expected_revision`; an outer presenter that never negotiated
-    /// the overlay bundle simply returns an error here, which the caller surfaces like any other
-    /// unsupported relayed configuration.
+    /// Relays retained host text layouts for one surface.
     pub(super) fn sync_overlay_layouts(&mut self, surface: &BridgeSurface) -> io::Result<()> {
         if surface.overlay_window.is_none() {
             return Ok(());
@@ -713,6 +733,11 @@ impl OuterBridge {
         Ok(())
     }
 
+    /// Relay one surface's overlay window to the outer session, if it has one and its geometry
+    /// changed since the last relay. Query the physical revision before changed options;
+    /// already-applied options keep their display receipt. An outer presenter that never negotiated
+    /// the overlay bundle simply returns an error here, which the caller surfaces like any other
+    /// unsupported relayed configuration.
     pub(super) fn sync_overlay_window(&mut self, surface: &BridgeSurface) -> io::Result<()> {
         let Some(window) = surface.overlay_window else {
             self.overlay_windows.remove(&surface.key);
@@ -735,31 +760,37 @@ impl OuterBridge {
             self.overlay_input = Some(Arc::new(input));
             self.overlay_renewed = Instant::now();
         }
-        if self
-            .overlay_windows
-            .get(&surface.key)
-            .is_some_and(|state| state.projected == window)
-        {
-            return Ok(());
+        if let Some(state) = self.overlay_windows.get_mut(&surface.key) {
+            let options = BridgeOverlayWindow {
+                revision: window.revision,
+                ..state.projected
+            };
+            if options == window {
+                // Source revisions are independent of physical revisions. An
+                // acknowledged action already changed the physical window; a
+                // revision-only projection must not publish a second geometry
+                // mutation and invalidate its displayed input target.
+                state.projected = window;
+                return Ok(());
+            }
         }
         let outer = self
             .surfaces
             .get(&surface.key)
             .ok_or_else(|| invalid_data("outer surface was not created"))?;
-        let mut expected_revision = self
-            .overlay_windows
-            .get(&surface.key)
-            .map_or(0, |state| state.outer_revision);
-        if expected_revision != 0 {
-            expected_revision = self
-                .session
-                .query_overlay_window(vivid_protocol::overlay::wire::Query {
-                    context_id: outer.context_id(),
-                    surface_id: outer.id(),
-                })?
-                .window
-                .expected_revision;
-        }
+        let status = if self.overlay_windows.contains_key(&surface.key) {
+            Some(
+                self.session
+                    .query_overlay_window(vivid_protocol::overlay::wire::Query {
+                        context_id: outer.context_id(),
+                        surface_id: outer.id(),
+                    })?
+                    .window,
+            )
+        } else {
+            None
+        };
+        let expected_revision = status.as_ref().map_or(0, |window| window.expected_revision);
         let request = SetWindow {
             address: WindowAddress {
                 context_id: outer.context_id(),
@@ -806,7 +837,11 @@ impl OuterBridge {
                     .map_err(io::Error::other)?,
             },
         };
-        let accepted = self.session.set_overlay_window(&request)?;
+        if status.as_ref().is_none_or(|current| {
+            current.address != request.address || current.options != request.options
+        }) {
+            self.session.set_overlay_window(&request)?;
+        }
         self.overlay_windows.insert(
             surface.key,
             OverlayWindowState {
@@ -814,7 +849,6 @@ impl OuterBridge {
                 offset_y: window.offset_y,
                 inner_generation: window.generation,
                 projected: window,
-                outer_revision: accepted.expected_revision,
             },
         );
         Ok(())
@@ -980,9 +1014,6 @@ pub(super) struct OverlayWindowState {
     /// The inner window's own revision last successfully relayed, so an unchanged snapshot does
     /// not re-send the same geometry every reconciliation pass.
     pub(super) projected: BridgeOverlayWindow,
-    /// The outer window's own revision, returned by the last accepted `SET_OVERLAY_WINDOW`, and
-    /// required as the next update's `expected_revision`.
-    pub(super) outer_revision: u64,
 }
 
 fn window_mode_from_wire(mode: u64) -> io::Result<WindowMode> {

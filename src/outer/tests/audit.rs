@@ -275,9 +275,18 @@ fn overlay_window_relays_create_update_and_teardown() {
         tracked.projected.revision, 2,
         "the relayed inner revision advances"
     );
-    assert!(
-        tracked.outer_revision > 0,
-        "the outer presenter's own revision was recorded"
+    let physical = &bridge.surfaces[&surface_key];
+    let status = bridge
+        .session
+        .query_overlay_window(vivid_protocol::overlay::wire::Query {
+            context_id: physical.context_id(),
+            surface_id: physical.id(),
+        })
+        .unwrap();
+    assert!(status.window.expected_revision > 0);
+    assert_eq!(
+        status.window.options.bounds,
+        vivid_protocol::vector::Rect::new(50., 60., 220., 120.).unwrap()
     );
 
     // An unchanged inner revision must not re-send the same geometry.

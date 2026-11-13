@@ -228,6 +228,35 @@ See the [window-action evidence](../vivid_compositor/docs/performance/2026-11-12
 Production transport adoption, load/recovery and physical platform/device
 acceptance remain separate gates.
 
+An action captures the bounded set of original owner windows already created at
+admission (`OverlayActionRequest::preceding_windows`). The gateway waits for their
+physical roles and revisions before dispatch, without waiting for media or unrelated
+owners. Changes to that original window set or its revisions retire the admission;
+`claim` rechecks it immediately before dispatch. This keeps a popup's implicit focus
+on creation from overtaking an earlier producer-requested Focus.
+
+Original and physical revisions remain independent. A revision-only acknowledgement
+updates the cached original projection without issuing another physical
+`SET_OVERLAY_WINDOW`. Actual option changes query the current physical revision;
+options already applied by Center or native geometry feedback keep their display
+receipt. Real geometry changes still invalidate stale native input targets.
+
+With an action route attached, `can_accept_media` also waits for the original vector
+window generation's physical role. `media_chunk` returns `WouldBlock` before
+assembling such a chunk; retain and retry it after projection reconciliation.
+This barrier applies to role creation, not every focus/geometry revision. Windowless
+vector tracks and unbound legacy routes keep their existing media contract. The
+bounded developer adapter retains a record even if control advances between its
+readiness check and handoff, rotating blocked sources so peers remain serviceable.
+
+The [local Metal startup evidence](../vivid_compositor/docs/performance/2026-11-12-sdk-vector-first-key-macos.json)
+records three deterministic two-hop ordering regressions and fresh sequential/paired
+GUI action launches. No physical key is retried or retargeted and the ten-second
+action admission deadline is unchanged. Production integration, sustained load,
+physical input/devices and other platforms remain separate gates. The full typed-relay
+fixture also hit one Unicode commit timeout during overlapping acceptance workloads;
+final isolated fixtures passed, but broader loaded composition remains unqualified.
+
 ## Slow clients and action deadlines
 
 Relayed actions run on the SDK's bounded host workers, leaving the authenticated

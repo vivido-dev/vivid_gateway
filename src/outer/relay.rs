@@ -1,5 +1,6 @@
 //! Media assembly, per-track outer writers, and the recovery requests they raise.
 
+// Rust guideline compliant 2026-10-07
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::io;
@@ -46,6 +47,9 @@ impl OuterBridge {
     /// producer's playback state, because the answer there is to leave them queued rather than to
     /// drop them.
     pub fn can_accept_media(&self, key: BridgeSourceKey) -> bool {
+        if !self.vector_window_ready(key) {
+            return false;
+        }
         if self.pending.contains_key(&key) {
             return true;
         }
@@ -61,6 +65,32 @@ impl OuterBridge {
             || (track.media_inflight == 0 && track.media_submitted < track.preplay_ceiling)
     }
 
+    fn vector_window_ready(&self, key: BridgeSourceKey) -> bool {
+        // Media needs an existing role, not a barrier on every focus/geometry revision.
+        if !self
+            .tracks
+            .get(&key)
+            .is_some_and(|track| matches!(track.kind, BridgeSourceKind::VectorScene { .. }))
+        {
+            return true;
+        }
+        let surface = BridgeSurfaceKey {
+            producer: key.producer,
+            context: key.context,
+            surface: key.surface,
+        };
+        let Some(before) = self
+            .action_relay
+            .as_ref()
+            .and_then(|route| route.window_stamp(surface))
+        else {
+            return true;
+        };
+        self.overlay_windows
+            .get(&surface)
+            .is_some_and(|after| after.inner_generation == before.generation)
+    }
+
     /// Accepts one chunk of an inner media record, relaying the record once it is complete.
     ///
     /// Returns `true` when this chunk completed the record and it was queued to the source's outer
@@ -73,7 +103,9 @@ impl OuterBridge {
     /// Returns [`io::ErrorKind::NotFound`] when the source has no outer track, and
     /// [`io::ErrorKind::InvalidData`] for a record type the track does not carry, chunk bounds or
     /// ordering that do not continue the partial record, an exhausted assembly budget, or media after
-    /// EOS. Returns [`io::ErrorKind::WouldBlock`] when the outer writer's queue is full and
+    /// EOS. Returns [`io::ErrorKind::WouldBlock`] when the outer writer's queue is full or an
+    /// attached original window role has not been projected. Retain and retry that chunk after
+    /// reconciling the projection. Returns
     /// [`io::ErrorKind::BrokenPipe`] when the writer has stopped.
     pub fn media_chunk(&mut self, chunk: MediaChunk) -> io::Result<bool> {
         let MediaChunk {
@@ -129,6 +161,12 @@ impl OuterBridge {
         if let Err(error) = validation {
             self.pending.remove(&key);
             return Err(error);
+        }
+        if !self.vector_window_ready(key) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "original vector window projection is pending",
+            ));
         }
         let reserved: usize = self.pending.values().map(|body| body.total).sum();
         let assemblies = self.pending.len();
