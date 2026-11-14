@@ -405,7 +405,8 @@ media handoff stays bounded, and cancellation retires the writer within two seco
 The test-only `socket2` dependency bounds native buffers below one authenticated
 vector frame so the observation cannot be only a protocol-credit wait. No writer
 condition variable or fabricated I/O error creates this native stall. Packet-loss
-blackholes and correlated transport/display loss remain unrun.
+blackholes and physical/correlated device faults remain unrun; controlled
+connection cancellation with logical GPU loss is covered below.
 
 Multiple in-flight source revisions now have native socket/host API regressions:
 a forwarded first scene remains displayable and editable after a second is
@@ -418,8 +419,9 @@ scene charges; the gateway retires copies by physical writer without resetting
 an existing window's revision namespace. A writer-specific fence under the mapping
 lock rejects late receipt insertion, and receipt abandonment runs outside that
 lock. A same-ID peer retains its pending outcome, and old prepared frames remain
-invalid. Aggressive multi-submission Metal load remains an explicit gate; this
-socket/native-host API regression does not qualify automatic frontend recovery.
+invalid. This socket/native-host API regression does not submit GPU work or
+qualify automatic frontend recovery. Bounded Metal streaming is covered below;
+higher-rate/peak workloads remain an explicit gate.
 See the [source retirement follow-up](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-generation-macos.json).
 
 Native physical hosts now reserve exact source scenes during preparation, so a
@@ -439,7 +441,27 @@ requires an actual native write to remain blocked while control and a peer
 progress. No observation or cancellation deadline is extended.
 
 Two bounded multi-submission Metal workloads passed the full key/Unicode/recovery
-and owner-replacement script. Another repeat timed out on focus/editor readiness;
-continuous editor readiness remains an open local gate. The native reservation
-fix does not imply complete unpaced producer qualification. See the
-[streaming evidence and remaining failure](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-stream-macos.json).
+and owner-replacement script; another repeat timed out on focus/editor readiness.
+The compositor subsequently fixed native candidate queries that read an older
+GUI caret copy instead of the current worker snapshot. A 43.2-minute follow-up
+passes 18,433 exact keys and 144 Unicode compositions, GPU retry, source replacement
+and stale callbacks. This qualifies the declared four-receipt, 100-ms offered
+batch policy, not peak or higher-rate throughput. The historical timeout remains
+recorded without retrospective sole-cause attribution. See the
+[historical streaming evidence](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-stream-macos.json)
+and the [long soak](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-soak-macos.json).
+
+A further 18.1-minute four-owner run offers batches every 10 ms while preserving
+the SDK helper's 60-record/s declaration and pacing. Rendered checkpoint deltas
+show approximately 60 source scenes/s per owner; 7,681 exact keys and 60 Unicode
+compositions pass through GPU retry and source replacement. This qualifies that
+declared ceiling, not GPU/display FPS or other track rates, canvas sizes and owner
+counts. See the [higher-offer evidence](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-fast-macos.json).
+
+Four further native Metal runs exercise actual producer termination and relay
+connection cancellation after verified logical GPU failure, using bounded
+streaming producers. The peer retains its process and state; explicit Restart
+gets a fresh owner and producer, rejects retired callbacks and admits fresh
+Unicode input. This controlled connection-loss case does not qualify packet-loss
+blackholes, physical GPU resets, production mux adoption or automatic frontend
+lease recovery. See the [combined-failure evidence](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-combined-macos.json).
