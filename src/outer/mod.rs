@@ -54,6 +54,7 @@ const START_POLICY_SYNCHRONIZED: u64 = 2;
 )]
 struct OuterTrack {
     writer_id: u64,
+    retired: Arc<AtomicBool>,
     surface_key: BridgeSurfaceKey,
     track: Track,
     channel: Arc<TrackChannel>,
@@ -807,6 +808,16 @@ impl OuterBridge {
         let replaced = std::mem::replace(&mut self.session, session);
         // Drop cancels the retired SDK transport without waiting for GOODBYE.
         drop(replaced);
+        // Fence queued media writers before retiring their physical mappings.
+        for track in self.tracks.values() {
+            if matches!(track.kind, BridgeSourceKind::VectorScene { .. }) {
+                self.overlay_revisions.retire_writer(
+                    track.surface_key,
+                    track.writer_id,
+                    &track.retired,
+                )?;
+            }
+        }
         // Before joining the request workers: one waiting on a retired scene is released by this.
         self.overlay_revisions.retire(None);
         self.retire_documents(None);

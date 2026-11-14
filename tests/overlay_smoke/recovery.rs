@@ -729,3 +729,161 @@ fn a_slow_routed_input_consumer_cannot_refresh_its_receipt_deadline() -> io::Res
     assert!(!a.status()?.focused);
     Ok(())
 }
+
+/// Submit retained bytes without granting the native host a display outcome.
+fn forward_unshown(
+    inner: &VirtualVivid,
+    relay: &mut OuterBridge,
+    producer: &Producer,
+    revision: u64,
+) -> io::Result<()> {
+    let accepted = Instant::now() + Duration::from_secs(3);
+    while producer.status()?.accepted_revision != revision {
+        assert!(Instant::now() < accepted, "source acceptance stalled");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Intentionally leave physical outcomes queued until recovery. Processing
+    // them here would hide unresolved original-scene retention across retirement.
+    project(inner, relay)?;
+    let source = snapshot(inner, &[1, 2])
+        .sources
+        .into_iter()
+        .find(|source| source.key.producer == producer.session.info().session_id)
+        .unwrap();
+    for (record_type, bytes) in source.retained_vector {
+        relay.media_chunk(MediaChunk {
+            delivery_id: 0,
+            source: source.key,
+            record_type,
+            offset: 0,
+            total: u32::try_from(bytes.len()).unwrap(),
+            last: true,
+            bytes: bytes.to_vec(),
+        })?;
+    }
+    let end = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(result) = relay.take_media_completions().into_iter().next() {
+            assert!(
+                result.delivered,
+                "fresh source frame {revision} could not forward"
+            );
+            assert!(!result.superseded);
+            return Ok(());
+        }
+        assert!(Instant::now() < end, "unshown forwarding stalled");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn unshown_frame(
+    host: &mut NativeVectorHost,
+    relay: &mut OuterBridge,
+    surface: u64,
+    revision: u64,
+) -> io::Result<vivid_sdk::presenter::VectorFrame> {
+    let end = Instant::now() + Duration::from_secs(3);
+    loop {
+        relay.retry_pending_activation()?;
+        let frame = host.prepare(9, 1.)?;
+        if frame.drawings().len() == 2
+            && frame.drawings().iter().any(|drawing| {
+                drawing.window.surface_id() == surface && drawing.submission.revision == revision
+            })
+        {
+            return Ok(frame);
+        }
+        assert!(
+            Instant::now() < end,
+            "fresh physical source frame {revision} stalled: {:?}",
+            frame
+                .drawings()
+                .iter()
+                .map(|d| (d.window.surface_id(), d.submission.revision))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn unresolved_forwarded_scenes_retire_across_channel_advance_and_lease_resume() -> io::Result<()> {
+    let (inner, _outer, mut host, mut relay) = fixture_mode(true)?;
+    let mut a = Producer::new(&inner, 1, true)?;
+    let mut b = Producer::new(&inner, 2, false)?;
+    assert_eq!(a.surface.id(), b.surface.id());
+    assert_eq!(a.track.id(), b.track.id());
+    b.paint(1, 0x0000_ffff)?;
+    forward_unshown(&inner, &mut relay, &b, 1)?;
+    let peer_outer = relay.outer_surface_id(b.key());
+    for revision in 1..=4 {
+        a.paint(revision, 0xff00_00ff)?;
+        forward_unshown(&inner, &mut relay, &a, revision)?;
+    }
+    let outer_a = relay.outer_surface_id(a.key()).unwrap();
+    let stale_channel = unshown_frame(&mut host, &mut relay, outer_a, 4)?;
+    assert_eq!(a.status()?.scene_revision, 0);
+    a.session
+        .advance_channel(&a.track, 1, &RequestMetadata::default())?;
+    let next_channel = a.session.open_track_channel(&a.track)?;
+    let old_channel = std::mem::replace(&mut a.channel, next_channel);
+    let _ = old_channel.close();
+    project(&inner, &mut relay)?;
+    for revision in 5..=8 {
+        a.paint(revision, 0x00ff_00ff)?;
+        forward_unshown(&inner, &mut relay, &a, revision)?;
+    }
+    drop(unshown_frame(&mut host, &mut relay, outer_a, 8)?);
+    assert!(!host.presented(&stale_channel)?);
+    drop(stale_channel);
+    let stale_resume = unshown_frame(&mut host, &mut relay, outer_a, 8)?;
+    let owner = a.session.info().session_id;
+    let generation = a.session.info().resume_generation;
+    let authentication = a.session.resume_authentication()?;
+    (a.session.cancel_handle())();
+    wait(&inner, &mut relay, || {
+        inner
+            .desktop_session_generation(SourceKey {
+                producer: owner,
+                context: a.surface.context_id(),
+                surface: a.surface.id(),
+                track: a.track.id(),
+            })
+            .is_none()
+    })?;
+    let mut resumed = Session::connect(config(&inner, authentication))?;
+    assert_eq!(resumed.info().session_id, owner);
+    assert_eq!(resumed.info().resume_generation, generation + 1);
+    resumed.adopt_surface(&a.surface)?;
+    resumed.adopt_track(&a.track)?;
+    resumed.advance_channel(&a.track, 1, &RequestMetadata::default())?;
+    let channel = resumed.open_track_channel(&a.track)?;
+    let lane = resumed.open_overlay_input_lane(2)?;
+    lane.renew(5_000_000, Duration::from_secs(1))?;
+    a.session = resumed;
+    a.channel = channel;
+    a.lane = lane;
+    project(&inner, &mut relay)?;
+    assert_eq!(relay.outer_surface_id(b.key()), peer_outer);
+    for revision in 9..=12 {
+        a.paint(revision, 0xffff_00ff)?;
+        forward_unshown(&inner, &mut relay, &a, revision)?;
+    }
+    let resumed_outer = relay.outer_surface_id(a.key()).unwrap();
+    assert_ne!(
+        resumed_outer, outer_a,
+        "resume reused a physical window identity"
+    );
+    drop(unshown_frame(&mut host, &mut relay, resumed_outer, 4)?);
+    assert!(!host.presented(&stale_resume)?);
+    drop(stale_resume);
+    let _ = display(&inner, &mut relay, &mut host, 2)?;
+    wait(&inner, &mut relay, || {
+        a.status().is_ok_and(|s| s.scene_revision == 12)
+            && b.status().is_ok_and(|s| s.scene_revision == 1)
+    })?;
+    assert!(relay.take_source_losses().is_empty());
+    assert_eq!(a.status()?.accepted_revision, 12);
+    assert_eq!(b.status()?.accepted_revision, 1);
+    Ok(())
+}

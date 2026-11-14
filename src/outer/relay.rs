@@ -361,6 +361,7 @@ impl OuterBridge {
                 .checked_add(1)
                 .ok_or_else(|| invalid_data("outer media writer identity exhausted"))?;
             let writer_id = self.next_writer_id;
+            let retired = Arc::new(AtomicBool::new(false));
             let (media_sender, media_receiver) = mpsc::sync_channel(OUTER_MEDIA_WRITER_QUEUE);
             let slot_activated = Arc::new(AtomicBool::new(false));
             let writer = OuterMediaWriter {
@@ -369,6 +370,7 @@ impl OuterBridge {
                 superseded: false,
                 overlay_layouts: Arc::clone(&self.overlay_layouts),
                 writer_id,
+                retired: Arc::clone(&retired),
                 key: source.key,
                 object_id: track.id(),
                 channel: Arc::clone(&channel),
@@ -387,9 +389,9 @@ impl OuterBridge {
             thread::Builder::new()
                 .name(format!("vivid-outer-media-{}", track.id()))
                 .spawn(move || run_outer_media_writer(writer, &media_receiver, &completions))?;
-            Ok((channel, media_sender, slot_activated, writer_id))
+            Ok((channel, media_sender, slot_activated, writer_id, retired))
         })();
-        let (channel, media_sender, slot_activated, writer_id) = match setup {
+        let (channel, media_sender, slot_activated, writer_id, retired) = match setup {
             Ok(value) => value,
             Err(error) => {
                 if let Some(channel) = opened_channel {
@@ -410,6 +412,7 @@ impl OuterBridge {
             source.key,
             OuterTrack {
                 writer_id,
+                retired,
                 surface_key,
                 track,
                 channel,
@@ -439,6 +442,13 @@ impl OuterBridge {
     pub(super) fn remove_track(&mut self, key: BridgeSourceKey) -> io::Result<()> {
         self.pending.remove(&key);
         if let Some(track) = self.tracks.get(&key) {
+            if matches!(track.kind, BridgeSourceKind::VectorScene { .. }) {
+                self.overlay_revisions.retire_writer(
+                    track.surface_key,
+                    track.writer_id,
+                    &track.retired,
+                )?;
+            }
             let _ = track.channel.close();
             self.session
                 .destroy_track(&track.track, &RequestMetadata::default())?;
@@ -548,6 +558,7 @@ pub struct DeliveryOutcome {
 }
 
 pub(super) struct OuterMediaWriter {
+    pub(super) retired: Arc<AtomicBool>,
     pub(super) presentation_relay: Option<Arc<vivid_sdk::presenter::OverlayPresentationRoute>>,
     pub(super) superseded: bool,
     pub(super) overlay_revisions: OverlayRevisions,
@@ -678,6 +689,13 @@ impl OuterMediaWriter {
                 let (epoch, _) = next_outer_identity(self, frame.epoch)?;
                 frame.epoch = epoch;
                 let mut mappings = self.overlay_revisions.lock()?;
+                if self.retired.load(Ordering::Acquire) {
+                    drop(mappings);
+                    if let Some(receipt) = receipt {
+                        receipt.abandon();
+                    }
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
                 let window = mappings.entry(key).or_default();
                 // Overlay revisions belong to the window, including a replacement
                 // track being primed; a new track must not restart that namespace.
@@ -694,7 +712,9 @@ impl OuterMediaWriter {
                 }
                 window.revisions.push_back((revision, inner_revision));
                 if let Some(receipt) = receipt {
-                    window.presentations.push_back((revision, receipt));
+                    window
+                        .presentations
+                        .push_back((revision, self.writer_id, receipt));
                 }
                 drop(mappings);
                 self.channel.send_vector(&frame)

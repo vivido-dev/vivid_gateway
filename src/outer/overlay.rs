@@ -3,7 +3,7 @@
 // Rust guideline compliant 2026-10-07
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -905,7 +905,8 @@ pub(super) struct RelayedScenes {
 #[derive(Default)]
 pub(super) struct WindowScenes {
     pub(super) next_revision: u64,
-    pub(super) presentations: VecDeque<(u64, vivid_sdk::presenter::OverlayPresentationReceipt)>,
+    pub(super) presentations:
+        VecDeque<(u64, u64, vivid_sdk::presenter::OverlayPresentationReceipt)>,
     /// `(outer, inner)` revisions of the last [`RELAYED_REVISIONS`] scenes relayed, oldest first.
     pub(super) revisions: VecDeque<(u64, u64)>,
     /// The outer revision the outer presenter last reported presented.
@@ -943,14 +944,42 @@ impl RelayedScenes {
                 window
                     .presentations
                     .iter()
-                    .position(|(revision, _)| *revision == outer)
+                    .position(|(revision, _, _)| *revision == outer)
                     .and_then(|index| window.presentations.remove(index))
-                    .map(|(_, receipt)| receipt)
+                    .map(|(_, _, receipt)| receipt)
             })
         };
         // Never acquire the original presenter's lock under the media mapping lock.
         if let Some(receipt) = receipt {
             receipt.complete(outcome);
+        }
+        Ok(())
+    }
+
+    /// Retires one physical writer without resetting the window revision namespace.
+    pub(super) fn retire_writer(
+        &self,
+        key: BridgeSurfaceKey,
+        writer: u64,
+        fence: &AtomicBool,
+    ) -> io::Result<()> {
+        let retired = {
+            let mut windows = self.lock()?;
+            // The worker checks this under the same lock before inserting.
+            fence.store(true, Ordering::Release);
+            let Some(window) = windows.get_mut(&key) else {
+                return Ok(());
+            };
+            let (retired, keep): (VecDeque<_>, VecDeque<_>) =
+                std::mem::take(&mut window.presentations)
+                    .into_iter()
+                    .partition(|(_, id, _)| *id == writer);
+            window.presentations = keep;
+            retired
+        };
+        // Receipt abandonment acquires the original presenter lock.
+        for (_, _, receipt) in retired {
+            receipt.abandon();
         }
         Ok(())
     }
@@ -970,7 +999,7 @@ impl RelayedScenes {
         // A replaced physical attachment may replay the newest original scene.
         // Retire its copies without inventing a source presentation outcome.
         for window in retired {
-            for (_, receipt) in window.presentations {
+            for (_, _, receipt) in window.presentations {
                 receipt.abandon();
             }
         }

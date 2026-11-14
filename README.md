@@ -411,6 +411,35 @@ Multiple in-flight source revisions now have native socket/host API regressions:
 a forwarded first scene remains displayable and editable after a second is
 accepted, repeated attachment replacement preserves replay, and an obsolete
 unforwarded delivery reaches neither the physical host nor source-loss recovery.
-These fixtures do not submit GPU work. Aggressive multi-submission Metal load and
-lease/channel recovery with multiple unresolved forwarded scenes remain explicit
-qualification gates.
+These fixtures do not submit GPU work. A follow-up now fills all four source
+forwarding slots before channel replacement, refills them before lease resume,
+and displays exact source revision 12 afterward. The SDK retires old original
+scene charges; the gateway retires copies by physical writer without resetting
+an existing window's revision namespace. A writer-specific fence under the mapping
+lock rejects late receipt insertion, and receipt abandonment runs outside that
+lock. A same-ID peer retains its pending outcome, and old prepared frames remain
+invalid. Aggressive multi-submission Metal load remains an explicit gate; this
+socket/native-host API regression does not qualify automatic frontend recovery.
+See the [source retirement follow-up](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-generation-macos.json).
+
+Native physical hosts now reserve exact source scenes during preparation, so a
+successor accepted during compilation, GPU work or GUI delivery does not retire
+the earlier image's physical outcome. Newer actual display, source/placement or
+host lifecycle changes still reject obsolete receipts. Dropped unshown native
+reservations settle during normal host polling. These reservations reuse encoded
+scene charges and preserve cached peers under resource pressure. This extends the
+SDK's terminating-source receipt accounting through the physical native host.
+
+The TCP saturation fixture now reapplies the receive-buffer setting after every
+proxy read. Diagnostics observed macOS grow a requested 16-KiB receive buffer to
+534,920 bytes during warmup; a handshake-time setting alone was insufficient.
+The fixture sets the initial receive window before connecting, uses 4-KiB bounded
+prefetch, verifies one frame exceeds measured buffers plus prefetch, and still
+requires an actual native write to remain blocked while control and a peer
+progress. No observation or cancellation deadline is extended.
+
+Two bounded multi-submission Metal workloads passed the full key/Unicode/recovery
+and owner-replacement script. Another repeat timed out on focus/editor readiness;
+continuous editor readiness remains an open local gate. The native reservation
+fix does not imply complete unpaced producer qualification. See the
+[streaming evidence and remaining failure](../vivid_compositor/docs/performance/2026-11-13-sdk-vector-stream-macos.json).
