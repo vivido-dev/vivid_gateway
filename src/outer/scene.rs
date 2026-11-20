@@ -68,6 +68,13 @@ impl OuterBridge {
                     .entry(surface.key)
                     .or_insert_with(|| route.input_epoch(surface.key));
             }
+            if surface.overlay_window.is_some()
+                && let Some(desired) = &self.external_input_epochs
+            {
+                self.external_input_bound
+                    .entry(surface.key)
+                    .or_insert_with(|| desired.get(&surface.key).copied());
+            }
             self.sync_overlay_layouts(surface)?;
             established.insert(surface.key);
         }
@@ -86,6 +93,7 @@ impl OuterBridge {
             .filter(|key| !desired_keys.contains(key) && !self.retiring_surfaces.contains_key(key))
             .collect::<Vec<_>>();
         for key in removed {
+            self.retire_external_actions(Some(key));
             self.surface_clock.remove(&key);
             self.hold_serials.remove(&key);
             self.hold_updates.retain(|source, _| {
@@ -95,6 +103,7 @@ impl OuterBridge {
             });
             self.overlay_windows.remove(&key);
             self.overlay_input_epochs.remove(&key);
+            self.external_input_bound.remove(&key);
             self.retire_documents(Some(key));
             self.overlay_revisions.retire(Some(key));
             {

@@ -89,13 +89,13 @@ impl Write for Writer {
         self.stream.flush()
     }
 }
-struct Carrier {
+pub(super) struct Carrier {
     endpoint: String,
     gate: Arc<Gate>,
     sockets: Mutex<Vec<TcpStream>>,
 }
 impl Carrier {
-    fn new(endpoint: &str) -> Self {
+    pub(super) fn new(endpoint: &str) -> Self {
         Self {
             endpoint: endpoint.strip_prefix("tcp:").unwrap().into(),
             gate: Arc::new(Gate {
@@ -108,6 +108,24 @@ impl Carrier {
             }),
             sockets: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Closes current TCP connections without cancelling future connection attempts.
+    #[cfg(feature = "native-vector-testing")]
+    pub(super) fn disconnect(&self) -> io::Result<()> {
+        let sockets = std::mem::take(&mut *self.sockets.lock().unwrap());
+        assert!(!sockets.is_empty(), "no current TCP connections to close");
+        for stream in sockets {
+            // Completed or cancelled channels remain in this clone list. On
+            // macOS their repeated shutdown is NotConnected; keep closing the
+            // remaining live sockets, while preserving unexpected failures.
+            if let Err(error) = stream.shutdown(Shutdown::Both)
+                && error.kind() != io::ErrorKind::NotConnected
+            {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 }
 impl ConnectionFactory for Carrier {
@@ -143,6 +161,64 @@ impl ConnectionFactory for Carrier {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
+}
+
+#[cfg(feature = "native-vector-testing")]
+#[test]
+fn disconnect_drains_closed_sockets_before_live_sockets_and_preserves_a_peer() -> io::Result<()> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let endpoint = format!("tcp:{}", listener.local_addr()?);
+    let first = Carrier::new(&endpoint);
+    let second = Carrier::new(&endpoint);
+    let pair = || -> io::Result<(TcpStream, TcpStream)> {
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let server = listener.accept()?.0;
+        server.set_read_timeout(Some(Duration::from_secs(1)))?;
+        Ok((client, server))
+    };
+    let (closed, _closed_server) = pair()?;
+    first.sockets.lock().unwrap().push(closed.try_clone()?);
+    closed.shutdown(Shutdown::Both)?;
+    // macOS reports NotConnected for repeated shutdown. The carrier retains
+    // clones of channels that may already have completed or been cancelled.
+    let repeated = closed.shutdown(Shutdown::Both);
+    #[cfg(target_os = "macos")]
+    assert_eq!(repeated.unwrap_err().kind(), io::ErrorKind::NotConnected);
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        repeated.is_ok()
+            || repeated.is_err_and(|error| error.kind() == io::ErrorKind::NotConnected)
+    );
+    let (live, mut live_server) = pair()?;
+    first.sockets.lock().unwrap().push(live.try_clone()?);
+    let (mut peer, mut peer_server) = pair()?;
+    second.sockets.lock().unwrap().push(peer.try_clone()?);
+    first.disconnect()?;
+    assert!(first.sockets.lock().unwrap().is_empty());
+    assert_eq!(live_server.read(&mut [0])?, 0);
+    peer.write_all(b"p")?;
+    let mut byte = [0];
+    peer_server.read_exact(&mut byte)?;
+    assert_eq!(byte, *b"p");
+    // Disconnecting a root does not permanently cancel future connections.
+    let replacement = first.open(ConnectionKind::Control, None)?;
+    let mut replacement_server = listener.accept()?.0;
+    replacement_server.set_read_timeout(Some(Duration::from_secs(1)))?;
+    let mut preface = [0; vivid_protocol::wire::PREFACE_SIZE];
+    replacement_server.read_exact(&mut preface)?;
+    assert_eq!(
+        preface,
+        vivid_protocol::wire::encode_preface(
+            ConnectionKind::Control,
+            vivid_protocol::CONTROL_MAX_RECORD_BODY
+        )
+    );
+    first.disconnect()?;
+    assert_eq!(replacement_server.read(&mut [0])?, 0);
+    drop(replacement);
+    second.disconnect()?;
+    assert_eq!(peer_server.read(&mut [0])?, 0);
+    Ok(())
 }
 fn reconcile(inner: &VirtualVivid, relay: &mut OuterBridge, pane: u64) -> io::Result<()> {
     let projection = snapshot(inner, &[pane]).bridge_projection();

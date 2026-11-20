@@ -17,7 +17,7 @@ use vivid_sdk::presenter::{
 };
 use vivid_sdk::{ChannelEvent, RequestMetadata, TrackChannel};
 
-use super::config::track_configuration;
+use super::config::{VECTOR_FRAME_HEADER_BYTES, track_configuration};
 use super::overlay::{OverlayLayouts, OverlayRevisions, RELAYED_REVISIONS};
 use super::playback::EosState;
 use super::{
@@ -25,7 +25,18 @@ use super::{
     surface_key,
 };
 
+// Only this source's bounded writer waits. No channel, layout or revision lock
+// is held; physical outcomes and retirement must remain able to release capacity.
+const PRESENTATION_CAPACITY_RETRY: Duration = Duration::from_millis(5);
+
 impl OuterBridge {
+    /// Identifies one current gateway-local media writer, independent of outer numeric IDs.
+    ///
+    /// Match this with [`DeliveryOutcome::writer_id`] to retire bounded handoffs.
+    /// The value is never installed as a protocol generation and grants no authority.
+    pub fn media_writer_id(&self, source: BridgeSourceKey) -> Option<u64> {
+        self.tracks.get(&source).map(|track| track.writer_id)
+    }
     /// Whether the foreground worker may hand another media chunk to this source.
     ///
     /// Timed tracks forward one bounded pre-roll window before outer PLAY. This avoids filling the
@@ -108,6 +119,61 @@ impl OuterBridge {
     /// reconciling the projection. Returns
     /// [`io::ErrorKind::BrokenPipe`] when the writer has stopped.
     pub fn media_chunk(&mut self, chunk: MediaChunk) -> io::Result<bool> {
+        self.media_chunk_impl(chunk, None)
+    }
+
+    /// Relays a vector chunk with a bounded downstream display correlation.
+    ///
+    /// Use when original SDK receipts remain on a different process. Supply the
+    /// same nonzero correlation on every chunk and drain `take_presentation_reports`
+    /// separately from write completions. The caller must retain and validate the
+    /// original receipt; these reports confer no source authority. An abandoned
+    /// partial assembly or retired writer reports abandonment, never presentation.
+    /// At most four live/undrained reports per original producer and 64 total are
+    /// admitted. This cannot be combined with a locally bound presentation route.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for zero/already-live correlation or non-vector frames, and
+    /// `Unsupported` for a local presentation binding or missing outer input lane.
+    /// In addition to `media_chunk` errors, returns `WouldBlock` for report
+    /// capacity pressure and `Interrupted` after cancellation. Retain and retry
+    /// a capacity-blocked chunk after draining outcomes.
+    pub fn media_chunk_with_presentation(
+        &mut self,
+        chunk: MediaChunk,
+        correlation: u64,
+    ) -> io::Result<bool> {
+        if self.cancellation.cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "bridge cancelled",
+            ));
+        }
+        if correlation == 0 || chunk.record_type != messages::VECTOR_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "display correlation requires a vector frame and nonzero identity",
+            ));
+        }
+        if self.presentation_relay.is_some()
+            || !self
+                .overlay_host_profiles()
+                .iter()
+                .any(|p| p == vivid_protocol::registry::OVERLAY_INPUT)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "external display reports require an independent outer overlay input route",
+            ));
+        }
+        self.media_chunk_impl(chunk, Some(correlation))
+    }
+
+    fn media_chunk_impl(
+        &mut self,
+        chunk: MediaChunk,
+        correlation: Option<u64>,
+    ) -> io::Result<bool> {
         let MediaChunk {
             delivery_id,
             source: key,
@@ -117,6 +183,17 @@ impl OuterBridge {
             last,
             bytes,
         } = chunk;
+        if last
+            && self
+                .tracks
+                .get(&key)
+                .is_some_and(|track| track.media_inflight >= OUTER_MEDIA_WRITER_QUEUE)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "outer source media writer queue is full",
+            ));
+        }
         let total = usize::try_from(total).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -180,6 +257,9 @@ impl OuterBridge {
                     return Err(invalid_data("media assembly sequence or budget exceeded"));
                 }
                 let mut body = Vec::new();
+                let external = correlation
+                    .map(|id| self.overlay_revisions.reports.reserve(key, id))
+                    .transpose()?;
                 body.try_reserve_exact(total).map_err(io::Error::other)?;
                 entry.insert(PendingBody {
                     delivery_id,
@@ -188,10 +268,12 @@ impl OuterBridge {
                     total,
                     received: 0,
                     bytes: body,
+                    external,
                 })
             }
         };
         if pending.delivery_id != delivery_id
+            || pending.external.as_ref().map(|receipt| receipt.correlation) != correlation
             || pending.record_type != record_type
             || pending.total != total
             || pending.received != offset as usize
@@ -218,6 +300,34 @@ impl OuterBridge {
         if pending.received != pending.total {
             return Err(invalid_data("incomplete media body"));
         }
+        // Bind before queueing or layout work can delay this record. Retrying a
+        // source's numeric IDs later must not capture a replacement incarnation.
+        let presentation = if pending.record_type == messages::VECTOR_FRAME {
+            if let Some(route) = &self.presentation_relay {
+                let header = pending
+                    .bytes
+                    .get(..VECTOR_FRAME_HEADER_BYTES as usize)
+                    .ok_or_else(|| invalid_data("missing vector frame prefix"))?;
+                let epoch = u32::from_be_bytes(
+                    header[..4]
+                        .try_into()
+                        .map_err(|_error| invalid_data("missing vector epoch"))?,
+                );
+                let revision = u64::from_be_bytes(
+                    header[4..]
+                        .try_into()
+                        .map_err(|_error| invalid_data("missing vector revision"))?,
+                );
+                if epoch == 0 || revision == 0 {
+                    return Err(invalid_data("zero vector epoch or revision"));
+                }
+                route.begin_capture(key, epoch, revision)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let track = self
             .tracks
             .get_mut(&key)
@@ -231,6 +341,8 @@ impl OuterBridge {
                 delivery_id,
                 record_type: pending.record_type,
                 body: pending.bytes,
+                presentation,
+                external: pending.external,
             })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => io::Error::new(
@@ -283,6 +395,8 @@ impl OuterBridge {
             .drain(..)
             .filter(|value| !value.eos)
             .map(|value| DeliveryOutcome {
+                source: value.source,
+                writer_id: value.writer_id,
                 delivery_id: value.delivery_id,
                 delivered: value.disposition == MediaDisposition::Delivered,
                 superseded: value.disposition == MediaDisposition::Superseded,
@@ -542,6 +656,10 @@ impl std::fmt::Debug for MediaChunk {
 /// How the outer writer finished one complete relayed record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeliveryOutcome {
+    /// Complete original source identity of the completed handoff.
+    pub source: BridgeSourceKey,
+    /// Gateway-local writer identity; it changes across attachment/session replacement.
+    pub writer_id: u64,
     /// The delivery the record arrived in; zero for a retained replay with no inner delivery.
     pub delivery_id: u64,
     /// Whether the outer track accepted the record.
@@ -594,6 +712,8 @@ pub(super) enum OuterMediaCommand {
         delivery_id: u64,
         record_type: u16,
         body: Vec<u8>,
+        presentation: Option<vivid_sdk::presenter::OverlayPresentationAttempt>,
+        external: Option<super::presentation_reports::Receipt>,
     },
     Eos,
 }
@@ -605,6 +725,7 @@ pub(super) struct PendingBody {
     pub(super) total: usize,
     pub(super) received: usize,
     pub(super) bytes: Vec<u8>,
+    external: Option<super::presentation_reports::Receipt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,7 +748,13 @@ pub(super) struct MediaCompletion {
 }
 
 impl OuterMediaWriter {
-    pub(super) fn forward_media(&mut self, record_type: u16, body: &[u8]) -> io::Result<u64> {
+    pub(super) fn forward_media(
+        &mut self,
+        record_type: u16,
+        body: &[u8],
+        presentation: Option<vivid_sdk::presenter::OverlayPresentationAttempt>,
+        external: Option<super::presentation_reports::Receipt>,
+    ) -> io::Result<u64> {
         match record_type {
             messages::VECTOR_ASSET => {
                 let asset = vivid_protocol::vector::ImageAsset::decode(body)
@@ -671,10 +798,25 @@ impl OuterMediaWriter {
                     }
                 }
                 frame.canvas = canvas;
-                let receipt = if let Some(route) = &self.presentation_relay {
-                    match route.capture(self.key, frame.epoch, frame.revision)? {
+                let receipt = if self.presentation_relay.is_some() {
+                    let Some(attempt) = presentation else {
+                        self.superseded = true;
+                        return Ok(0);
+                    };
+                    let capture = loop {
+                        if self.retired.load(Ordering::Acquire) {
+                            return Err(io::ErrorKind::BrokenPipe.into());
+                        }
+                        match attempt.capture() {
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                thread::sleep(PRESENTATION_CAPACITY_RETRY);
+                            }
+                            result => break result?,
+                        }
+                    };
+                    match capture {
                         vivid_sdk::presenter::OverlayPresentationCapture::Forwarded(receipt) => {
-                            Some(receipt)
+                            Some(super::presentation_reports::OriginalReceipt::Local(receipt))
                         }
                         vivid_sdk::presenter::OverlayPresentationCapture::Replay => None,
                         vivid_sdk::presenter::OverlayPresentationCapture::Discard => {
@@ -683,7 +825,7 @@ impl OuterMediaWriter {
                         }
                     }
                 } else {
-                    None
+                    external.map(super::presentation_reports::OriginalReceipt::Report)
                 };
                 let inner_revision = frame.revision;
                 let (epoch, _) = next_outer_identity(self, frame.epoch)?;
@@ -707,8 +849,8 @@ impl OuterMediaWriter {
                 frame.revision = revision;
                 if window.revisions.len() == RELAYED_REVISIONS {
                     window.revisions.pop_front();
-                    // Outcome receipts have their own bounded SDK credits. Do
-                    // not discard an unresolved physical outcome with history.
+                    // Outcome receipts have bounded credits independent of
+                    // revision history. Keep every unresolved physical copy.
                 }
                 window.revisions.push_back((revision, inner_revision));
                 if let Some(receipt) = receipt {
@@ -717,7 +859,12 @@ impl OuterMediaWriter {
                         .push_back((revision, self.writer_id, receipt));
                 }
                 drop(mappings);
-                self.channel.send_vector(&frame)
+                let result = self.channel.send_vector(&frame);
+                if result.is_err() {
+                    self.overlay_revisions
+                        .abandon_copy(key, self.writer_id, revision)?;
+                }
+                result
             }
             messages::IMAGE_DATA => self.channel.send_image(body),
             messages::VIDEO_PACKET => {
@@ -844,11 +991,13 @@ pub(super) fn run_outer_media_writer(
                 delivery_id,
                 record_type,
                 body,
+                presentation,
+                external,
             } => {
                 writer.needs_full_frame = false;
                 writer.superseded = false;
                 let result = writer
-                    .forward_media(record_type, &body)
+                    .forward_media(record_type, &body, presentation, external)
                     .and_then(|sequence| {
                         if sequence != 0
                             && !matches!(

@@ -10,12 +10,19 @@ use std::{
 
 // Bound the fixture independently of the gateway's own source/queue budgets.
 const MAX_SOCKETS: usize = 32;
-// Include this prefetch in the native capacity bound; one frame must exceed
-// prefetch plus both socket buffers before protocol credit can become the gate.
+// Include proxy prefetch in both setup and live socket observations. A held
+// native syscall, not the setup buffer sizes, proves kernel backpressure.
 const COPY_BYTES: usize = 4 * 1024;
-// Keep both native buffers below one bounded 256-KiB overlay record, so the
-// experiment reaches a kernel write rather than stopping at channel credit.
+// Request buffers below one bounded 256-KiB record. Verify live capacity
+// again while the same native write is held; setup values alone are insufficient.
 const SOCKET_BYTES: usize = 16 * 1024;
+// macOS loopback's large segments can grow receiver storage after SO_RCVBUF
+// is set. Bound this private fixture's segment size on connected sockets.
+#[cfg(target_os = "macos")]
+const SEGMENT_BYTES: u32 = 1024;
+// Outlast short native buffering/ACK pauses without extending the five-second
+// witness deadline or the independent two-second cancellation bound.
+const WRITE_HOLD: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 struct Writes {
@@ -69,6 +76,7 @@ struct KernelCarrier {
     endpoint: String,
     gate: Arc<Gate>,
     writes: Arc<Writes>,
+    native_pair: Mutex<Option<(TcpStream, TcpStream)>>,
     sockets: Mutex<Vec<TcpStream>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -85,6 +93,7 @@ impl KernelCarrier {
                 changed: Condvar::new(),
             }),
             writes: Arc::default(),
+            native_pair: Mutex::default(),
             sockets: Mutex::default(),
             workers: Mutex::default(),
         }
@@ -101,6 +110,14 @@ impl KernelCarrier {
         }
         Ok(())
     }
+    fn live_buffers(&self) -> io::Result<(usize, usize)> {
+        let pair = self.native_pair.lock().unwrap();
+        let (sender, receiver) = pair.as_ref().expect("one observed native track");
+        Ok((
+            socket2::SockRef::from(sender).send_buffer_size()?,
+            socket2::SockRef::from(receiver).recv_buffer_size()?,
+        ))
+    }
     fn observation(&self) -> String {
         format!(
             "active={}, completed={}, calls={}, errors={}, send_buffer={}, receive_buffer={}",
@@ -112,18 +129,23 @@ impl KernelCarrier {
             self.writes.recv_capacity.load(Ordering::Acquire)
         )
     }
-    fn blocked_write(&self) {
+    fn blocked_write(&self) -> (u64, u64) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if self.writes.active.load(Ordering::Acquire) {
+            if self.writes.active.load(Ordering::Acquire)
+                && deadline.saturating_duration_since(Instant::now()) >= WRITE_HOLD
+            {
                 let completed = self.writes.completed_bytes.load(Ordering::Acquire);
+                let call = self.writes.calls.load(Ordering::Acquire);
                 // Observe an actual native write, not just a full gateway queue
                 // or a sender parked on authenticated protocol credit.
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(WRITE_HOLD);
                 if self.writes.active.load(Ordering::Acquire)
                     && self.writes.completed_bytes.load(Ordering::Acquire) == completed
+                    && self.writes.calls.load(Ordering::Acquire) == call
+                    && Instant::now() < deadline
                 {
-                    return;
+                    return (call, completed);
                 }
             }
             assert!(
@@ -144,16 +166,30 @@ impl ConnectionFactory for KernelCarrier {
             return Connection::from_streams(upstream.try_clone()?, upstream, kind);
         }
         let listener = TcpListener::bind("127.0.0.1:0")?;
-        // Configure the passive socket before SYN, so the first advertised
-        // receive window cannot retain the platform's larger default capacity.
+        // Request a small initial receive window before SYN. Connected-socket
+        // tuning and the live observation account for subsequent buffer growth.
         socket2::SockRef::from(&listener).set_recv_buffer_size(SOCKET_BYTES)?;
         let client = TcpStream::connect(listener.local_addr()?)?;
         let (mut receiver, _) = listener.accept()?;
         client.set_nodelay(true)?;
         receiver.set_nodelay(true)?;
+        #[cfg(target_os = "macos")]
+        for stream in [&client, &receiver] {
+            let socket = socket2::SockRef::from(stream);
+            let segment = socket.tcp_mss()?.min(SEGMENT_BYTES);
+            socket.set_tcp_mss(segment)?;
+            assert_eq!(socket.tcp_mss()?, segment);
+        }
         socket2::SockRef::from(&client).set_send_buffer_size(SOCKET_BYTES)?;
         socket2::SockRef::from(&receiver).set_recv_buffer_size(SOCKET_BYTES)?;
         self.retain(&[&client, &receiver, &upstream])?;
+        let mut pair = self.native_pair.lock().unwrap();
+        assert!(
+            pair.is_none(),
+            "fixture must observe only one native track writer"
+        );
+        *pair = Some((client.try_clone()?, receiver.try_clone()?));
+        drop(pair);
         let mut remote_reader = upstream.try_clone()?;
         let mut response = receiver.try_clone()?;
         let gate = Arc::clone(&self.gate);
@@ -166,10 +202,9 @@ impl ConnectionFactory for KernelCarrier {
                 let Ok(count) = receiver.read(&mut buffer) else {
                     return;
                 };
-                // macOS can enlarge the receive buffer while the initial
-                // record drains. Reapply the bound at every read, immediately
-                // before the gate stops draining, rather than trusting its
-                // handshake-time value throughout the experiment.
+                // Reapply the requested size as the initial record drains.
+                // macOS may still grow storage after this read; the live
+                // observation checks capacity while the native write is held.
                 if socket2::SockRef::from(&receiver)
                     .set_recv_buffer_size(SOCKET_BYTES)
                     .is_err()
@@ -294,6 +329,23 @@ fn native_tcp_backpressure_cancels_while_control_and_a_same_id_peer_progress() -
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        // Delivery and control activation can both finish while the proxy is
+        // still forwarding the initial scene. Do not arm the media gate in the
+        // middle of that initial frame: it must reach the actual outer receiver
+        // before the pressure experiment starts and consumes fresh media credit.
+        let ready_before_wait = snapshot(&outer, &[pane + 8])
+            .sources
+            .iter()
+            .any(|source| source.key.track == track && source.retained.is_some());
+        let (_, applied) = outer_frame(&outer, pane + 8, |source, _| source.track == track);
+        assert_eq!(
+            applied.canvas.commands().len(),
+            if pane == 1 { 2 } else { 1 }
+        );
+        eprintln!(
+            "Initial outer scene applied: pane={}, track={track}, ready_before_wait={ready_before_wait}",
+            pane + 8
+        );
     }
     let source_keys = [1, 2].map(|pane| snapshot(&inner, &[pane]).sources[0].key);
     assert_eq!(
@@ -331,7 +383,7 @@ fn native_tcp_backpressure_cancels_while_control_and_a_same_id_peer_progress() -
         "one vector frame must exceed native buffers plus proxy prefetch"
     );
     eprintln!(
-        "Native TCP fixture: frame={frame_bytes} bytes, socket buffers plus prefetch={capacity} bytes"
+        "Native TCP fixture: frame={frame_bytes} bytes, setup socket buffers plus prefetch={capacity} bytes"
     );
     let peer_surface = peer.outer_surface_id(keys[1]);
     let cancel = blocked.cancel_handle();
@@ -354,11 +406,25 @@ fn native_tcp_backpressure_cancels_while_control_and_a_same_id_peer_progress() -
             "native stall escaped the bounded media queue"
         );
         carrier.gate.entered();
-        carrier.blocked_write();
+        let (held_call, held_bytes) = carrier.blocked_write();
+        let (live_send, live_receive) = carrier.live_buffers()?;
+        let live_capacity = live_send
+            .checked_add(live_receive)
+            .and_then(|n| n.checked_add(COPY_BYTES))
+            .expect("bounded live native buffers");
+        assert!(
+            frame_bytes > live_capacity,
+            "native receiver outgrew the pressure frame: send={live_send}, receive={live_receive}, frame={frame_bytes}"
+        );
+        eprintln!(
+            "Native TCP sustained witness: call={held_call}, completed={held_bytes}, live_send={live_send}, live_receive={live_receive}, frame={frame_bytes}"
+        );
         a.set_bounds(Rect::new(8., 8., 240., 120.).unwrap())?;
         reconcile(&inner, &mut blocked, 1)?;
         assert!(
-            carrier.writes.active.load(Ordering::Acquire),
+            carrier.writes.active.load(Ordering::Acquire)
+                && carrier.writes.calls.load(Ordering::Acquire) == held_call
+                && carrier.writes.completed_bytes.load(Ordering::Acquire) == held_bytes,
             "native write ended: {}",
             carrier.observation()
         );
@@ -377,9 +443,17 @@ fn native_tcp_backpressure_cancels_while_control_and_a_same_id_peer_progress() -
         );
         frame(&inner, &mut peer, 2)?;
         finish_delivery(&inner, &mut peer, 0)?;
+        // Observe the peer's receiver-applied scene, not only its local write.
+        let peer_track = peer.outer_track_id(source_keys[1]).unwrap();
+        let expected_peer = scene(2);
+        outer_frame(&outer, 10, |source, applied| {
+            source.track == peer_track && applied.canvas == expected_peer
+        });
         assert_eq!(peer.outer_surface_id(keys[1]), peer_surface);
         assert!(
-            carrier.writes.active.load(Ordering::Acquire),
+            carrier.writes.active.load(Ordering::Acquire)
+                && carrier.writes.calls.load(Ordering::Acquire) == held_call
+                && carrier.writes.completed_bytes.load(Ordering::Acquire) == held_bytes,
             "native write ended: {}",
             carrier.observation()
         );
@@ -393,7 +467,7 @@ fn native_tcp_backpressure_cancels_while_control_and_a_same_id_peer_progress() -
         assert!(!carrier.writes.active.load(Ordering::Acquire));
         worker.join().unwrap();
         eprintln!(
-            "Verified native TCP write blocked for at least 100 ms, {queued} bounded media handoffs, same-owner control and same-ID peer progress; cancellation retired the writer in {} ms.",
+            "Verified native TCP write blocked for at least 500 ms, {queued} bounded media handoffs, same-owner control and same-ID peer progress; cancellation retired the writer in {} ms.",
             start.elapsed().as_millis()
         );
         Ok(())

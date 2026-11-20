@@ -23,10 +23,23 @@ use vivid_sdk::{
     VectorConfiguration,
 };
 
-struct Producer {
-    session: Session,
-    lane: OverlayInputLane,
-    surface: Surface,
+#[cfg(feature = "native-gpu-testing")]
+#[path = "recovery/gpu.rs"]
+mod gpu;
+
+#[path = "recovery/outer.rs"]
+mod outer;
+
+#[path = "recovery/capture_pressure.rs"]
+mod capture_pressure;
+
+#[path = "recovery/late_lane.rs"]
+mod late_lane;
+
+pub(super) struct Producer {
+    pub(super) session: Session,
+    pub(super) lane: OverlayInputLane,
+    pub(super) surface: Surface,
     track: Track,
     channel: TrackChannel,
 }
@@ -68,14 +81,28 @@ fn fixture_mode(
     NativeVectorHost,
     OuterBridge,
 )> {
+    fixture_geometry(presentations, COLUMNS, ROWS)
+}
+fn fixture_geometry(
+    presentations: bool,
+    columns: u16,
+    rows: u16,
+) -> io::Result<(
+    Arc<VirtualVivid>,
+    Arc<VirtualVivid>,
+    NativeVectorHost,
+    OuterBridge,
+)> {
     let (inner, _) = overlay_presenter()?;
     let inner = Arc::new(inner);
     inner.enable_overlay_host_relay();
     let (outer, endpoint) = overlay_presenter()?;
     let outer = Arc::new(outer);
     let host = NativeVectorHost::attach(Arc::clone(&outer), "")?;
+    let secret = pane(&outer, 9)?;
+    outer.update_metrics(9, columns, rows, CELL);
     let builder = OuterBridge::builder(
-        Secret32::from_hex(&pane(&outer, 9)?).map_err(io::Error::other)?,
+        Secret32::from_hex(&secret).map_err(io::Error::other)?,
         DisplayMetrics::default(),
     )
     .control_endpoint(endpoint)
@@ -89,7 +116,7 @@ fn fixture_mode(
     Ok((inner, outer, host, relay))
 }
 impl Producer {
-    fn new(inner: &VirtualVivid, pane_id: u64, leased: bool) -> io::Result<Self> {
+    pub(super) fn new(inner: &VirtualVivid, pane_id: u64, leased: bool) -> io::Result<Self> {
         let secret = pane(inner, pane_id)?;
         let authentication = if leased {
             let profiles = config(
@@ -115,7 +142,18 @@ impl Producer {
         let mut session = Session::connect(config(inner, authentication))?;
         let lane = session.open_overlay_input_lane(1)?;
         lane.renew(5_000_000, Duration::from_secs(1))?;
-        let definition = SurfaceBuilder::new(&session, 48, 48)?
+        let (surface, track, channel) =
+            Self::create_window(&mut session, if pane_id == 1 { 0. } else { 64. })?;
+        Ok(Self {
+            session,
+            lane,
+            surface,
+            track,
+            channel,
+        })
+    }
+    fn create_window(session: &mut Session, x: f64) -> io::Result<(Surface, Track, TrackChannel)> {
+        let definition = SurfaceBuilder::new(session, 48, 48)?
             .titled(SurfaceRole::Figure, "recovery source")
             .build()?;
         let surface = session.create_surface(definition, &RequestMetadata::default())?;
@@ -124,7 +162,7 @@ impl Producer {
                 direction: vivid_sdk::TrackDirection::default(),
                 context_id: surface.context_id(),
                 surface_id: surface.id(),
-                track_id: 2,
+                track_id: session.allocate_id()?,
                 slot: SLOT_VECTOR,
                 mode: TrackMode::Live,
                 lane: LaneClass::Bulk,
@@ -152,40 +190,48 @@ impl Producer {
                 generation: surface.generation().get(),
             },
             expected_revision: 0,
-            options: WindowOptions::new(
-                Rect::new(if pane_id == 1 { 0. } else { 64. }, 0., 48., 48.).unwrap(),
-                WindowMode::Floating,
-            ),
+            options: WindowOptions::new(Rect::new(x, 0., 48., 48.).unwrap(), WindowMode::Floating),
         })?;
-        Ok(Self {
-            session,
-            lane,
-            surface,
-            track,
-            channel,
-        })
+        Ok((surface, track, channel))
     }
-    fn key(&self) -> BridgeSurfaceKey {
+    pub(super) fn key(&self) -> BridgeSurfaceKey {
         BridgeSurfaceKey {
             producer: self.session.info().session_id,
             context: self.surface.context_id(),
             surface: self.surface.id(),
         }
     }
-    fn address(&self) -> WindowAddress {
+    pub(super) fn address(&self) -> WindowAddress {
         WindowAddress {
             context_id: self.surface.context_id(),
             surface_id: self.surface.id(),
             generation: self.surface.generation().get(),
         }
     }
-    fn status(&self) -> io::Result<vivid_protocol::overlay::wire::Status> {
+    pub(super) fn status(&self) -> io::Result<vivid_protocol::overlay::wire::Status> {
         self.session.query_overlay_window(Query {
             context_id: self.surface.context_id(),
             surface_id: self.surface.id(),
         })
     }
-    fn paint(&mut self, revision: u64, color: u32) -> io::Result<()> {
+    pub(super) fn paint(&mut self, revision: u64, color: u32) -> io::Result<()> {
+        Self::paint_window(
+            &mut self.session,
+            &self.surface,
+            &self.track,
+            &self.channel,
+            revision,
+            color,
+        )
+    }
+    fn paint_window(
+        session: &mut Session,
+        surface: &Surface,
+        track: &Track,
+        channel: &TrackChannel,
+        revision: u64,
+        color: u32,
+    ) -> io::Result<()> {
         let mut canvas = Canvas::new();
         let path = Path::rectangle(Rect::new(0., 0., 48., 48.).unwrap()).unwrap();
         canvas
@@ -199,23 +245,23 @@ impl Producer {
                 cursor: None,
             })
             .unwrap();
-        self.channel.send_vector(&Frame {
+        channel.send_vector(&Frame {
             epoch: 1,
             revision,
             canvas,
         })?;
-        self.session.wait_track(
-            &self.track,
+        session.wait_track(
+            track,
             TrackWaitCondition::MilestoneSet,
             Some(MILESTONE_OUTPUT_READY),
             1_000_000,
         )?;
-        self.session.activate_tracks(
-            &self.surface,
+        session.activate_tracks(
+            surface,
             &[SlotBinding {
                 slot: SLOT_VECTOR,
-                track_id: self.track.id(),
-                expected_channel_generation: self.track.channel_generation(),
+                track_id: track.id(),
+                expected_channel_generation: track.channel_generation(),
                 required_milestone: MILESTONE_OUTPUT_READY,
             }],
             &RequestMetadata::default(),
@@ -808,6 +854,12 @@ fn unshown_frame(
 
 #[test]
 fn unresolved_forwarded_scenes_retire_across_channel_advance_and_lease_resume() -> io::Result<()> {
+    unresolved_scenes(|_, _| Ok(()))
+}
+
+fn unresolved_scenes(
+    mut render: impl FnMut(&vivid_sdk::presenter::VectorFrame, [u8; 4]) -> io::Result<()>,
+) -> io::Result<()> {
     let (inner, _outer, mut host, mut relay) = fixture_mode(true)?;
     let mut a = Producer::new(&inner, 1, true)?;
     let mut b = Producer::new(&inner, 2, false)?;
@@ -822,7 +874,9 @@ fn unresolved_forwarded_scenes_retire_across_channel_advance_and_lease_resume() 
     }
     let outer_a = relay.outer_surface_id(a.key()).unwrap();
     let stale_channel = unshown_frame(&mut host, &mut relay, outer_a, 4)?;
+    render(&stale_channel, [255, 0, 0, 255])?;
     assert_eq!(a.status()?.scene_revision, 0);
+    assert_eq!(b.status()?.scene_revision, 0);
     a.session
         .advance_channel(&a.track, 1, &RequestMetadata::default())?;
     let next_channel = a.session.open_track_channel(&a.track)?;
@@ -833,7 +887,11 @@ fn unresolved_forwarded_scenes_retire_across_channel_advance_and_lease_resume() 
         a.paint(revision, 0x00ff_00ff)?;
         forward_unshown(&inner, &mut relay, &a, revision)?;
     }
-    drop(unshown_frame(&mut host, &mut relay, outer_a, 8)?);
+    let fresh_channel = unshown_frame(&mut host, &mut relay, outer_a, 8)?;
+    render(&fresh_channel, [0, 255, 0, 255])?;
+    drop(fresh_channel);
+    // Old pixels can still be rendered, but cannot acknowledge a retired writer.
+    render(&stale_channel, [255, 0, 0, 255])?;
     assert!(!host.presented(&stale_channel)?);
     drop(stale_channel);
     let stale_resume = unshown_frame(&mut host, &mut relay, outer_a, 8)?;
@@ -874,10 +932,16 @@ fn unresolved_forwarded_scenes_retire_across_channel_advance_and_lease_resume() 
         resumed_outer, outer_a,
         "resume reused a physical window identity"
     );
-    drop(unshown_frame(&mut host, &mut relay, resumed_outer, 4)?);
+    let fresh_resume = unshown_frame(&mut host, &mut relay, resumed_outer, 4)?;
+    render(&fresh_resume, [255, 255, 0, 255])?;
+    render(&stale_resume, [0, 255, 0, 255])?;
     assert!(!host.presented(&stale_resume)?);
     drop(stale_resume);
-    let _ = display(&inner, &mut relay, &mut host, 2)?;
+    // Readback alone must not settle either source, including the same-ID peer.
+    assert_eq!(a.status()?.scene_revision, 0);
+    assert_eq!(b.status()?.scene_revision, 0);
+    render(&fresh_resume, [255, 255, 0, 255])?;
+    assert!(host.presented(&fresh_resume)?);
     wait(&inner, &mut relay, || {
         a.status().is_ok_and(|s| s.scene_revision == 12)
             && b.status().is_ok_and(|s| s.scene_revision == 1)

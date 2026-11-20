@@ -18,15 +18,20 @@ use vivid_sdk::{
 mod builder;
 mod config;
 mod document;
+mod input_epochs;
 mod overlay;
 mod playback;
+mod presentation_reports;
 mod relay;
 mod scene;
+mod window_actions;
 
 pub use builder::OuterBridgeBuilder;
 #[doc(inline)]
 pub use document::DocumentInput;
 pub use playback::{ClockState, EosState, PlaybackSnapshot};
+#[doc(inline)]
+pub use presentation_reports::PresentationReport;
 pub use relay::{DeliveryOutcome, MediaChunk};
 
 use config::{display_from_target, producer_config};
@@ -161,6 +166,7 @@ pub struct BridgeCancel {
     factory: Option<Arc<dyn ConnectionFactory>>,
     actions: Arc<Mutex<Option<CancelHook>>>,
     presentations: Arc<Mutex<Option<CancelHook>>>,
+    reports: Arc<presentation_reports::Reports>,
 }
 
 impl std::fmt::Debug for BridgeCancel {
@@ -178,6 +184,7 @@ impl BridgeCancel {
     /// Blocking calls on the bridge's thread return promptly with an error once this runs.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.reports.cancel();
         let actions = self
             .actions
             .lock()
@@ -242,8 +249,11 @@ pub struct OuterBridge {
     document_input: std::collections::VecDeque<DocumentInput>,
     overlay_jobs: Vec<HostWorker>,
     action_relay: Option<vivid_sdk::presenter::OverlayActionRoute>,
+    external_action_claims: Vec<(u64, Arc<window_actions::Admission>)>,
     overlay_input_epochs:
         HashMap<BridgeSurfaceKey, Option<vivid_sdk::presenter::OverlayInputEpoch>>,
+    external_input_epochs: Option<HashMap<BridgeSurfaceKey, u64>>,
+    external_input_bound: HashMap<BridgeSurfaceKey, Option<u64>>,
     overlay_results: Vec<(u64, io::Result<Vec<u8>>)>,
     overlay_input: Option<Arc<vivid_sdk::OverlayInputLane>>,
     overlay_environment: Option<Vec<u8>>,
@@ -347,12 +357,14 @@ impl OuterBridge {
         let display = display_from_target(&session, fallback_display)?;
         let target_profile = session.info().target_profile.clone();
         let (writer_completions_tx, writer_completions_rx) = mpsc::channel();
+        let overlay_revisions: OverlayRevisions = Arc::default();
         let cancellation = BridgeCancel {
             cancelled: Arc::new(AtomicBool::new(false)),
             current: Arc::new(std::sync::Mutex::new(session.cancel_handle())),
             factory: route.factory(),
             actions: Arc::default(),
             presentations: Arc::default(),
+            reports: Arc::clone(&overlay_revisions.reports),
         };
         let position_observer = PositionObserver::new(&session)?;
         Ok(Self {
@@ -370,7 +382,10 @@ impl OuterBridge {
             overlay_input: None,
             overlay_jobs: Vec::new(),
             action_relay: None,
+            external_action_claims: Vec::new(),
             overlay_input_epochs: HashMap::new(),
+            external_input_epochs: None,
+            external_input_bound: HashMap::new(),
             document_relay: false,
             document_target: std::sync::Weak::new(),
             documents: Arc::default(),
@@ -379,7 +394,7 @@ impl OuterBridge {
             overlay_environment: None,
             overlay_renewed: Instant::now(),
             overlay_layouts: Arc::default(),
-            overlay_revisions: Arc::default(),
+            overlay_revisions,
             tracks: HashMap::new(),
             unfinished_tracks: HashMap::new(),
             surface_refresh: HashSet::new(),
@@ -469,6 +484,34 @@ impl OuterBridge {
         self.diagnostic_generation
     }
 
+    /// Identifies the current physical owner for exact display-completion observations.
+    ///
+    /// This ID is scoped to this bridge's outer presenter. It grants no authority.
+    pub fn outer_session_id(&self) -> u64 {
+        self.session.info().session_id
+    }
+
+    /// Disconnects one current outer transport without cancelling the bridge's retry policy.
+    ///
+    /// Test support only. Unlike [`Self::cancel_handle`], this leaves subsequent
+    /// independent root authentications available.
+    ///
+    /// # Errors
+    /// Rejects stale physical owner IDs and an already cancelled bridge.
+    #[cfg(feature = "testing")]
+    pub fn disconnect_outer_session_for_test(&self, expected_owner: u64) -> io::Result<()> {
+        if expected_owner != self.outer_session_id()
+            || self.cancellation.cancelled.load(Ordering::Acquire)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stale outer disconnect",
+            ));
+        }
+        (self.session.cancel_handle())();
+        Ok(())
+    }
+
     /// The outer channel generation of every relayed track, ordered by inner identity.
     pub fn attachment_generations(&self) -> Vec<(BridgeSourceKey, u64)> {
         let mut values = self
@@ -520,6 +563,9 @@ impl OuterBridge {
     ///
     /// Setup that fails part-way keeps what it needs to clean up, and the next call retries it.
     ///
+    /// Surface order determines creation order for newly re-originated overlay windows.
+    /// SDK projections preserve the original bottom-to-top pane stack, including hidden windows.
+    ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidData`] for an inconsistent snapshot: duplicate or zero
@@ -554,6 +600,17 @@ impl OuterBridge {
         recovering: &HashSet<BridgeSourceKey>,
     ) -> io::Result<HashSet<BridgeSourceKey>> {
         validate_snapshot(surfaces, sources, nodes)?;
+        if let Some(epochs) = &self.external_input_epochs
+            && epochs.keys().any(|key| {
+                !surfaces
+                    .iter()
+                    .any(|surface| surface.key == *key && surface.overlay_window.is_some())
+            })
+        {
+            return Err(invalid_data(
+                "external input epoch has no projected overlay window",
+            ));
+        }
         self.rebuild_inner(surfaces, sources, nodes, recovering, true)
     }
 
@@ -583,6 +640,20 @@ impl OuterBridge {
         } else {
             HashSet::new()
         };
+        if renew_input && let Some(desired) = &self.external_input_epochs {
+            retired.extend(
+                surfaces
+                    .iter()
+                    .filter(|surface| {
+                        surface.overlay_window.is_some()
+                            && self
+                                .external_input_bound
+                                .get(&surface.key)
+                                .is_some_and(|bound| *bound != desired.get(&surface.key).copied())
+                    })
+                    .map(|surface| surface.key),
+            );
+        }
         // Include new or differently stamped child windows before the temporary
         // removal pass, so no retained child names a missing physical parent.
         loop {
@@ -829,6 +900,7 @@ impl OuterBridge {
         self.overlay_input.take();
         self.overlay_windows.clear();
         self.overlay_input_epochs.clear();
+        self.external_input_bound.clear();
         self.documents = Arc::default();
         self.document_input.clear();
         *self
@@ -1109,3 +1181,8 @@ fn invalid_data(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[doc(inline)]
+pub use input_epochs::ExternalOverlayInput;
+#[doc(inline)]
+pub use window_actions::ExternalActionClaim;

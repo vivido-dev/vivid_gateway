@@ -1961,12 +1961,12 @@ fn delta_body(frame_id: u64, base_frame_id: u64) -> Vec<u8> {
 fn a_delta_the_outer_track_cannot_accept_asks_for_a_full_frame() {
     let (_session, mut writer) = raster_writer(0);
     writer
-        .forward_media(messages::RASTER_FRAME, &full_frame_body(1))
+        .forward_media(messages::RASTER_FRAME, &full_frame_body(1), None, None)
         .expect("a full frame is always relayable");
     assert!(!writer.needs_full_frame);
 
     let error = writer
-        .forward_media(messages::RASTER_FRAME, &delta_body(2, 1))
+        .forward_media(messages::RASTER_FRAME, &delta_body(2, 1), None, None)
         .expect_err("an ungranted delta cannot be relayed");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(
@@ -1980,10 +1980,10 @@ fn a_delta_the_outer_track_cannot_accept_asks_for_a_full_frame() {
 fn a_delta_within_the_outer_grant_is_relayed() {
     let (_session, mut writer) = raster_writer(INNER_DELTA_OPERATIONS);
     writer
-        .forward_media(messages::RASTER_FRAME, &full_frame_body(1))
+        .forward_media(messages::RASTER_FRAME, &full_frame_body(1), None, None)
         .expect("a full frame is always relayable");
     writer
-        .forward_media(messages::RASTER_FRAME, &delta_body(2, 1))
+        .forward_media(messages::RASTER_FRAME, &delta_body(2, 1), None, None)
         .expect("a granted delta is relayable");
     assert!(!writer.needs_full_frame);
     assert_eq!(writer.last_raster_id, 2, "the outer base has to advance");
@@ -2120,6 +2120,8 @@ fn queue_full_frame(commands: &mpsc::SyncSender<OuterMediaCommand>, frame_id: u6
             delivery_id: frame_id,
             record_type: messages::RASTER_FRAME,
             body: full_frame_body(frame_id),
+            presentation: None,
+            external: None,
         })
         .unwrap();
 }

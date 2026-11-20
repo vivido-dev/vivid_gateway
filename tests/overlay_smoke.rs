@@ -35,14 +35,22 @@ mod common;
 #[cfg(feature = "native-vector-testing")]
 #[path = "overlay_smoke/document.rs"]
 mod document;
+#[cfg(feature = "native-vector-testing")]
+#[path = "overlay_smoke/external_actions.rs"]
+mod external_actions;
 #[path = "overlay_smoke/focus.rs"]
 mod focus;
+#[cfg(feature = "native-vector-testing")]
+#[path = "overlay_smoke/presentation_reports.rs"]
+mod presentation_reports;
 #[cfg(feature = "native-vector-testing")]
 #[path = "overlay_smoke/pressure.rs"]
 mod pressure;
 #[cfg(feature = "native-vector-testing")]
 #[path = "overlay_smoke/recovery.rs"]
 mod recovery;
+#[path = "overlay_smoke/stacking.rs"]
+mod stacking;
 #[path = "overlay_smoke/transport.rs"]
 mod transport;
 

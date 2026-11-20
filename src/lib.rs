@@ -40,5 +40,8 @@ pub use microphone::MicrophonePacket;
 #[doc(inline)]
 pub use outer::{
     BridgeCancel, ClockState, DeliveryOutcome, DocumentInput, EosState, MediaChunk, OuterBridge,
-    OuterBridgeBuilder, PlaybackSnapshot,
+    OuterBridgeBuilder, PlaybackSnapshot, PresentationReport,
 };
+
+#[doc(inline)]
+pub use outer::{ExternalActionClaim, ExternalOverlayInput};

@@ -17,6 +17,118 @@ fn audit_bridge() -> OuterBridge {
 }
 
 #[test]
+fn cancellation_abandons_external_observations_before_late_physical_callbacks() {
+    let mut bridge = audit_bridge();
+    let mut unrelated = audit_bridge();
+    let source = BridgeSourceKey {
+        producer: 1,
+        context: 1,
+        surface: 1,
+        track: 1,
+    };
+    let receipt = bridge.overlay_revisions.reports.reserve(source, 7).unwrap();
+    let peer = unrelated
+        .overlay_revisions
+        .reports
+        .reserve(source, 7)
+        .unwrap();
+    bridge.cancel_handle().cancel();
+    assert_eq!(
+        bridge
+            .media_chunk_with_presentation(
+                MediaChunk {
+                    delivery_id: 1,
+                    source,
+                    record_type: messages::VECTOR_FRAME,
+                    offset: 0,
+                    total: 1,
+                    last: true,
+                    bytes: vec![1]
+                },
+                8
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Interrupted
+    );
+    let reports = bridge.take_presentation_reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].outcome, None);
+    assert_eq!(reports[0].source, source);
+    receipt.complete(vivid_protocol::overlay::wire::PresentationOutcome::Presented);
+    assert!(bridge.take_presentation_reports().is_empty());
+    assert!(unrelated.take_presentation_reports().is_empty());
+    peer.complete(vivid_protocol::overlay::wire::PresentationOutcome::Presented);
+    let reports = unrelated.take_presentation_reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].outcome,
+        Some(vivid_protocol::overlay::wire::PresentationOutcome::Presented)
+    );
+}
+
+#[test]
+fn failed_write_abandons_only_its_exact_owner_writer_and_revision() {
+    use crate::outer::presentation_reports::OriginalReceipt;
+    let mut bridge = audit_bridge();
+    let first = BridgeSourceKey {
+        producer: 1,
+        context: 1,
+        surface: 1,
+        track: 1,
+    };
+    let peer = BridgeSourceKey {
+        producer: 2,
+        ..first
+    };
+    for (source, correlation, writer) in [(first, 11, 10), (peer, 12, 20)] {
+        let receipt = bridge
+            .overlay_revisions
+            .reports
+            .reserve(source, correlation)
+            .unwrap();
+        let key = BridgeSurfaceKey {
+            producer: source.producer,
+            context: source.context,
+            surface: source.surface,
+        };
+        bridge
+            .overlay_revisions
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .presentations
+            .push_back((1, writer, OriginalReceipt::Report(receipt)));
+    }
+    let key = BridgeSurfaceKey {
+        producer: 1,
+        context: 1,
+        surface: 1,
+    };
+    bridge.overlay_revisions.abandon_copy(key, 20, 1).unwrap();
+    assert!(bridge.take_presentation_reports().is_empty());
+    bridge.overlay_revisions.abandon_copy(key, 10, 2).unwrap();
+    assert!(bridge.take_presentation_reports().is_empty());
+    bridge.overlay_revisions.abandon_copy(key, 10, 1).unwrap();
+    let reports = bridge.take_presentation_reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].source, first);
+    assert_eq!(reports[0].outcome, None);
+    bridge
+        .overlay_revisions
+        .record_presented(BridgeSurfaceKey { producer: 2, ..key }, 1)
+        .unwrap();
+    let reports = bridge.take_presentation_reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].source, peer);
+    assert_eq!(
+        reports[0].outcome,
+        Some(vivid_protocol::overlay::wire::PresentationOutcome::Presented)
+    );
+}
+
+#[test]
 fn unknown_sources_cannot_retain_partial_records() {
     let mut bridge = audit_bridge();
     for producer in 1..=100 {
@@ -54,7 +166,7 @@ fn unknown_sources_cannot_retain_partial_records() {
 fn delta_recovery_waits_for_full_frame() {
     let (_session, mut writer) = raster_writer(1);
     writer
-        .forward_media(messages::RASTER_FRAME, &full_frame_body(1))
+        .forward_media(messages::RASTER_FRAME, &full_frame_body(1), None, None)
         .unwrap();
     let pixels = [0xaa, 0xbb, 0xcc, 0xff];
     let skipped = media::raster_delta_frame_body(
@@ -88,19 +200,19 @@ fn delta_recovery_waits_for_full_frame() {
     )
     .unwrap();
     writer
-        .forward_media(messages::RASTER_FRAME, &skipped)
+        .forward_media(messages::RASTER_FRAME, &skipped, None, None)
         .unwrap_err();
     assert!(writer.needs_full_frame);
     writer.needs_full_frame = false; // The worker resets this before each command.
     // Frame 3 depends on omitted frame 2 and must wait for a new full frame.
     writer
-        .forward_media(messages::RASTER_FRAME, &delta_body(3, 2))
+        .forward_media(messages::RASTER_FRAME, &delta_body(3, 2), None, None)
         .unwrap_err();
     writer
-        .forward_media(messages::RASTER_FRAME, &full_frame_body(4))
+        .forward_media(messages::RASTER_FRAME, &full_frame_body(4), None, None)
         .unwrap();
     writer
-        .forward_media(messages::RASTER_FRAME, &delta_body(5, 4))
+        .forward_media(messages::RASTER_FRAME, &delta_body(5, 4), None, None)
         .unwrap();
 }
 

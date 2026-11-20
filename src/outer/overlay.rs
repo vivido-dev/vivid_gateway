@@ -26,7 +26,7 @@ impl OuterBridge {
     /// [`io::ErrorKind::BrokenPipe`] when the outer overlay input lane closes.
     /// Bound action routes return `Unsupported`; use `take_overlay_routed_input` instead.
     pub fn take_overlay_input(&mut self) -> io::Result<Vec<(BridgeSurfaceKey, Vec<u8>)>> {
-        if self.action_relay.is_some() {
+        if self.action_relay.is_some() || self.external_input_epochs.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "bound action routes require take_overlay_routed_input",
@@ -69,7 +69,7 @@ impl OuterBridge {
         Ok(inputs)
     }
 
-    fn drain_overlay_input(&mut self) -> io::Result<Vec<(BridgeSurfaceKey, Vec<u8>)>> {
+    pub(super) fn drain_overlay_input(&mut self) -> io::Result<Vec<(BridgeSurfaceKey, Vec<u8>)>> {
         let Some(input) = self.overlay_input.clone() else {
             return Ok(Vec::new());
         };
@@ -124,6 +124,14 @@ impl OuterBridge {
             let Some(key) = self.outer_surface_key(&event.address) else {
                 continue;
             };
+            if let Some(desired) = &self.external_input_epochs
+                && self
+                    .external_input_bound
+                    .get(&key)
+                    .is_none_or(|bound| bound.is_none() || *bound != desired.get(&key).copied())
+            {
+                continue;
+            }
             if let Some(route) = &self.action_relay
                 && self
                     .overlay_input_epochs
@@ -243,13 +251,7 @@ impl OuterBridge {
         {
             return true;
         }
-        self.overlay_jobs.len() < MAX_OVERLAY_JOBS
-            && self
-                .overlay_jobs
-                .iter()
-                .filter(|job| job.owner == request.surface.producer)
-                .count()
-                < MAX_OWNER_OVERLAY_JOBS
+        self.overlay_worker_available(request.surface.producer)
             && (request.record_type != messages::OVERLAY_ACTION
                 || self
                     .overlay_windows
@@ -293,16 +295,7 @@ impl OuterBridge {
         self.action_relay
             .as_ref()
             .and_then(|route| route.request(request).preceding_windows())
-            .is_some_and(|windows| {
-                windows.iter().all(|before| {
-                    self.overlay_windows
-                        .get(&before.surface)
-                        .is_some_and(|after| {
-                            after.inner_generation == before.generation
-                                && after.projected.revision >= before.revision
-                        })
-                })
-            })
+            .is_some_and(|windows| self.window_barrier_ready(&windows))
     }
 
     /// Starts `request` on a worker thread.
@@ -328,6 +321,25 @@ impl OuterBridge {
         let id = request.id;
         let owner = request.surface.producer;
         let job = self.prepare_overlay_host_request(request)?;
+        self.spawn_overlay_job(id, owner, job)
+    }
+
+    pub(super) fn overlay_worker_available(&self, owner: u64) -> bool {
+        self.overlay_jobs.len() < MAX_OVERLAY_JOBS
+            && self
+                .overlay_jobs
+                .iter()
+                .filter(|job| job.owner == owner)
+                .count()
+                < MAX_OWNER_OVERLAY_JOBS
+    }
+
+    pub(super) fn spawn_overlay_job(
+        &mut self,
+        id: u64,
+        owner: u64,
+        job: OverlayJob,
+    ) -> io::Result<()> {
         let worker = thread::Builder::new()
             .name("vivid-overlay-host".into())
             .spawn(job)?;
@@ -357,6 +369,7 @@ impl OuterBridge {
     }
 
     pub(super) fn retire_overlay_jobs(&mut self) {
+        self.retire_external_actions(None);
         for HostWorker { id, worker, .. } in self.overlay_jobs.drain(..) {
             let _ = worker.join();
             self.overlay_results.push((
@@ -393,116 +406,7 @@ impl OuterBridge {
             return self.prepare_document_request(&request, address, host);
         }
         if request.record_type == messages::OVERLAY_ACTION {
-            let envelope = messages::decode_control(&request.body)?;
-            let mut query = vivid_protocol::overlay::wire::Action::decode(
-                request.surface.surface,
-                &Value::Map(envelope.payload),
-            )?;
-            let window = self
-                .overlay_windows
-                .get(&request.surface)
-                .ok_or_else(|| invalid_data("action window is absent"))?;
-            if query.address.context_id != request.surface.context
-                || query.address.generation != window.inner_generation
-                || query.expected_revision != window.projected.revision
-            {
-                return Err(invalid_data("action window revision is stale"));
-            }
-            let admission = self
-                .action_relay
-                .as_ref()
-                .ok_or_else(|| invalid_data("window-action forwarding is not enabled"))?
-                .request(&request);
-            if !admission.is_pending() {
-                return Err(invalid_data("original window action is retired or expired"));
-            }
-            if !self.action_projection_ready(&request) {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "preceding owner windows have not reached the physical projection",
-                ));
-            }
-            let centered = if query.action == vivid_protocol::overlay::wire::WindowAction::Center {
-                let bounds = admission
-                    .centered_bounds()
-                    .ok_or_else(|| invalid_data("original center bounds are unavailable"))?;
-                Some(
-                    Rect::new(
-                        bounds.origin.x.get() + exact_f64(window.offset_x)?,
-                        bounds.origin.y.get() + exact_f64(window.offset_y)?,
-                        bounds.width.get(),
-                        bounds.height.get(),
-                    )
-                    .map_err(io::Error::other)?,
-                )
-            } else {
-                None
-            };
-            query.address = address;
-            let owner = vivid_protocol::identity::SessionIdentity::new(
-                vivid_protocol::identity::PresenterInstanceId([0; 16]),
-                self.session.info().session_id,
-            )
-            .map_err(io::Error::other)?;
-            let cancelled = Arc::clone(&self.cancellation.cancelled);
-            return Ok(Box::new(move || {
-                if cancelled.load(Ordering::Acquire) || !admission.is_pending() {
-                    return Err(invalid_data("original window action is retired or expired"));
-                }
-                let status = host(
-                    messages::QUERY_OVERLAY,
-                    address.surface_id,
-                    vivid_protocol::overlay::wire::Query {
-                        context_id: address.context_id,
-                        surface_id: address.surface_id,
-                    }
-                    .payload()?,
-                )?;
-                let status = vivid_protocol::overlay::wire::Status::decode(
-                    owner,
-                    address.surface_id,
-                    &Value::Map(status),
-                )?;
-                if status.window.address != address {
-                    return Err(invalid_data("outer action window generation changed"));
-                }
-                query.expected_revision = status.window.expected_revision;
-                if cancelled.load(Ordering::Acquire) || !admission.claim() {
-                    return Err(invalid_data("original window action is retired"));
-                }
-                if let Some(bounds) = centered {
-                    if bounds.width != status.window.options.bounds.width
-                        || bounds.height != status.window.options.bounds.height
-                    {
-                        return Err(invalid_data("physical window size changed before center"));
-                    }
-                    let mut request = status.window;
-                    request.options.bounds = bounds;
-                    let fields = host(
-                        messages::SET_OVERLAY_WINDOW,
-                        address.surface_id,
-                        request.payload(owner)?,
-                    )?;
-                    let accepted =
-                        SetWindow::decode(owner, address.surface_id, &Value::Map(fields))?;
-                    if accepted.address != address || accepted.options.bounds != bounds {
-                        return Err(invalid_data(
-                            "physical center acknowledgement changed bounds",
-                        ));
-                    }
-                    return messages::Envelope::new(0, Vec::new())
-                        .encode()
-                        .map_err(io::Error::other);
-                }
-                let fields = host(
-                    messages::OVERLAY_ACTION,
-                    address.surface_id,
-                    query.payload()?,
-                )?;
-                messages::Envelope::new(0, fields)
-                    .encode()
-                    .map_err(io::Error::other)
-            }));
+            return self.prepare_local_window_action(&request);
         }
         let overlay_layouts = Arc::clone(&self.overlay_layouts);
         let overlay_revisions = Arc::clone(&self.overlay_revisions);
@@ -740,6 +644,7 @@ impl OuterBridge {
     /// unsupported relayed configuration.
     pub(super) fn sync_overlay_window(&mut self, surface: &BridgeSurface) -> io::Result<()> {
         let Some(window) = surface.overlay_window else {
+            self.retire_external_actions(Some(surface.key));
             self.overlay_windows.remove(&surface.key);
             self.retire_documents(Some(surface.key));
             return Ok(());
@@ -856,7 +761,7 @@ impl OuterBridge {
 }
 
 pub(super) struct HostWorker {
-    id: u64,
+    pub(super) id: u64,
     owner: u64,
     worker: thread::JoinHandle<io::Result<Vec<u8>>>,
 }
@@ -900,13 +805,13 @@ pub(super) const RELAYED_REVISIONS: usize = 64;
 pub(super) struct RelayedScenes {
     windows: Mutex<HashMap<BridgeSurfaceKey, WindowScenes>>,
     presented: Condvar,
+    pub(super) reports: Arc<super::presentation_reports::Reports>,
 }
 
 #[derive(Default)]
 pub(super) struct WindowScenes {
     pub(super) next_revision: u64,
-    pub(super) presentations:
-        VecDeque<(u64, u64, vivid_sdk::presenter::OverlayPresentationReceipt)>,
+    pub(super) presentations: VecDeque<(u64, u64, super::presentation_reports::OriginalReceipt)>,
     /// `(outer, inner)` revisions of the last [`RELAYED_REVISIONS`] scenes relayed, oldest first.
     pub(super) revisions: VecDeque<(u64, u64)>,
     /// The outer revision the outer presenter last reported presented.
@@ -914,6 +819,28 @@ pub(super) struct WindowScenes {
 }
 
 impl RelayedScenes {
+    pub(super) fn abandon_copy(
+        &self,
+        key: BridgeSurfaceKey,
+        writer: u64,
+        revision: u64,
+    ) -> io::Result<()> {
+        let receipt = {
+            let mut windows = self.lock()?;
+            windows.get_mut(&key).and_then(|window| {
+                window
+                    .presentations
+                    .iter()
+                    .position(|(r, w, _)| *r == revision && *w == writer)
+                    .and_then(|index| window.presentations.remove(index))
+                    .map(|(_, _, receipt)| receipt)
+            })
+        };
+        if let Some(receipt) = receipt {
+            receipt.abandon();
+        }
+        Ok(())
+    }
     pub(super) fn lock(
         &self,
     ) -> io::Result<std::sync::MutexGuard<'_, HashMap<BridgeSurfaceKey, WindowScenes>>> {
@@ -1073,8 +1000,8 @@ pub(super) struct OverlayLayouts {
 
 /// Revision bookkeeping for one surface's relayed overlay window.
 pub(super) struct OverlayWindowState {
-    offset_x: i64,
-    offset_y: i64,
+    pub(super) offset_x: i64,
+    pub(super) offset_y: i64,
     pub(super) inner_generation: u64,
     /// The inner window's own revision last successfully relayed, so an unchanged snapshot does
     /// not re-send the same geometry every reconciliation pass.
@@ -1091,7 +1018,7 @@ fn window_mode_from_wire(mode: u64) -> io::Result<WindowMode> {
 }
 
 /// Converts an overlay coordinate to `f64`, refusing one `f64` cannot represent exactly.
-fn exact_f64(value: i64) -> io::Result<f64> {
+pub(super) fn exact_f64(value: i64) -> io::Result<f64> {
     /// Largest magnitude every integer up to which `f64` represents exactly.
     const EXACT: i64 = 1 << f64::MANTISSA_DIGITS;
     if !(-EXACT..=EXACT).contains(&value) {

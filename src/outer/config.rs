@@ -60,7 +60,7 @@ const SPACE_TARGET: u64 = 1;
 const TEXT_LAYER_UNDER_GLYPHS: u64 = 1;
 
 /// Bytes a `VECTOR_FRAME` body carries ahead of its canvas: a `u32` epoch and a `u64` revision.
-const VECTOR_FRAME_HEADER_BYTES: u32 = 12;
+pub(super) const VECTOR_FRAME_HEADER_BYTES: u32 = 12;
 /// Bytes a `VECTOR_ASSET` body carries ahead of its pixels: a `u64` ID and `u32` dimensions.
 const VECTOR_ASSET_HEADER_BYTES: usize = 16;
 
