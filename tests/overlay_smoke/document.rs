@@ -144,16 +144,23 @@ fn publish(
     host: &mut NativeVectorHost,
     window: &OverlayWindow,
     scene: u64,
-    context: Context,
+    context: impl Into<Option<Context>>,
 ) -> io::Result<()> {
+    let context = context.into();
     std::thread::scope(|scope| {
-        let job = scope.spawn(|| window.set_text_context(scene, Some(context)));
+        let job = scope.spawn(|| window.set_text_context(scene, context));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !job.is_finished() {
             host.poll();
             input(inner, relay)?;
             for request in inner.take_overlay_host_requests() {
+                let id = request.id;
+                let surface = request.surface;
+                let mut foreign = surface;
+                foreign.producer = 0;
+                assert!(inner.take_overlay_document_target(id, foreign).is_none());
                 relay.start_overlay_host_request(request)?;
+                assert!(inner.take_overlay_document_target(id, surface).is_none());
             }
             for (id, result) in relay.take_overlay_host_replies() {
                 if let Err(error) = &result {
@@ -392,9 +399,40 @@ fn native_documents_reoriginate_revisions_and_revoke_delayed_input_without_harmi
     send(&mut host, &peer_text, "masked");
     assert!(pending(&inner, &mut relay).forward()?);
     assert_eq!(received(&second).commit.as_deref(), Some("masked"));
+    send(&mut host, &peer_text, "before-clear");
+    let held = pending(&inner, &mut relay);
+    publish(&inner, &mut relay, &mut host, &b, 2, None)?;
+    assert!(host.editor_state(&peer_text).unwrap().document.is_none());
+    assert!(!held.forward()?);
     peer_context.editor = 44;
     peer_context.revision = 1;
     publish(&inner, &mut relay, &mut host, &b, 2, peer_context.clone())?;
+    // A request can sit in the mux queue while its original pane loses focus.
+    // The delayed publication must fail before reaching the physical editor.
+    std::thread::scope(|scope| -> io::Result<()> {
+        let job = scope.spawn(|| b.set_text_context(2, Some(context(45, 1))));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(request) = inner.take_overlay_host_requests().pop() {
+                let id = request.id;
+                inner.set_overlay_pane_focus(2, false);
+                inner.set_overlay_pane_focus(2, true);
+                let error = relay.start_overlay_host_request(request).unwrap_err();
+                inner.complete_overlay_host_request(id, Err(error.to_string()));
+                assert!(job.join().unwrap().is_err());
+                break;
+            }
+            if job.is_finished() {
+                return Err(io::Error::other(
+                    "document request failed before reaching the relay",
+                ));
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    })?;
+    peer_context.editor = 46;
     a.close()?;
     first.close()?;
     await_windows(&inner, &[1, 2], 1);

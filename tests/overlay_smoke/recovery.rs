@@ -593,7 +593,10 @@ fn replacing_the_lane_after_physical_focus_cannot_deliver_old_feedback_or_acknow
         project(&inner, &mut relay)?;
         hydrate(&inner, &mut relay, &mut host)?;
         action(&inner, &mut relay, &a, WindowAction::Focus)?;
-        assert!(a.status()?.focused);
+        display(&inner, &mut relay, &mut host, 2)?;
+        wait(&inner, &mut relay, || {
+            a.status().is_ok_and(|status| status.focused)
+        })?;
         assert_eq!(a.status()?.window.expected_revision, 2);
         Ok(())
     })
@@ -733,7 +736,10 @@ fn leased_source_resume(presentations: bool) -> io::Result<()> {
         })?;
         assert!(b.status()?.focused);
         action(&inner, &mut relay, &a, WindowAction::Focus)?;
-        assert!(a.status()?.focused);
+        display(&inner, &mut relay, &mut host, 2)?;
+        wait(&inner, &mut relay, || {
+            a.status().is_ok_and(|status| status.focused)
+        })?;
         assert_eq!(a.session.query_track(&a.track)?.attachment_state, 1);
         assert_eq!(b.session.query_track(&b.track)?.attachment_state, 1);
         a.paint(3, 0xffff_00ff)?;
@@ -769,6 +775,7 @@ fn a_slow_routed_input_consumer_cannot_refresh_its_receipt_deadline() -> io::Res
         assert!(!input.forward(), "slow consumer revived physical input");
     }
     action(&inner, &mut relay, &b, WindowAction::Focus)?;
+    display(&inner, &mut relay, &mut host, 2)?;
     wait(&inner, &mut relay, || {
         b.status().is_ok_and(|status| status.focused)
     })?;

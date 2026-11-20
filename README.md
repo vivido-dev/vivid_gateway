@@ -94,6 +94,20 @@ let mut bridge = OuterBridge::builder(authentication, display)
 inner.set_overlay_document_host_profiles(&bridge.overlay_host_profiles());
 ```
 
+The presenter captures the original editor when it admits the publication. The
+bridge claims that grant once using the pending request ID and full surface key.
+Clearing an excerpt revokes the inner grant immediately and forwards the clear
+to the physical editor. A delayed edit against the cleared excerpt is refused.
+
+A same-host split-process integration uses `external_overlay_document_editing()`
+on the foreground bridge. The server claims and stores each original SDK target
+before sending the publication. Drain physical presentation reports and ordinary
+input before taking document events. Call `DocumentInput::into_external` for the
+mapped edit, publication ID, surface and deadline. The server verifies the
+attachment and original publication, then uses `relay_overlay_document_edit_before`
+with the remaining lifetime. The native vvmux client implements this contract.
+[Native mux contract](../vvmux/ARCHITECTURE.md)
+
 When several inner owners map onto one outer session, bound aggregate inner
 windows to that outer owner's 32-window protocol ceiling before authentication.
 The setter rejects invalid reductions without eviction; ordinary updates and

@@ -28,7 +28,7 @@ mod window_actions;
 
 pub use builder::OuterBridgeBuilder;
 #[doc(inline)]
-pub use document::DocumentInput;
+pub use document::{DocumentInput, ExternalDocumentInput};
 pub use playback::{ClockState, EosState, PlaybackSnapshot};
 #[doc(inline)]
 pub use presentation_reports::PresentationReport;
@@ -243,8 +243,7 @@ impl BridgeCancel {
 /// keys only and never become outer Vivid IDs, revisions, generations, epochs, or media IDs.
 pub struct OuterBridge {
     presentation_relay: Option<Arc<vivid_sdk::presenter::OverlayPresentationRoute>>,
-    document_relay: bool,
-    document_target: std::sync::Weak<vivid_sdk::presenter::VirtualVivid>,
+    document_route: document::DocumentRoute,
     documents: Arc<Mutex<document::Documents>>,
     document_input: std::collections::VecDeque<DocumentInput>,
     overlay_jobs: Vec<HostWorker>,
@@ -386,8 +385,7 @@ impl OuterBridge {
             overlay_input_epochs: HashMap::new(),
             external_input_epochs: None,
             external_input_bound: HashMap::new(),
-            document_relay: false,
-            document_target: std::sync::Weak::new(),
+            document_route: document::DocumentRoute::Disabled,
             documents: Arc::default(),
             document_input: std::collections::VecDeque::new(),
             overlay_results: Vec::new(),
@@ -868,7 +866,7 @@ impl OuterBridge {
         let session = self.route.connect(
             &self.authentication,
             &self.target_profile,
-            self.document_relay,
+            !matches!(self.document_route, document::DocumentRoute::Disabled),
         )?;
         let display = display_from_target(&session, self.display)?;
         if let Some(actions) = &mut self.action_relay {

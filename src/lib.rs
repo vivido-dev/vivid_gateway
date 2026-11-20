@@ -44,4 +44,4 @@ pub use outer::{
 };
 
 #[doc(inline)]
-pub use outer::{ExternalActionClaim, ExternalOverlayInput};
+pub use outer::{ExternalActionClaim, ExternalDocumentInput, ExternalOverlayInput};

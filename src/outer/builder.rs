@@ -24,7 +24,7 @@ pub struct OuterBridgeBuilder {
     bulk: Option<String>,
     factory: Option<Arc<dyn ConnectionFactory>>,
     target_profile: String,
-    documents: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
+    documents: super::document::DocumentRoute,
     actions: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
     presentations: Option<std::sync::Weak<vivid_sdk::presenter::VirtualVivid>>,
 }
@@ -44,7 +44,7 @@ impl OuterBridge {
             bulk: None,
             factory: None,
             target_profile: registry::TERMINAL_SURFACE.into(),
-            documents: None,
+            documents: super::document::DocumentRoute::Disabled,
             actions: None,
             presentations: None,
         }
@@ -105,8 +105,17 @@ impl OuterBridgeBuilder {
         mut self,
         inner: &Arc<vivid_sdk::presenter::VirtualVivid>,
     ) -> Self {
-        self.documents = Some(Arc::downgrade(inner));
+        self.documents = super::document::DocumentRoute::Local(Arc::downgrade(inner));
         self.presentations = Some(Arc::downgrade(inner));
+        self
+    }
+
+    /// Negotiates document editing for a split-process presenter. The server must
+    /// retain each original SDK target before sending its request, and validate
+    /// attachment, publication and deadline when receiving the edit.
+    #[must_use]
+    pub fn external_overlay_document_editing(mut self) -> Self {
+        self.documents = super::document::DocumentRoute::External;
         self
     }
 
@@ -152,7 +161,9 @@ impl OuterBridgeBuilder {
     /// authentication failures, and an outer target descriptor that carries no usable terminal
     /// geometry when `display` has none either, are returned as the outer session reports them.
     pub fn build(self) -> io::Result<OuterBridge> {
-        if (self.documents.is_some() || self.actions.is_some() || self.presentations.is_some())
+        if (!matches!(self.documents, super::document::DocumentRoute::Disabled)
+            || self.actions.is_some()
+            || self.presentations.is_some())
             && self.target_profile != registry::TERMINAL_SURFACE
         {
             return Err(io::Error::new(
@@ -160,10 +171,18 @@ impl OuterBridgeBuilder {
                 "window-action and document relays require a terminal overlay target",
             ));
         }
-        let origins: Vec<_> = [&self.documents, &self.actions, &self.presentations]
-            .into_iter()
-            .flatten()
-            .collect();
+        let document_presenter = match &self.documents {
+            super::document::DocumentRoute::Local(inner) => Some(inner),
+            _ => None,
+        };
+        let origins: Vec<_> = [
+            document_presenter,
+            self.actions.as_ref(),
+            self.presentations.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if origins
             .windows(2)
             .any(|pair| !std::sync::Weak::ptr_eq(pair[0], pair[1]))
@@ -193,12 +212,11 @@ impl OuterBridgeBuilder {
         let session = route.connect(
             &self.authentication,
             &self.target_profile,
-            self.documents.is_some(),
+            !matches!(self.documents, super::document::DocumentRoute::Disabled),
         )?;
         let mut bridge =
             OuterBridge::from_session(session, self.authentication, route, self.display)?;
-        bridge.document_relay = self.documents.is_some();
-        bridge.document_target = self.documents.unwrap_or_default();
+        bridge.document_route = self.documents;
         if let Some(inner) = self.actions {
             if !bridge
                 .overlay_host_profiles()
@@ -264,7 +282,10 @@ impl std::fmt::Debug for OuterBridgeBuilder {
             .field("bulk", &self.bulk)
             .field("factory", &self.factory.is_some())
             .field("target_profile", &self.target_profile)
-            .field("documents", &self.documents.is_some())
+            .field(
+                "documents",
+                &!matches!(self.documents, super::document::DocumentRoute::Disabled),
+            )
             .field("actions", &self.actions.is_some())
             .field("presentations", &self.presentations.is_some())
             .finish()

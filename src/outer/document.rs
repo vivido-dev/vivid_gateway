@@ -27,6 +27,38 @@ const CAPACITY: usize = 64;
 const INPUT_LIFETIME: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
+pub(super) enum DocumentRoute {
+    #[default]
+    Disabled,
+    Local(std::sync::Weak<VirtualVivid>),
+    External,
+}
+
+#[derive(Clone)]
+enum Target {
+    Local(
+        std::sync::Weak<VirtualVivid>,
+        vivid_sdk::presenter::OverlayDocumentTarget,
+    ),
+    External(u64),
+}
+
+/// Re-originated document input for an authenticated split-process bridge.
+/// The receiving presenter must resolve the request against its original grant
+/// and preserve the absolute deadline across transport.
+#[derive(Debug)]
+pub struct ExternalDocumentInput {
+    /// Original host request whose grant the server retained.
+    pub publication: u64,
+    /// Full original owner and surface identity.
+    pub surface: BridgeSurfaceKey,
+    /// Edit translated back into the original editor namespace.
+    pub edit: Edit,
+    /// Latest delivery instant, measured from receipt at the physical bridge.
+    pub deadline: Instant,
+}
+
+#[derive(Default)]
 pub(super) struct Documents {
     next: u64,
     windows: HashMap<BridgeSurfaceKey, Arc<Mutex<Window>>>,
@@ -42,11 +74,10 @@ struct Window {
 struct Revision {
     outer: u64,
     inner: u64,
-    target: vivid_sdk::presenter::OverlayDocumentTarget,
+    target: Target,
 }
 struct Grant {
     documents: Arc<Mutex<Documents>>,
-    presenter: std::sync::Weak<VirtualVivid>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     key: BridgeSurfaceKey,
     window: Arc<Mutex<Window>>,
@@ -69,13 +100,12 @@ impl Grant {
 
 /// An immutable document input retaining its original bridge/editor grant and deadline.
 ///
-/// This type deliberately has no serialization or retargeting API. Integrations
-/// must forward it to the original inner presenter. Legacy out-of-process mux
-/// transports must continue declining document editing until they preserve these scopes.
+/// A local grant can only forward to its original presenter. An external grant
+/// yields a publication correlation for delivery through its original attachment.
 pub struct DocumentInput {
     destination: Grant,
     edit: Edit,
-    target: vivid_sdk::presenter::OverlayDocumentTarget,
+    target: Target,
     deadline: Instant,
 }
 impl std::fmt::Debug for DocumentInput {
@@ -93,16 +123,48 @@ impl DocumentInput {
     /// # Errors
     /// Returns strict edit or ownership validation errors from the inner presenter.
     pub fn forward(self) -> io::Result<bool> {
-        let Some(inner) = self.destination.presenter.upgrade() else {
+        let Target::Local(presenter, target) = &self.target else {
             return Ok(false);
         };
+        let Some(inner) = presenter.upgrade() else {
+            return Ok(false);
+        };
+        Ok(self
+            .with_live_context(|| {
+                inner.relay_overlay_document_edit_before(target, &self.edit, self.deadline)
+            })?
+            .transpose()?
+            .unwrap_or(false))
+    }
+
+    /// Takes an external edit for immediate transport on the originating attachment.
+    /// A local, retired or expired grant yields no message.
+    ///
+    /// # Errors
+    /// Returns an error if the bridge state lock was poisoned.
+    pub fn into_external(self) -> io::Result<Option<ExternalDocumentInput>> {
+        let Target::External(publication) = self.target else {
+            return Ok(None);
+        };
+        if self.with_live_context(|| ())?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(ExternalDocumentInput {
+            publication,
+            surface: self.destination.key,
+            edit: self.edit,
+            deadline: self.deadline,
+        }))
+    }
+
+    fn with_live_context<T>(&self, run: impl FnOnce() -> T) -> io::Result<Option<T>> {
         let documents = self
             .destination
             .documents
             .lock()
             .map_err(super::poisoned("document relay"))?;
         if Instant::now() >= self.deadline || !self.destination.live(&documents) {
-            return Ok(false);
+            return Ok(None);
         }
         let window = self
             .destination
@@ -110,12 +172,12 @@ impl DocumentInput {
             .lock()
             .map_err(super::poisoned("document window"))?;
         let Some(context) = &window.inner else {
-            return Ok(false);
+            return Ok(None);
         };
         if self.edit.validate_context(context).is_err() {
-            return Ok(false);
+            return Ok(None);
         }
-        inner.relay_overlay_document_edit(&self.target, &self.edit)
+        Ok(Some(run()))
     }
 }
 impl OuterBridge {
@@ -149,7 +211,7 @@ impl OuterBridge {
             return true;
         }
         let documents = self.documents.lock().expect("document relay mutex");
-        self.document_relay
+        !matches!(self.document_route, DocumentRoute::Disabled)
             && documents
                 .windows
                 .get(&request.surface)
@@ -165,7 +227,7 @@ impl OuterBridge {
         host: OverlayHostHandle,
     ) -> io::Result<OverlayJob> {
         let key = request.surface;
-        if !self.document_relay {
+        if matches!(self.document_route, DocumentRoute::Disabled) {
             return Err(invalid_data("document relay is not enabled"));
         }
         let envelope = messages::decode_control(&request.body)?;
@@ -179,11 +241,22 @@ impl OuterBridge {
         {
             return Err(invalid_data("document surface is stale"));
         }
-        let target = self
-            .document_target
-            .upgrade()
-            .and_then(|inner| inner.overlay_document_target(key))
-            .ok_or_else(|| invalid_data("original inner document grant is unavailable"))?;
+        // The inner presenter has already revoked its editor when forwarding
+        // a clear. Only a publication with an excerpt can grant edit input.
+        let target = match (&self.document_route, &query.context) {
+            (_, None) => None,
+            (DocumentRoute::Local(presenter), Some(_)) => {
+                let target = presenter
+                    .upgrade()
+                    .and_then(|inner| inner.take_overlay_document_target(request.id, key))
+                    .ok_or_else(|| invalid_data("original inner document grant is unavailable"))?;
+                Some(Target::Local(std::sync::Weak::clone(presenter), target))
+            }
+            (DocumentRoute::External, Some(_)) if request.id != 0 => {
+                Some(Target::External(request.id))
+            }
+            _ => return Err(invalid_data("missing document publication grant")),
+        };
         let mut documents = self.documents.lock().expect("document relay mutex");
         if !documents.windows.contains_key(&key) && documents.windows.len() >= CAPACITY {
             return Err(io::ErrorKind::WouldBlock.into());
@@ -210,7 +283,6 @@ impl OuterBridge {
         drop(documents);
         let reservation = Reservation(Grant {
             documents: Arc::clone(&self.documents),
-            presenter: std::sync::Weak::clone(&self.document_target),
             cancelled: Arc::clone(&self.cancellation.cancelled),
             key,
             window,
@@ -262,7 +334,7 @@ impl OuterBridge {
             if state.inner.as_ref().map(|c| c.editor) != query.context.as_ref().map(|c| c.editor) {
                 state.revisions.clear();
             }
-            if let (Some(inner), Some(outer)) = (&query.context, &context) {
+            if let (Some(inner), Some(outer), Some(target)) = (&query.context, &context, target) {
                 if state.revisions.len() >= CAPACITY {
                     state.revisions.pop_front();
                 }
@@ -303,7 +375,7 @@ impl OuterBridge {
     }
 
     pub(super) fn queue_document_input(&mut self, mut edit: Edit) -> io::Result<()> {
-        if !self.document_relay {
+        if matches!(self.document_route, DocumentRoute::Disabled) {
             return Err(invalid_data("document relay is not enabled"));
         }
         let Some(key) = self.outer_surface_key(&edit.address) else {
@@ -357,7 +429,6 @@ impl OuterBridge {
             self.document_input.push_back(DocumentInput {
                 destination: Grant {
                     documents: Arc::clone(&self.documents),
-                    presenter: std::sync::Weak::clone(&self.document_target),
                     cancelled: Arc::clone(&self.cancellation.cancelled),
                     key,
                     window,
